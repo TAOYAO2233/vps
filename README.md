@@ -1,8 +1,6 @@
 🎬 VPS 多功能自动化管理与审计工具箱 (VPS Multi-functional Automation Management & Audit Toolkit)
 本项目是一套专为 VPS（Virtual Private Server）运维、多媒体流媒体处理、直播自动化录制管理以及网络访问审计打造的全套 Telegram Bot 自动化解决方案。系统基于 Python 异步架构（依托 python-telegram-bot 与 asyncio）及高性能 Shell 脚本构建，旨在通过移动端 Telegram 交互界面，实现远程服务器的高效、零代码、可视化管控。
 
-📂 项目矩阵与目录结构
-Plaintext
 vps-telegram-bot/
 ├── bilive_bot/                          # 🤖 Bililive-go 录制控制机器人
 │   ├── bl_bot.py                        # 核心控制与消息推送代码
