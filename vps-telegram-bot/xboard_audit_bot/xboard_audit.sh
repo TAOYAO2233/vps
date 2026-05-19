@@ -24,6 +24,22 @@ init_public_dir() {
     chmod 777 /home/xboard_log/
 }
 
+# 自动检测并安装 rsyslog 依赖
+check_rsyslog() {
+    if ! command -v rsyslogd &> /dev/null; then
+        echo -e "${YELLOW}📦 检测到系统环境缺失 rsyslog 核心日志组件，正在自动补全...${NC}"
+        apt-get update > /dev/null 2>&1
+        apt-get install rsyslog -y > /dev/null 2>&1
+        
+        # 确保基础目录与配置文件存在
+        mkdir -p /etc/rsyslog.d
+        if [ ! -f "/etc/rsyslog.conf" ] && [ -f "/usr/share/doc/rsyslog/examples/rsyslog.conf" ]; then
+            cp /usr/share/doc/rsyslog/examples/rsyslog.conf /etc/rsyslog.conf
+        fi
+        echo -e "${GREEN}✅ rsyslog 补全成功！${NC}"
+    fi
+}
+
 # 管道流重建与配置优化
 start_journal_tunnel() {
     # 📝 自动化调整 Xboard 节点的日志级别
@@ -53,6 +69,7 @@ start_journal_tunnel() {
 # 1. 设置本机为主控
 set_as_master() {
     init_public_dir
+    check_rsyslog
     touch /home/xboard_log/xboard_vps_b.log
     chmod 666 /home/xboard_log/xboard_vps_b.log
     
@@ -144,6 +161,7 @@ SYSTEMEOF
 # 2. 设置本机为客户端
 set_as_client() {
     init_public_dir
+    check_rsyslog
     
     echo -e "\n${BLUE}--- 请配置客户端网络远程推送参数 ---${NC}"
     read -p "请输入主控机 (VPS-A) 的公网 IP: " MASTER_IP
@@ -183,8 +201,10 @@ local7.* @${MASTER_IP}:514
 LOGEOF
     
     echo -e "${YELLOW}🔒 正在破除系统的 rsyslog 跨目录降权阻锁...${NC}"
-    sed -i 's/^\$PrivDropToUser/# \$PrivDropToUser/g' /etc/rsyslog.conf
-    sed -i 's/^\$PrivDropToGroup/# \$PrivDropToGroup/g' /etc/rsyslog.conf
+    if [ -f "/etc/rsyslog.conf" ]; then
+        sed -i 's/^\$PrivDropToUser/# \$PrivDropToUser/g' /etc/rsyslog.conf
+        sed -i 's/^\$PrivDropToGroup/# \$PrivDropToGroup/g' /etc/rsyslog.conf
+    fi
     
     systemctl restart rsyslog
     
@@ -250,7 +270,7 @@ add_new_node_on_master() {
     
     echo -e "${GREEN}=========================================${NC}"
     echo -e "${GREEN}🎉 动态追加成功！新节点 [${NODE_NAME}] 已加入实时审计！${NC}"
-    echo -e "${YELLOW}💡 提示：您可以使用 journalctl -u xboard-audit -f 实时查看多端合并流。${NC}"
+    echo -e "${YELLOW}💡 提示：您可以使用 journalctl -u xboard-audit -f 实时查看多端合并流. ${NC}"
     echo -e "${GREEN}=========================================${NC}"
     exit 0
 }
