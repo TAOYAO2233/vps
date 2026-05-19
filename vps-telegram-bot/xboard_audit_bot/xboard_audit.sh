@@ -7,13 +7,14 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# GitHub 托管的 Python 审计脚本地址
-GITHUB_RAW_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/xboard_audit_bot/xboard_audit.py"
+# 💡 核心升级：定义多版本 Python 审计脚本云端同步地址
+URL_PYTHON_38="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/xboard_audit_bot/xboard_audit3.8.py"
+URL_PYTHON_HIGH="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/xboard_audit_bot/xboard_audit.py"
 
 clear
 echo -e "${BLUE}====================================================${NC}"
-echo -e "${GREEN}    Xboard 节点网络访问双机集中审计一键脚本 (云端同步版)${NC}"
-echo -e "${YELLOW}    系统支持: Ubuntu 20.04+ (兼容当前系统 Python 3.8)${NC}"
+echo -e "${GREEN}    Xboard 节点网络访问双机集中审计一键脚本 (版本智能自适应版)${NC}"
+echo -e "${YELLOW}    系统支持: Ubuntu 20.04+ (自动嗅探并完美兼容 Python 3.8)${NC}"
 echo -e "${BLUE}====================================================${NC}"
 
 # 基础公共检查与权限放开
@@ -70,8 +71,21 @@ RECVEOF
     systemctl restart rsyslog
     start_journal_tunnel
     
-    # 从 GitHub 实时拉取你托管的代码
-    echo -e "${YELLOW}📥 正在从 GitHub 远程安全获取最新版审计代码...${NC}"
+    # 💡 核心升级：动态智能探测系统内置的 Python3 子版本号
+    PY_SUB_VER=$(python3 -c 'import sys; print(sys.version_info.minor)')
+    echo -e "${BLUE}[系统嗅探] 当前本地内置 Python 版本为: 3.${PY_SUB_VER}${NC}"
+    
+    # 动态执行条件分支：根据子版本是否小于 9 (即 3.8 及以下) 自动决策拉取目标
+    if [ "$PY_SUB_VER" -lt 9 ]; then
+        echo -e "${YELLOW}⚠️  侦测到当前系统 Python 环境较低，自动为您切换至 3.8 兼容版审计源码...${NC}"
+        GITHUB_RAW_URL="$URL_PYTHON_38"
+    else
+        echo -e "${GREEN}✨ 侦测到当前系统 Python 环境支持新特性，为您切换至标准版高阶审计源码...${NC}"
+        GITHUB_RAW_URL="$URL_PYTHON_HIGH"
+    fi
+    
+    # 从决策后的 GitHub 地址拉取源码
+    echo -e "${YELLOW}📥 正在从 GitHub 远程安全获取对应版本的审计代码...${NC}"
     mkdir -p /root/xboard_log
     curl -sS -o /root/xboard_log/xboard_monitor.py "$GITHUB_RAW_URL"
     
@@ -118,7 +132,7 @@ SYSTEMEOF
     systemctl restart xboard-audit
     
     echo -e "${GREEN}=========================================${NC}"
-    echo -e "${GREEN}🎉 本机【主控中心】一键配置并从 GitHub 同步成功！${NC}"
+    echo -e "${GREEN}🎉 本机【主控中心】一键配置并成功完成版本适配同步！${NC}"
     echo -e "${YELLOW}💡 提示：请确保主控端的云面板/防火墙放行了 514/UDP 端口。${NC}"
     echo -e "${GREEN}=========================================${NC}"
     exit 0
@@ -165,7 +179,7 @@ LOGEOF
 
 # 菜单选择逻辑
 echo -e "${BLUE}请选择当前 VPS 的部署角色:${NC}"
-echo -e "  ${GREEN}1.${NC} 设置本机为 ${GREEN}[主控机 (VPS-A)]${NC} (从 GitHub 自动拉取源码并热填入变量)"
+echo -e "  ${GREEN}1.${NC} 设置本机为 ${GREEN}[主控机 (VPS-A)]${NC} (智能识别系统环境，自动拉取对应源码)"
 echo -e "  ${GREEN}2.${NC} 设置本机为 ${GREEN}[客户端 (VPS-B)]${NC} (仅外发推送日志给主控)"
 echo -e "  ${RED}3.${NC} 退出安装"
 echo -e "${BLUE}────────────────────────────────────────────────────${NC}"
