@@ -24,12 +24,25 @@ init_public_dir() {
     chmod 777 /home/xboard_log/
 }
 
-# 管道流重建
+# 管道流重建与配置优化
 start_journal_tunnel() {
+    # 📝 自动化调整 Xboard 节点的日志级别
+    if [ -f "/etc/xboard-node/config.yml" ]; then
+        if grep -q "log_level:[[:space:]]*warn" /etc/xboard-node/config.yml; then
+            echo -e "${YELLOW}⚙️ 检测到内核日志级别为 warn，正在自动修正为 info 以启用全量审计...${NC}"
+            sed -i 's/log_level:[[:space:]]*warn/log_level: info/g' /etc/xboard-node/config.yml
+            echo -e "${YELLOW}🔄 正在重启 xboard-node 服务以应用新配置...${NC}"
+            systemctl restart xboard-node > /dev/null 2>&1
+            sleep 1
+        else
+            echo -e "${GREEN}✅ 检查完毕：内核日志级别已是 info，无需修改。${NC}"
+        fi
+    fi
+
     echo -e "${YELLOW}🚀 正在建立 journalctl -> /home/xboard_log/xboard.log 实时导流管道...${NC}"
     pkill -f "journalctl -u xboard-node" > /dev/null 2>&1
     nohup journalctl -u xboard-node -f --no-pager > /home/xboard_log/xboard.log 2>&1 &
-    sleep 1
+    sleep 2
     if ps ax | grep -v grep | grep "journalctl -u xboard-node" > /dev/null; then
         echo -e "${GREEN}✅ 实时日志导流管道建立成功！${NC}"
     else
