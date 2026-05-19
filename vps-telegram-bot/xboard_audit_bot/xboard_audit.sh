@@ -31,7 +31,6 @@ check_rsyslog() {
         apt-get update > /dev/null 2>&1
         apt-get install rsyslog -y > /dev/null 2>&1
         
-        # 确保基础目录与配置文件存在
         mkdir -p /etc/rsyslog.d
         if [ ! -f "/etc/rsyslog.conf" ] && [ -f "/usr/share/doc/rsyslog/examples/rsyslog.conf" ]; then
             cp /usr/share/doc/rsyslog/examples/rsyslog.conf /etc/rsyslog.conf
@@ -42,7 +41,6 @@ check_rsyslog() {
 
 # 管道流重建与配置优化
 start_journal_tunnel() {
-    # 📝 自动化调整 Xboard 节点的日志级别
     if [ -f "/etc/xboard-node/config.yml" ]; then
         if grep -q "log_level:[[:space:]]*warn" /etc/xboard-node/config.yml; then
             echo -e "${YELLOW}⚙️ 检测到内核日志级别为 warn，正在自动修正为 info 以启用全量审计...${NC}"
@@ -172,13 +170,10 @@ set_as_client() {
         exit 1
     fi
     
-    # 💡 客户端智能核心变换
     if [[ "$USER_INPUT" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        # 如果填的是 IP，把点去掉组装成纯数字串标识
         CLEAN_TAG=$(echo "$USER_INPUT" | sed 's/\.//g')
         NODE_DISPLAY="ip-${USER_INPUT//./-}"
     else
-        # 如果是英文，清洗掉特殊字符并转小写
         CLEAN_TAG=$(echo "$USER_INPUT" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9-]//g')
         NODE_DISPLAY="$CLEAN_TAG"
     fi
@@ -231,13 +226,10 @@ add_new_node_on_master() {
         exit 1
     fi
     
-    # 💡 主控端智能核心变换（必须和客户端变换算法百分之百对齐）
     if [[ "$MASTER_INPUT" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        # 输入的是 IP
         CLEAN_TAG=$(echo "$MASTER_INPUT" | sed 's/\.//g')
         NODE_NAME="vps-${MASTER_INPUT}"
     else
-        # 输入的是英文代号
         CLEAN_TAG=$(echo "$MASTER_INPUT" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9-]//g')
         NODE_NAME="vps-${CLEAN_TAG}"
     fi
@@ -261,9 +253,19 @@ add_new_node_on_master() {
     if grep -q "${LOG_FILE_NAME}" /root/xboard_log/xboard_monitor.py; then
         echo -e "${YELLOW}ℹ️  Python 核心中已并联此节点，跳过注入。${NC}"
     else
-        # 追加字典到 Python 代码的 LOG_TASKS 列表中
-        sed -i "/\"path\":/ { :a; n; /\]/! ba; i \    {\"path\": \"/home/xboard_log/${LOG_FILE_NAME}\", \"node_name\": \"${NODE_NAME}\"}," /root/xboard_log/xboard_monitor.py
-        
+        # 💡 摒弃脆弱的 sed 方案，改用 100% 稳健的 python 原生无损切片注入
+        python3 -c "
+file_path = '/root/xboard_log/xboard_monitor.py'
+with open(file_path, 'r', encoding='utf-8') as f: lines = f.readlines()
+start = False
+for i, l in enumerate(lines):
+    if 'LOG_TASKS = [' in l: start = True
+    if start and l.strip() == ']':
+        lines[i-1] = lines[i-1].rstrip('\r\n') + ',\n'
+        lines.insert(i, '    {\"path\": \"/home/xboard_log/${LOG_FILE_NAME}\", \"node_name\": \"${NODE_NAME}\"},\n')
+        break
+with open(file_path, 'w', encoding='utf-8') as f: f.writelines(lines)
+"
         systemctl restart xboard-audit
         echo -e "${GREEN}✅ Python 跨多路高并发并联监听机制注入成功！${NC}"
     fi
