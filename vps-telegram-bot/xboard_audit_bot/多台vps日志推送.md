@@ -3,15 +3,30 @@
 > 由于默认的 /root/ 目录存在严格的系统降权和隔离限制  
 > 我们统一使用系统公共的 /home/xboard_log/ 目录来做数据交互
 >
-> #### 在两台VPS（A 和 B） 上分别输入以下命令：
+> #### 在 VPS-A 上分别输入以下命令：
 >
 > ```bash
-> # 创建公共目录
+> # 创建新的日志公共存放目录
+> mkdir -p /home/xboard_log/
+> # 创建 VPS-B 的接收日志文件
+> touch /home/xboard_log/xboard_vps_b.log
+> 赋予完全读写权限，彻底根除权限阻挡
+> chmod 777 /home/xboard_log/
+> chmod 666 /home/xboard_log/xboard_vps_b.log
+> ```
+>
+> ### 在 VPS-B（客户端）上执行:
+>
+> ```bash
+> # 同样创建公共目录
 > mkdir -p /home/xboard_log/
 > chmod 777 /home/xboard_log/
-> # 建立软链接，将你原本 Xboard 生成的日志映射到公共目录下
-> # (请确保你原先的本地日志路径确实在 /root/xboard_log/xboard.log)
-> ln -sf /root/xboard_log/xboard.log /home/xboard_log/xboard.log
+> ```
+>
+> ### 💡【核心添加】将本地 xboard-node 服务的日志实时、不断流地灌入公共目录：
+>
+> ```bash
+> nohup journalctl -u xboard-node -f --no-pager > /home/xboard_log/xboard.log 2>&1 &
 > ```
 
 ## 📡 第二阶段：配置客户端（VPS-B）日志外发
@@ -91,7 +106,7 @@
 > ```bash
 > # 如果日志来自 VPS-B，则写入独立日志文件，并停止后续规则处理
 > if $fromhost-ip == 'VPS-B的公网IP' then {
->    action(type="omfile" file="/root/xboard_log/xboard_vps_b.log")
+>    action(type="omfile" file="/home/xboard_log/xboard_vps_b.log")
 >    stop
 > }
 >
