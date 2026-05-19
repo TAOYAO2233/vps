@@ -1,0 +1,14 @@
+[Unit]
+Description=Xboard Log Audit Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/xboard_log
+ExecStart=/root/xboard_log/xboard_env/bin/python3 /root/xboard_log/xboard_audit.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
