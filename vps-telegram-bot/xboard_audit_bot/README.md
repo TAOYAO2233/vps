@@ -18,6 +18,7 @@ xboard_audit_bot
 ├── xboard_audit.py # 监控与审计核心逻辑脚本
 ├── xboard-audit.service # Systemd 系统服务配置文件
 ├── systemctl守护进程.md # 系统服务命令及运维操作指南
+├── xboard_audit.sh # 一键运行脚本
 └── README.md # 说明
 ```
 
