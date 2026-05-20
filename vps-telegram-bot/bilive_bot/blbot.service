@@ -1,0 +1,19 @@
+[Unit]
+Description=Bilibili Live Monitor Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# 设置工作目录
+WorkingDirectory=/root/bilive_bot
+# 直接调用该目录虚拟环境下的 Python 解释器执行脚本
+ExecStart=/root/bilive_bot/bilive/bin/python3 bl_bot.py
+Restart=always
+RestartSec=5
+# 环境变量设置（确保日志实时输出与编码正确）
+Environment=PYTHONUNBUFFERED=1
+Environment=LANG=en_US.UTF-8
+
+[Install]
+WantedBy=multi-user.target

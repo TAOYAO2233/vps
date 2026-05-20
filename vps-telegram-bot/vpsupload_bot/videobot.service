@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram Video Management Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# 设置工作目录，确保机器人能正确找到 token.json 和相对路径下的文件
+WorkingDirectory=/root/video_bot
+# 直接调用虚拟环境下的 Python 解释器执行脚本
+ExecStart=/root/video_bot/yt/bin/python3 bot_main.py
+Restart=always
+RestartSec=5
+# 环境变量设置（确保编码正确）
+Environment=PYTHONUNBUFFERED=1
+Environment=LANG=en_US.UTF-8
+
+[Install]
+WantedBy=multi-user.target

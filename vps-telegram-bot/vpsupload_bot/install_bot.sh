@@ -55,8 +55,8 @@ fi
 
 # 4. 初始化 Python 虚拟环境并安装环境库
 echo -e "${GREEN}[3/6] 正在初始化 Python 虚拟环境并安装运行依赖...${NC}"
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv yt
+source yt/bin/activate
 
 pip install --upgrade pip
 pip install python-telegram-bot google-api-python-client google-auth-oauthlib google-auth
@@ -123,7 +123,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${BOT_DIR}
-ExecStart=${BOT_DIR}/venv/bin/python3 ${BOT_DIR}/bot_main.py
+ExecStart=${BOT_DIR}/yt/bin/python3 ${BOT_DIR}/bot_main.py
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
