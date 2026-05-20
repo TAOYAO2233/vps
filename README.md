@@ -21,7 +21,9 @@
 │  ├─ vpsupload_bot
 │  │  ├─ bot_main.py
 │  │  ├─ get josn.py
+│  │  ├─ install_bot.sh
 │  │  ├─ README.md
+│  │  ├─ 使用向导.md
 │  │  └─ 更新日志.md
 │  └─ xboard_audit_bot
 │     ├─ README.md
