@@ -16,6 +16,7 @@
 ├─ README.md
 ├─ vps-telegram-bot
 │  ├─ bilive_bot
+│  │  ├─ blbot.service
 │  │  ├─ bl_bot.py
 │  │  └─ README.md
 │  ├─ vpsupload_bot
@@ -23,6 +24,7 @@
 │  │  ├─ get josn.py
 │  │  ├─ install_bot.sh
 │  │  ├─ README.md
+│  │  ├─ videobot.service
 │  │  ├─ 使用向导.md
 │  │  └─ 更新日志.md
 │  └─ xboard_audit_bot
@@ -34,19 +36,22 @@
 │     ├─ 使用向导.md
 │     └─ 多台vps日志推送.md
 └─ 常用VPS .sh文件
-   └─ sh-files
-      ├─ convert_flv_copy_mp4.sh
-      ├─ convert_flv_to_mp4.sh
-      ├─ delete_old_files.sh
-      ├─ download_video.sh
-      ├─ linuxcheck.sh
-      ├─ monitor_xrayr.sh
-      ├─ sshkey_manager.sh
-      ├─ stream_videos_with_interval.sh
-      ├─ tdl_commands.sh
-      ├─ tdl_forward_commands.sh
-      ├─ v2bx
-      │  └─ install.sh
-      ├─ viedo_master.sh
-      └─ 使用方法.md
+   ├─ sh-files
+   │  ├─ convert_flv_copy_mp4.sh
+   │  ├─ convert_flv_to_mp4.sh
+   │  ├─ delete_old_files.sh
+   │  ├─ download_video.sh
+   │  ├─ linuxcheck.sh
+   │  ├─ monitor_xrayr.sh
+   │  ├─ sshkey_manager.sh
+   │  ├─ stream_videos_with_interval.sh
+   │  ├─ tdl_commands.sh
+   │  ├─ tdl_forward_commands.sh
+   │  ├─ v2bx
+   │  │  └─ install.sh
+   │  ├─ viedo_master.sh
+   │  └─ 使用方法.md
+   └─ vps-sh
+      └─ lscolorsetup.sh
+
 ```
