@@ -1,5 +1,6 @@
 #更新日志：
 #2024-06-01 v2.0.0
+#2024-06-XX v2.1.0 - RTMP推流改为多视频队列模式：可多选视频、自定义播放顺序后按序推流
 import os
 import re
 import math
@@ -123,50 +124,117 @@ async def action_browse(update: Update, context: ContextTypes.DEFAULT_TYPE, file
         await query.answer(f"❌ 获取文件信息失败: {e}", show_alert=True)
 
 
-async def action_stream(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path: str):
+async def action_stream(update: Update, context: ContextTypes.DEFAULT_TYPE, files: list):
+    """推流队列：按顺序依次推流多个视频文件"""
     query = update.callback_query
-    context.user_data['cancel_flag'] = False 
-    
-    size_str = get_formatted_file_size(file_path)
-    message = await query.edit_message_text(f"⏳ 正在分析推流文件: `{os.path.basename(file_path)}` ({size_str})...", parse_mode='Markdown')
+    context.user_data['cancel_flag'] = False
+    total = len(files)
 
-    duration = await get_video_duration(file_path)
-    if duration <= 0: return await message.edit_text("❌ 无法获取视频时长，推流终止。")
-
-    cmd = ["ffmpeg", "-re", "-i", file_path, "-c", "copy", "-f", "flv", RTMP_URL]
-    process = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
-    context.user_data['current_process'] = process 
+    message = await query.edit_message_text(
+        f"⏳ 推流队列就绪，共 *{total}* 个视频，正在初始化...",
+        parse_mode='Markdown'
+    )
 
     time_regex = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.\d{2}")
-    last_update_time = time.time()
-    last_percent = -1.0
 
-    while True:
-        if context.user_data.get('cancel_flag'): break
+    for file_idx, file_path in enumerate(files):
+        if context.user_data.get('cancel_flag'):
+            await message.edit_text(
+                f"🛑 *推流队列已中断*\n已完成 {file_idx}/{total} 个视频",
+                parse_mode='Markdown'
+            )
+            return
 
-        line = await process.stderr.readline()
-        if not line: break
-        match = time_regex.search(line.decode('utf-8', errors='ignore'))
-        if match:
-            h, m, s = map(int, match.groups())
-            current_sec = h * 3600 + m * 60 + s
-            percent = (current_sec / duration) * 100
-            current_time = time.time()
-            if (percent - last_percent >= 1.0) and (current_time - last_update_time >= 2.0):
-                bar = build_progress_bar(percent)
+        filename = os.path.basename(file_path)
+        size_str = get_formatted_file_size(file_path)
+
+        try:
+            await message.edit_text(
+                f"⏳ 正在分析文件 ({file_idx + 1}/{total}):\n`{filename}` ({size_str})...",
+                parse_mode='Markdown'
+            )
+        except Exception:
+            pass
+
+        duration = await get_video_duration(file_path)
+        if duration <= 0:
+            try:
+                await message.edit_text(
+                    f"⚠️ 跳过文件 ({file_idx + 1}/{total}):\n`{filename}`\n❌ 无法获取视频时长，已跳过",
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+            continue
+
+        cmd = ["ffmpeg", "-re", "-i", file_path, "-c", "copy", "-f", "flv", RTMP_URL]
+        process = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
+        context.user_data['current_process'] = process
+
+        last_update_time = time.time()
+        last_percent = -1.0
+
+        while True:
+            if context.user_data.get('cancel_flag'):
                 try:
-                    await message.edit_text(f"📡 **推流中**: `{os.path.basename(file_path)}`\n\n`{bar}`\n⏱️ {current_sec}s / {int(duration)}s", parse_mode='Markdown')
-                    last_update_time = current_time
-                    last_percent = int(percent)
-                except Exception: pass 
-                
-    await process.wait()
-    context.user_data['current_process'] = None
-    
-    if context.user_data.get('cancel_flag'):
-        await message.edit_text(f"🛑 **推流已手动终止**:\n`{os.path.basename(file_path)}`", parse_mode='Markdown')
-    else:
-        await message.edit_text(f"✅ **推流结束**:\n`{os.path.basename(file_path)}`", parse_mode='Markdown')
+                    process.terminate()
+                except Exception:
+                    pass
+                break
+
+            line = await process.stderr.readline()
+            if not line:
+                break
+
+            match = time_regex.search(line.decode('utf-8', errors='ignore'))
+            if match:
+                h, m, s = map(int, match.groups())
+                current_sec = h * 3600 + m * 60 + s
+                percent = (current_sec / duration) * 100
+                current_time = time.time()
+                if (percent - last_percent >= 1.0) and (current_time - last_update_time >= 2.0):
+                    bar = build_progress_bar(percent)
+                    try:
+                        await message.edit_text(
+                            f"📡 *推流中* ({file_idx + 1}/{total})\n"
+                            f"`{filename}`\n\n"
+                            f"`{bar}`\n"
+                            f"⏱️ {current_sec}s / {int(duration)}s",
+                            parse_mode='Markdown'
+                        )
+                        last_update_time = current_time
+                        last_percent = int(percent)
+                    except Exception:
+                        pass
+
+        await process.wait()
+        context.user_data['current_process'] = None
+
+        if context.user_data.get('cancel_flag'):
+            await message.edit_text(
+                f"🛑 *推流已手动终止*\n"
+                f"已完成: {file_idx}/{total} 个\n"
+                f"最后文件: `{filename}`",
+                parse_mode='Markdown'
+            )
+            return
+
+        # 非最后一个时，显示过渡提示
+        if file_idx < total - 1:
+            try:
+                await message.edit_text(
+                    f"✅ 第 {file_idx + 1}/{total} 个完成: `{filename}`\n⏳ 正在准备下一个...",
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+    await message.edit_text(
+        f"✅ *推流队列全部完成！*\n🎉 共完成 {total} 个视频的推流。",
+        parse_mode='Markdown'
+    )
 
 async def action_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path: str):
     query = update.callback_query
@@ -330,7 +398,7 @@ async def render_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 修改了 callback_data 以 init_ 开头，为了在进入功能前初始化路径
     keyboard = [
         [InlineKeyboardButton("📂 浏览远程文件", callback_data="init_browse")],
-        [InlineKeyboardButton("📡 RTMP 单路推流", callback_data="init_stream"),
+        [InlineKeyboardButton("📡 RTMP 推流队列", callback_data="init_stream"),
          InlineKeyboardButton("☁️ YouTube 上传", callback_data="init_youtube")],
         [InlineKeyboardButton("✂️ 智能视频合并", callback_data="init_concat")],
         [InlineKeyboardButton("🔄 批量转码 MP4", callback_data="init_convert")],
@@ -341,6 +409,62 @@ async def render_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     else:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def render_stream_sort_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """渲染推流队列排序页面：显示已选视频列表，支持上移/下移/移除，确认后按序推流"""
+    query = update.callback_query
+    queue = context.user_data.get('stream_queue', [])
+
+    if not queue:
+        await query.answer("❌ 推流队列为空，请重新选择文件！", show_alert=True)
+        await render_file_selector(update, context, 'stream', 0)
+        return
+
+    nums = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩',
+            '⑪', '⑫', '⑬', '⑭', '⑮', '⑯', '⑰', '⑱', '⑲', '⑳']
+    n = len(queue)
+
+    # 消息文本：完整队列信息（文件名可能很长，放消息里更合适）
+    lines = [
+        "📋 *推流队列排序*",
+        f"共 *{n}* 个视频，将按以下顺序推流。",
+        "点击 ⬆️⬇️ 调整顺序，🗑️ 移除视频：",
+        "━━━━━━━━━━━━"
+    ]
+    for i, fp in enumerate(queue):
+        num = nums[i] if i < len(nums) else f"{i + 1}."
+        size_str = get_formatted_file_size(fp)
+        filename = os.path.basename(fp)
+        lines.append(f"{num} `[{size_str}]` {filename}")
+
+    # 键盘：每个视频一行，含上移/下移/移除按钮
+    keyboard = []
+    for i in range(n):
+        num = nums[i] if i < len(nums) else f"{i + 1}."
+        row = []
+        # 上移（第一个禁用，显示锁图标）
+        if i > 0:
+            row.append(InlineKeyboardButton(f"⬆️ {num}", callback_data=f"ssort_up_{i}"))
+        else:
+            row.append(InlineKeyboardButton(f"🔝 {num}", callback_data="ssort_noop"))
+        # 下移（最后一个禁用，显示锁图标）
+        if i < n - 1:
+            row.append(InlineKeyboardButton(f"⬇️ {num}", callback_data=f"ssort_down_{i}"))
+        else:
+            row.append(InlineKeyboardButton(f"🔚 {num}", callback_data="ssort_noop"))
+        # 移除
+        row.append(InlineKeyboardButton(f"🗑️ {num}", callback_data=f"ssort_rm_{i}"))
+        keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton(f"▶️ 开始按序推流 ({n} 个视频)", callback_data="ssort_start")])
+    keyboard.append([InlineKeyboardButton("🔙 返回重新选择文件", callback_data="ssort_back")])
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
 
 async def render_file_selector(update: Update, context: ContextTypes.DEFAULT_TYPE, action_type: str, page: int):
     query = update.callback_query
@@ -358,7 +482,8 @@ async def render_file_selector(update: Update, context: ContextTypes.DEFAULT_TYP
     items = dirs + files # 文件夹排在前面
     context.user_data['current_files'] = items # 统一缓存名称
     
-    is_multi_select = action_type in ['concat', 'convert', 'delete']
+    # stream 改为多选模式，选完后进入排序页
+    is_multi_select = action_type in ['concat', 'convert', 'delete', 'stream']
     selected_indices = context.user_data.setdefault(f'selected_{action_type}', set())
 
     total_pages = max(1, math.ceil(len(items) / ITEMS_PER_PAGE))
@@ -399,13 +524,19 @@ async def render_file_selector(update: Update, context: ContextTypes.DEFAULT_TYP
         keyboard.append([InlineKeyboardButton("⬆️ 返回上一级目录", callback_data=f"updir_{action_type}")])
     
     if is_multi_select and selected_indices:
-        keyboard.append([InlineKeyboardButton(f"▶️ 确认执行 ({len(selected_indices)} 个文件)", callback_data=f"execbatch_{action_type}")])
+        if action_type == 'stream':
+            keyboard.append([InlineKeyboardButton(
+                f"📋 确认并进入排序 ({len(selected_indices)} 个视频)",
+                callback_data=f"execbatch_{action_type}"
+            )])
+        else:
+            keyboard.append([InlineKeyboardButton(f"▶️ 确认执行 ({len(selected_indices)} 个文件)", callback_data=f"execbatch_{action_type}")])
         
     keyboard.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_main")])
     
     action_name_map = {
         "browse": "浏览与查看详情",
-        "stream": "推流",
+        "stream": "推流队列 (多选)",
         "youtube": "上传 YT",
         "concat": "合并",
         "convert": "转码 MP4",
@@ -415,6 +546,9 @@ async def render_file_selector(update: Update, context: ContextTypes.DEFAULT_TYP
     # 为了UI美观，将路径前缀精简显示
     display_path = current_dir.replace(BASE_DIR, '🏠')
     header = f"📂 路径: `{display_path}`\n👉 模式: [{action_name_map.get(action_type, action_type.upper())}] (页 {page+1}/{total_pages})"
+
+    if action_type == 'stream':
+        header += "\n💡 勾选视频后点击确认按钮，进入排序页调整播放顺序"
     
     if not items:
         header += "\n\n⚠️ 当前目录下既无子文件夹也无视频文件。"
@@ -469,7 +603,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render_file_selector(update, context, action, int(page))
         
     elif data.startswith("execsingle_"):
-        # 单文件执行逻辑
+        # 单文件执行逻辑（stream 已改为多选，此处仅保留 browse / youtube）
         _, action, idx = data.split('_')
         current_dir = context.user_data.get('current_dir', BASE_DIR)
         filename = context.user_data['current_files'][int(idx)]
@@ -479,8 +613,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(action_browse(update, context, filepath))
         else:
             await query.answer() 
-            if action == "stream": asyncio.create_task(action_stream(update, context, filepath))
-            elif action == "youtube": asyncio.create_task(action_youtube(update, context, filepath))
+            if action == "youtube": asyncio.create_task(action_youtube(update, context, filepath))
 
     elif data.startswith("execbatch_"):
         # 批量执行逻辑
@@ -494,9 +627,61 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cached_files = context.user_data['current_files']
         target_files = [os.path.join(current_dir, cached_files[i]) for i in sorted(selected_indices)]
         
-        if action == "concat": asyncio.create_task(action_concat(update, context, target_files))
+        if action == "stream":
+            # stream 进入排序页，不直接推流
+            context.user_data['stream_queue'] = target_files
+            await render_stream_sort_view(update, context)
+        elif action == "concat": asyncio.create_task(action_concat(update, context, target_files))
         elif action == "convert": asyncio.create_task(action_convert(update, context, target_files))
         elif action == "delete": asyncio.create_task(action_delete(update, context, target_files))
+
+    # --- 推流队列排序处理 ---
+    elif data.startswith("ssort_"):
+        parts = data.split("_")
+        ssort_action = parts[1]
+        queue = context.user_data.get('stream_queue', [])
+
+        if ssort_action == "noop":
+            # 边界按钮（第一个/最后一个），仅提示
+            await query.answer("⚠️ 已在边界位置，无法继续移动。")
+
+        elif ssort_action == "up":
+            idx = int(parts[2])
+            if 0 < idx < len(queue):
+                queue[idx], queue[idx - 1] = queue[idx - 1], queue[idx]
+                context.user_data['stream_queue'] = queue
+            await render_stream_sort_view(update, context)
+
+        elif ssort_action == "down":
+            idx = int(parts[2])
+            if 0 <= idx < len(queue) - 1:
+                queue[idx], queue[idx + 1] = queue[idx + 1], queue[idx]
+                context.user_data['stream_queue'] = queue
+            await render_stream_sort_view(update, context)
+
+        elif ssort_action == "rm":
+            idx = int(parts[2])
+            if 0 <= idx < len(queue):
+                queue.pop(idx)
+                context.user_data['stream_queue'] = queue
+            if not queue:
+                # 队列已清空，返回文件选择
+                await query.answer("⚠️ 队列已清空，请重新选择文件", show_alert=True)
+                context.user_data[f'selected_stream'] = set()
+                await render_file_selector(update, context, 'stream', 0)
+            else:
+                await render_stream_sort_view(update, context)
+
+        elif ssort_action == "start":
+            if not queue:
+                await query.answer("❌ 推流队列为空！", show_alert=True)
+                return
+            await query.answer()
+            asyncio.create_task(action_stream(update, context, list(queue)))
+
+        elif ssort_action == "back":
+            # 返回文件选择，保留之前的勾选状态，方便调整
+            await render_file_selector(update, context, 'stream', 0)
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
