@@ -1,6 +1,6 @@
 #更新日志：
 #2024-06-01 v2.0.0
-#2024-xx-xx v2.3.0 优化合并逻辑：优先极速拼接 -> 体积校验 -> 失败后触发TS容错
+#2024-xx-xx v2.4.0 优化合并逻辑(TS容错) + 修复智能命名保留完整时分秒
 import os
 import re
 import math
@@ -68,13 +68,16 @@ def smart_rename(first_file_path: str) -> str:
     base_name = os.path.splitext(os.path.basename(first_file_path))[0]
     ext = os.path.splitext(first_file_path)[1]
     
-    date_match = re.search(r'\d{4}[-_.]?\d{2}[-_.]?\d{2}', base_name)
-    date_str = date_match.group(0) if date_match else f"Merged_{datetime.now().strftime('%Y%m%d')}"
+    # 增强正则：匹配日期(YYYY-MM-DD) 以及其后的时间(HH-MM-SS)，保留完整的录播时间标签
+    date_match = re.search(r'\d{4}[-_.]\d{2}[-_.]\d{2}(?:[ _-]\d{2}[-_.:]\d{2}[-_.:]\d{2})?', base_name)
+    date_str = date_match.group(0) if date_match else f"Merged_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    title_part = re.sub(r'^\[\d[^\]]*\]', '', base_name)
+    # 清理掉开头的日期时间括号 [2026-06-07 20-00-00]，保留后面的标题
+    title_part = re.sub(r'^\[\d[^\]]*\]\s*', '', base_name)
+    
     if title_part == base_name:
         title_part = base_name.replace(date_str, '')
-        title_part = re.sub(r'^[-_.]+', '', title_part)
+        title_part = re.sub(r'^[-_.\s]+', '', title_part)
         
     if title_part:
         output_name = f"{date_str}_{title_part}{ext}"
