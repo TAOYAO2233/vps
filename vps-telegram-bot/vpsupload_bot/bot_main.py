@@ -1,6 +1,6 @@
 #更新日志：
 #2024-06-01 v2.0.0
-#2024-xx-xx v2.2.0 YT通知详情、重构合并逻辑(强制TS流水线+防静默失败+强制输出MP4)
+#2024-xx-xx v2.3.0 优化合并逻辑：优先极速拼接 -> 体积校验 -> 失败后触发TS容错
 import os
 import re
 import math
@@ -230,73 +230,99 @@ async def action_concat(update: Update, context: ContextTypes.DEFAULT_TYPE, file
     query = update.callback_query
     context.user_data['cancel_flag'] = False
     
-    if len(files_to_merge) < 2: return await query.answer("❌ 至少需要选择 2 个文件！", show_alert=True)
+    if len(files_to_merge) < 2: 
+        return await query.answer("❌ 至少需要选择 2 个文件！", show_alert=True)
     
-    # 1. 记录原文件总大小，用于最终防静默失败校验
+    # 记录原文件总大小，用于判断极速拼接是否发生“静默失败”
     total_input_size = sum(os.path.getsize(f) for f in files_to_merge)
-    
-    await query.edit_message_text("⏳ **步骤 1/2: 正在预处理视频...**\n为防止时间戳断层，正在将片段无损转为 TS 格式...", parse_mode='Markdown')
-    
     work_dir = os.path.dirname(files_to_merge[0])
     
-    # 强制将最终合并文件的后缀改为 .mp4 (解决flv容器时间轴元数据错误导致播一半卡住的问题)
+    # 强制输出 MP4 格式，修复 FLV 合并后的时间轴乱序问题
     base_smart_name = smart_rename(files_to_merge[0])
     output_filename = os.path.splitext(base_smart_name)[0] + ".mp4"
     output_path = os.path.join(work_dir, output_filename)
     
-    # --- 强制执行 TS 容错流水线 ---
-    ts_files = []
-    for idx, file_path in enumerate(files_to_merge):
-        if context.user_data.get('cancel_flag'): break
-        
-        ts_path = os.path.join(work_dir, f"temp_merge_fallback_{idx}.ts")
-        ts_files.append(ts_path)
-        
-        # 将各分段无损转换为独立 .ts
-        cmd_ts = ["ffmpeg", "-y", "-i", file_path, "-c", "copy", ts_path]
-        proc_ts = await asyncio.create_subprocess_exec(*cmd_ts)
-        context.user_data['current_process'] = proc_ts
-        await proc_ts.wait()
-        
-    if context.user_data.get('cancel_flag'):
-        for ts in ts_files:
-            if os.path.exists(ts): os.remove(ts)
-        return await query.edit_message_text("🛑 **合并任务已手动终止。**", parse_mode='Markdown')
-        
-    # --- 构建 TS 拼接列表并执行最终合并 ---
-    list_file_path = os.path.join(work_dir, "concat_list_ts.txt")
-    with open(list_file_path, 'w', encoding='utf-8') as f:
-        for ts in ts_files: f.write(f"file '{ts}'\n")
-        
-    await query.edit_message_text(f"✂️ **步骤 2/2: TS缓冲处理完毕，正在进行最终无损拼接...**\n输出文件:\n`{output_filename}`", parse_mode='Markdown')
+    # ================= 第一阶段：尝试极速直连拼接 =================
+    await query.edit_message_text("⏳ **正在尝试极速直连拼接...**", parse_mode='Markdown')
     
-    # 将拼接的 TS 流重新封转为 MP4 (+faststart 优化流媒体播放)
-    cmd_concat = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file_path, "-c", "copy", "-movflags", "+faststart", output_path]
-    process = await asyncio.create_subprocess_exec(*cmd_concat)
+    list_file_path = os.path.join(work_dir, "concat_list.txt")
+    with open(list_file_path, 'w', encoding='utf-8') as f:
+        for file in files_to_merge: f.write(f"file '{file}'\n")
+            
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file_path, "-c", "copy", "-movflags", "+faststart", output_path]
+    process = await asyncio.create_subprocess_exec(*cmd)
     context.user_data['current_process'] = process
     await process.wait()
     
-    # --- 清理所有的临时文件 ---
     if os.path.exists(list_file_path): os.remove(list_file_path)
-    for ts in ts_files:
-        if os.path.exists(ts): os.remove(ts)
+    
+    if context.user_data.get('cancel_flag'):
+        if os.path.exists(output_path): os.remove(output_path)
+        return await query.edit_message_text("🛑 **合并任务已手动终止。**", parse_mode='Markdown')
         
+    # --- 核心拦截：检测是否静默失败 ---
+    output_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+    # 允许 30% 以内的体积误差（更换容器可能会有体积变化），超过则判定为丢帧失败
+    is_success = process.returncode == 0 and output_size >= (total_input_size * 0.7)
+
+    # ================= 第二阶段：如果失败，触发 TS 容错机制 =================
+    if not is_success:
+        await query.edit_message_text(
+            "⚠️ **直连拼接失败或检测到时间戳断层 (丢帧)！**\n"
+            "正在触发 `.ts` 容错处理机制，请耐心等待...", parse_mode='Markdown'
+        )
+        
+        ts_files = []
+        for idx, file_path in enumerate(files_to_merge):
+            if context.user_data.get('cancel_flag'): break
+            
+            ts_path = os.path.join(work_dir, f"temp_merge_fallback_{idx}.ts")
+            ts_files.append(ts_path)
+            
+            # 将视频无损封转为 TS 格式
+            cmd_ts = ["ffmpeg", "-y", "-i", file_path, "-c", "copy", ts_path]
+            proc_ts = await asyncio.create_subprocess_exec(*cmd_ts)
+            context.user_data['current_process'] = proc_ts  
+            await proc_ts.wait()
+            
+        if context.user_data.get('cancel_flag'):
+            for ts in ts_files:
+                if os.path.exists(ts): os.remove(ts)
+            if os.path.exists(output_path): os.remove(output_path)
+            return await query.edit_message_text("🛑 **合并任务已手动终止。**", parse_mode='Markdown')
+            
+        # 构建新的 TS 队列文件进行二次拼接
+        list_file_path_ts = os.path.join(work_dir, "concat_list_ts.txt")
+        with open(list_file_path_ts, 'w', encoding='utf-8') as f_ts:
+            for ts in ts_files: f_ts.write(f"file '{ts}'\n")
+        
+        await query.edit_message_text(f"✂️ **TS 容错转换完成，正在进行最终拼接...**\n输出文件:\n`{output_filename}`", parse_mode='Markdown')
+        
+        cmd_concat_ts = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file_path_ts, "-c", "copy", "-movflags", "+faststart", output_path]
+        process_ts = await asyncio.create_subprocess_exec(*cmd_concat_ts)
+        context.user_data['current_process'] = process_ts
+        await process_ts.wait()
+        
+        # 清理 TS 临时垃圾
+        if os.path.exists(list_file_path_ts): os.remove(list_file_path_ts)
+        for ts in ts_files:
+            if os.path.exists(ts): os.remove(ts)
+            
+        # 再次校验最终生成结果
+        final_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+        is_success = process_ts.returncode == 0 and final_size >= (total_input_size * 0.7)
+
+    # ================= 最终结果输出 =================
     context.user_data['current_process'] = None
     
     if context.user_data.get('cancel_flag'):
         if os.path.exists(output_path): os.remove(output_path)
         await query.edit_message_text("🛑 **合并任务已手动终止。**", parse_mode='Markdown')
-        
-    elif process.returncode == 0:
-        # === 核心防丢帧/防静默失败逻辑：校验体积 ===
-        output_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-        # 如果生成的文件体积小于原总文件的 70%，说明 FFmpeg 悄悄丢弃了后半部分
-        if output_size < total_input_size * 0.7:
-            await query.edit_message_text("⚠️ **合并出现异常 (静默失败拦截)**\n发现合并后的文件大小远小于原文件总和。这通常由于两段视频分辨率、编码不一致，或容器严重损坏导致 FFmpeg 中途退出。请尝试先单独将其转码为 MP4 后再合并！", parse_mode='Markdown')
-        else:
-            await query.edit_message_text(f"✅ **合并完成!**\n\n📁 新文件: `{output_filename}`", parse_mode='Markdown')
+    elif is_success:
+        await query.edit_message_text(f"✅ **合并完成!**\n\n📁 新文件: `{output_filename}`", parse_mode='Markdown')
     else:
-        await query.edit_message_text("❌ 合并失败。文件可能已彻底损坏或编码格式无法兼容。")
+        await query.edit_message_text("❌ **合并彻底失败**\n两段视频的编码或分辨率可能严重不一致，导致容错机制也无法处理。建议先单文件转码后再试！", parse_mode='Markdown')
+
 
 async def action_convert(update: Update, context: ContextTypes.DEFAULT_TYPE, files_to_convert: list):
     query = update.callback_query
