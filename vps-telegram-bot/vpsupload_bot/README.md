@@ -29,7 +29,6 @@ vpsupload_bot/
 ├── install_bot.sh              # 一键部署脚本
 ├── get_json.py                 # YouTube OAuth token.json 生成辅助脚本
 ├── README.md                   # 项目说明
-├── 使用向导.md                 # 详细使用向导
 └── video_bot_mod/              # 模块化核心代码
     ├── __init__.py             # 版本信息
     ├── actions.py              # 浏览、推流、合并、转码、删除动作
