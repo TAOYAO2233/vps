@@ -84,12 +84,12 @@ echo -e "${GREEN}[4/6] 正在准备脚本源码...${NC}"
 BOT_MAIN_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/bot_main.py"
 GET_JSON_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/get%20josn.py"
 
-if [ -s "${SCRIPT_DIR}/bot_main_optimized.py" ]; then
-    cp "${SCRIPT_DIR}/bot_main_optimized.py" bot_main.py
+if [ -s "${SCRIPT_DIR}/bot_main.py" ]; then
+    cp "${SCRIPT_DIR}/bot_main.py" bot_main.py
 elif [ -s "${SCRIPT_DIR}/bot_main.py" ]; then
     cp "${SCRIPT_DIR}/bot_main.py" bot_main.py
 else
-    echo -e "${YELLOW}未在安装脚本同目录找到 bot_main_optimized.py，改为从 GitHub 下载。请确认仓库中已更新优化版。${NC}"
+    echo -e "${YELLOW}未在安装脚本同目录找到 bot_main.py，改为从 GitHub 下载。请确认仓库中已更新优化版。${NC}"
     curl -fSL -o bot_main.py "${BOT_MAIN_URL}"
 fi
 
