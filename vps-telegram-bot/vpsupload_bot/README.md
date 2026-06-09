@@ -78,6 +78,32 @@ sudo ./install_bot.sh
 
 ---
 
+## ⚙️ `.env` 配置示例（v2.5.2）
+
+```env
+BOT_TOKEN=你的BotToken
+ADMIN_ID=你的Telegram数字ID
+BASE_DIR=/storage512/bilivego/download
+RTMP_URL=rtmp://example.com/live/stream_key
+TOKEN_FILE=/root/video_bot/token.json
+ITEMS_PER_PAGE=8
+VIDEO_EXTENSIONS=.mp4,.mkv,.flv,.ts,.webm,.mov
+YOUTUBE_MAX_CONCURRENT_UPLOADS=2
+YOUTUBE_UPLOAD_CHUNK_MB=10
+MERGE_MIN_DURATION_RATIO=0.95
+MERGE_MIN_SIZE_RATIO=0.30
+FFPROBE_TIMEOUT_SECONDS=30
+YOUTUBE_UPLOAD_QUEUE_FILE=/root/video_bot/youtube_upload_queue.json
+LOG_LEVEL=INFO
+```
+
+> 机器人启动会读取系统环境变量优先，然后读取 `.env`。修改后需重启服务：
+> ```bash
+> systemctl restart videobot
+> ```
+
+---
+
 ## 🛠️ 系统要求
 
 ### 支持系统
