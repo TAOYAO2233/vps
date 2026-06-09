@@ -1,15 +1,20 @@
-"""长任务、独占任务与 YouTube 上传池管理。"""
+"""长任务、独占任务、YouTube 上传池与队列持久化管理。"""
 
 import asyncio
+import json
 import logging
+import os
+import tempfile
+import time
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from .config import YOUTUBE_MAX_CONCURRENT_UPLOADS
+from .config import YOUTUBE_MAX_CONCURRENT_UPLOADS, YOUTUBE_UPLOAD_QUEUE_FILE
 
 logger = logging.getLogger(__name__)
+
 
 def get_active_task(context: ContextTypes.DEFAULT_TYPE) -> Optional[asyncio.Task]:
     """Exclusive task: stream/concat/convert/delete. YouTube uploads use a separate pool."""
@@ -23,9 +28,8 @@ def get_active_task(context: ContextTypes.DEFAULT_TYPE) -> Optional[asyncio.Task
 
     return None
 
-def get_youtube_uploads(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Dict[str, Any]]:
-    """Return active/queued YouTube upload tasks and clean finished entries."""
-    uploads = context.user_data.setdefault("youtube_uploads", {})
+
+def _clean_finished_uploads(uploads: Dict[str, Dict[str, Any]]) -> None:
     stale_task_ids = []
     for task_id, info in uploads.items():
         task = info.get("task")
@@ -35,10 +39,27 @@ def get_youtube_uploads(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Dict[st
     for task_id in stale_task_ids:
         uploads.pop(task_id, None)
 
-    return uploads
+
+def get_youtube_uploads(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Dict[str, Any]]:
+    """Return active/queued YouTube uploads, including restored global uploads."""
+    user_uploads = context.user_data.setdefault("youtube_uploads", {})
+    global_uploads = context.bot_data.setdefault("restored_youtube_uploads", {})
+
+    _clean_finished_uploads(user_uploads)
+    _clean_finished_uploads(global_uploads)
+
+    if not global_uploads:
+        return user_uploads
+
+    combined: Dict[str, Dict[str, Any]] = {}
+    combined.update(global_uploads)
+    combined.update(user_uploads)
+    return combined
+
 
 def get_youtube_upload_count(context: ContextTypes.DEFAULT_TYPE) -> int:
     return len(get_youtube_uploads(context))
+
 
 def get_youtube_semaphore(context: ContextTypes.DEFAULT_TYPE) -> asyncio.Semaphore:
     semaphore = context.bot_data.get("youtube_upload_semaphore")
@@ -46,6 +67,84 @@ def get_youtube_semaphore(context: ContextTypes.DEFAULT_TYPE) -> asyncio.Semapho
         semaphore = asyncio.Semaphore(YOUTUBE_MAX_CONCURRENT_UPLOADS)
         context.bot_data["youtube_upload_semaphore"] = semaphore
     return semaphore
+
+
+def _sanitize_upload_info(info: Dict[str, Any]) -> Dict[str, Any]:
+    allowed_keys = {
+        "filename",
+        "path",
+        "chat_id",
+        "user_id",
+        "created_at",
+        "status",
+        "progress",
+    }
+    sanitized = {key: info.get(key) for key in allowed_keys if key in info}
+    sanitized["updated_at"] = time.time()
+    return sanitized
+
+
+def load_persisted_youtube_uploads() -> Dict[str, Dict[str, Any]]:
+    """Load persisted YouTube upload queue from JSON. Corrupt files are preserved as .bad."""
+    if not os.path.exists(YOUTUBE_UPLOAD_QUEUE_FILE):
+        return {}
+
+    try:
+        with open(YOUTUBE_UPLOAD_QUEUE_FILE, "r", encoding="utf-8") as queue_file:
+            data = json.load(queue_file)
+        if isinstance(data, dict):
+            return {str(task_id): dict(info) for task_id, info in data.items() if isinstance(info, dict)}
+    except Exception as exc:
+        logger.exception("读取 YouTube 上传队列失败: %s", exc)
+        bad_path = f"{YOUTUBE_UPLOAD_QUEUE_FILE}.bad"
+        try:
+            os.replace(YOUTUBE_UPLOAD_QUEUE_FILE, bad_path)
+            logger.warning("已将损坏队列文件移动到: %s", bad_path)
+        except OSError:
+            pass
+
+    return {}
+
+
+def save_persisted_youtube_uploads(records: Dict[str, Dict[str, Any]]) -> None:
+    """Atomically save persisted YouTube upload queue."""
+    queue_dir = os.path.dirname(os.path.abspath(YOUTUBE_UPLOAD_QUEUE_FILE))
+    os.makedirs(queue_dir, exist_ok=True)
+
+    fd, temp_path = tempfile.mkstemp(prefix=".youtube_upload_queue_", suffix=".json", dir=queue_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+            json.dump(records, temp_file, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(temp_path, YOUTUBE_UPLOAD_QUEUE_FILE)
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def persist_youtube_upload_task(task_id: str, info: Dict[str, Any]) -> None:
+    records = load_persisted_youtube_uploads()
+    records[task_id] = _sanitize_upload_info(info)
+    save_persisted_youtube_uploads(records)
+
+
+def update_persisted_youtube_upload_task(task_id: str, **updates: Any) -> None:
+    records = load_persisted_youtube_uploads()
+    if task_id not in records:
+        return
+    records[task_id].update({key: value for key, value in updates.items() if key not in {"task", "cancel_event"}})
+    records[task_id]["updated_at"] = time.time()
+    save_persisted_youtube_uploads(records)
+
+
+def remove_persisted_youtube_upload_task(task_id: str) -> None:
+    records = load_persisted_youtube_uploads()
+    if task_id in records:
+        records.pop(task_id, None)
+        save_persisted_youtube_uploads(records)
+
 
 async def start_long_task(
     update: Update,

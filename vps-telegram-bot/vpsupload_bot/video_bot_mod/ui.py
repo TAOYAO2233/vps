@@ -9,7 +9,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from .auth import is_admin
-from .config import BASE_DIR, ITEMS_PER_PAGE, VIDEO_EXTENSIONS
+from .config import ACTION_NAME_MAP, BASE_DIR, ITEMS_PER_PAGE, VIDEO_EXTENSIONS
 from .media_utils import assert_path_inside_base, get_formatted_file_size, safe_join
 from .task_manager import get_active_task, get_youtube_upload_count
 
@@ -61,20 +61,28 @@ async def render_file_selector(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("❌ 目录不存在！")
         return
 
-    all_items = os.listdir(current_dir)
     dirs = []
     files = []
-    for item in all_items:
-        try:
-            item_path = safe_join(current_dir, item)
-        except ValueError:
-            logger.warning("跳过越界路径: %s", item)
-            continue
+    try:
+        with os.scandir(current_dir) as entries:
+            for entry in entries:
+                item = entry.name
+                try:
+                    item_path = safe_join(current_dir, item)
+                except ValueError:
+                    logger.warning("跳过越界路径: %s", item)
+                    continue
 
-        if os.path.isdir(item_path):
-            dirs.append(item)
-        elif os.path.isfile(item_path) and item.lower().endswith(VIDEO_EXTENSIONS):
-            files.append(item)
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        dirs.append(item)
+                    elif entry.is_file(follow_symlinks=False) and item.lower().endswith(VIDEO_EXTENSIONS):
+                        files.append(item)
+                except OSError as exc:
+                    logger.warning("读取目录项失败: %s, %s", item_path, exc)
+    except OSError as exc:
+        await query.edit_message_text(f"❌ 无法读取目录：`{exc}`", parse_mode="Markdown")
+        return
 
     dirs = sorted(dirs)
     files = sorted(files)
@@ -126,18 +134,9 @@ async def render_file_selector(update: Update, context: ContextTypes.DEFAULT_TYP
 
     keyboard.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="menu_main")])
 
-    action_name_map = {
-        "browse": "浏览与查看详情",
-        "stream": "推流",
-        "youtube": "上传 YT",
-        "concat": "合并",
-        "convert": "转码 MP4",
-        "delete": "删除",
-    }
-
     rel_path = os.path.relpath(current_dir, BASE_DIR)
     display_path = "🏠" if rel_path == "." else f"🏠/{rel_path}"
-    header = f"📂 路径: `{display_path}`\n👉 模式: [{action_name_map.get(action_type, action_type.upper())}] (页 {page + 1}/{total_pages})"
+    header = f"📂 路径: `{display_path}`\n👉 模式: [{ACTION_NAME_MAP.get(action_type, action_type.upper())}] (页 {page + 1}/{total_pages})"
 
     if get_active_task(context):
         header += f"\n🔒 独占任务: `{context.user_data.get('active_task_name', '任务')}`"

@@ -1,9 +1,11 @@
-"""YouTube 上传命令与上传任务实现。"""
+"""YouTube 上传命令、上传任务实现与重启恢复。"""
 
 import asyncio
+import logging
 import os
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from google.oauth2.credentials import Credentials
@@ -14,6 +16,7 @@ from telegram.ext import ContextTypes
 
 from .auth import is_admin
 from .config import (
+    ADMIN_ID,
     TOKEN_FILE,
     YOUTUBE_MAX_CONCURRENT_UPLOADS,
     YOUTUBE_SCOPES,
@@ -23,9 +26,15 @@ from .media_utils import assert_path_inside_base, build_progress_bar, format_ela
 from .task_manager import (
     get_active_task,
     get_youtube_semaphore,
-    get_youtube_upload_count,
     get_youtube_uploads,
+    load_persisted_youtube_uploads,
+    persist_youtube_upload_task,
+    remove_persisted_youtube_upload_task,
+    update_persisted_youtube_upload_task,
 )
+
+logger = logging.getLogger(__name__)
+
 
 async def cmd_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -55,6 +64,7 @@ async def cmd_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("\n\u53d1\u9001 /stop \u53ef\u505c\u6b62\u5f53\u524d\u6240\u6709\u4efb\u52a1\u3002")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+
 async def upload_youtube_file(
     context: ContextTypes.DEFAULT_TYPE,
     message,
@@ -67,12 +77,17 @@ async def upload_youtube_file(
 
     def set_upload_info(status: str, progress: Optional[float] = None) -> None:
         uploads = context.user_data.get("youtube_uploads", {})
-        info = uploads.get(task_id)
+        global_uploads = context.bot_data.get("restored_youtube_uploads", {})
+        info = uploads.get(task_id) or global_uploads.get(task_id)
         if not info:
             return
         info["status"] = status
         if progress is not None:
             info["progress"] = progress
+        try:
+            update_persisted_youtube_upload_task(task_id, status=status, progress=info.get("progress"))
+        except Exception as exc:
+            logger.warning("更新 YouTube 上传队列记录失败: %s", exc)
 
     try:
         set_upload_info("\u6392\u961f\u4e2d", 0.0)
@@ -171,6 +186,12 @@ async def upload_youtube_file(
     finally:
         uploads = context.user_data.get("youtube_uploads", {})
         uploads.pop(task_id, None)
+        context.bot_data.get("restored_youtube_uploads", {}).pop(task_id, None)
+        try:
+            remove_persisted_youtube_upload_task(task_id)
+        except Exception as exc:
+            logger.warning("清理 YouTube 上传队列记录失败: %s", exc)
+
 
 async def start_youtube_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE, file_paths: List[str]) -> bool:
     query = update.callback_query
@@ -195,7 +216,7 @@ async def start_youtube_uploads(update: Update, context: ContextTypes.DEFAULT_TY
         return False
 
     await query.answer()
-    uploads = get_youtube_uploads(context)
+    uploads = context.user_data.setdefault("youtube_uploads", {})
     created = []
     now_ms = int(time.time() * 1000)
 
@@ -210,6 +231,8 @@ async def start_youtube_uploads(update: Update, context: ContextTypes.DEFAULT_TY
         info: Dict[str, Any] = {
             "filename": filename,
             "path": file_path,
+            "chat_id": update.effective_chat.id if update.effective_chat else ADMIN_ID,
+            "user_id": update.effective_user.id if update.effective_user else ADMIN_ID,
             "cancel_event": cancel_event,
             "created_at": time.time(),
             "status": "\u6392\u961f\u4e2d",
@@ -217,6 +240,11 @@ async def start_youtube_uploads(update: Update, context: ContextTypes.DEFAULT_TY
             "task": None,
         }
         uploads[task_id] = info
+        try:
+            persist_youtube_upload_task(task_id, info)
+        except Exception as exc:
+            logger.warning("写入 YouTube 上传队列记录失败: %s", exc)
+
         task = asyncio.create_task(
             upload_youtube_file(context, progress_message, file_path, task_id, cancel_event),
             name=f"youtube:{filename}",
@@ -224,7 +252,6 @@ async def start_youtube_uploads(update: Update, context: ContextTypes.DEFAULT_TY
         info["task"] = task
         created.append(filename)
 
-    context.user_data["youtube_uploads"] = uploads
     context.user_data["selected_youtube"] = set()
 
     try:
@@ -238,3 +265,67 @@ async def start_youtube_uploads(update: Update, context: ContextTypes.DEFAULT_TY
         pass
 
     return True
+
+
+async def restore_persisted_youtube_uploads(application) -> None:
+    """Restore unfinished YouTube upload tasks after Bot restart."""
+    records = load_persisted_youtube_uploads()
+    if not records:
+        return
+
+    restored_uploads = application.bot_data.setdefault("restored_youtube_uploads", {})
+    logger.info("发现 %s 个待恢复 YouTube 上传任务", len(records))
+
+    for old_task_id, record in list(records.items()):
+        file_path = str(record.get("path", ""))
+        try:
+            file_path = assert_path_inside_base(file_path)
+        except Exception as exc:
+            logger.warning("跳过非法恢复路径: task=%s path=%s error=%s", old_task_id, file_path, exc)
+            remove_persisted_youtube_upload_task(old_task_id)
+            continue
+
+        if not os.path.isfile(file_path):
+            logger.warning("跳过不存在的恢复文件: task=%s path=%s", old_task_id, file_path)
+            remove_persisted_youtube_upload_task(old_task_id)
+            continue
+
+        chat_id = int(record.get("chat_id") or record.get("user_id") or ADMIN_ID)
+        filename = os.path.basename(file_path)
+        task_id = f"restored_{int(time.time() * 1000)}_{abs(hash(file_path)) % 100000}"
+        cancel_event = asyncio.Event()
+
+        try:
+            message = await application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "\u267b\ufe0f **\u68c0\u6d4b\u5230\u670d\u52a1\u91cd\u542f\uff0c\u6b63\u5728\u6062\u590d YouTube \u4e0a\u4f20\u4efb\u52a1**\n"
+                    f"`{filename}`"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            logger.warning("发送恢复提示失败，跳过任务: task=%s chat_id=%s error=%s", old_task_id, chat_id, exc)
+            continue
+
+        info: Dict[str, Any] = {
+            "filename": filename,
+            "path": file_path,
+            "chat_id": chat_id,
+            "user_id": int(record.get("user_id") or ADMIN_ID),
+            "cancel_event": cancel_event,
+            "created_at": float(record.get("created_at") or time.time()),
+            "status": "\u6062\u590d\u4e2d",
+            "progress": float(record.get("progress") or 0.0),
+            "task": None,
+        }
+        restored_uploads[task_id] = info
+        remove_persisted_youtube_upload_task(old_task_id)
+        persist_youtube_upload_task(task_id, info)
+
+        fake_context = SimpleNamespace(user_data={"youtube_uploads": {}}, bot_data=application.bot_data)
+        task = asyncio.create_task(
+            upload_youtube_file(fake_context, message, file_path, task_id, cancel_event),
+            name=f"youtube:restore:{filename}",
+        )
+        info["task"] = task

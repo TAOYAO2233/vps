@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-from .config import BASE_DIR, MERGE_MIN_DURATION_RATIO, MERGE_MIN_SIZE_RATIO
+from .config import BASE_DIR, FFPROBE_TIMEOUT_SECONDS, MERGE_MIN_DURATION_RATIO, MERGE_MIN_SIZE_RATIO
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,7 @@ def format_duration(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 async def get_video_duration(filepath: str) -> float:
+    """Use ffprobe to read media duration. Return 0.0 and log details on failure."""
     cmd = [
         "ffprobe",
         "-v", "error",
@@ -73,15 +74,51 @@ async def get_video_duration(filepath: str) -> float:
         "-of", "default=noprint_wrappers=1:nokey=1",
         filepath,
     ]
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await process.communicate()
+    process = None
     try:
-        return float(stdout.decode().strip())
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=FFPROBE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        if process and process.returncode is None:
+            process.kill()
+            await process.communicate()
+        logger.warning("ffprobe 超时: file=%s timeout=%ss", filepath, FFPROBE_TIMEOUT_SECONDS)
+        return 0.0
+    except FileNotFoundError:
+        logger.exception("ffprobe 未安装或不可执行，无法分析文件时长: %s", filepath)
+        return 0.0
+    except Exception as exc:
+        logger.exception("ffprobe 执行异常: file=%s error=%s", filepath, exc)
+        return 0.0
+
+    stderr_text = stderr.decode("utf-8", errors="ignore").strip()
+    stdout_text = stdout.decode("utf-8", errors="ignore").strip()
+
+    if process.returncode != 0:
+        logger.warning(
+            "ffprobe 分析失败: file=%s returncode=%s stderr=%s",
+            filepath,
+            process.returncode,
+            stderr_text[:500],
+        )
+        return 0.0
+
+    try:
+        return float(stdout_text)
     except ValueError:
+        logger.warning(
+            "ffprobe 输出无法解析为时长: file=%s stdout=%r stderr=%s",
+            filepath,
+            stdout_text,
+            stderr_text[:500],
+        )
         return 0.0
 
 def build_progress_bar(percent: float, length: int = 20) -> str:
