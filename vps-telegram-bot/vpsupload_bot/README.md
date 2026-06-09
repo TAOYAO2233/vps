@@ -78,32 +78,6 @@ sudo ./install_bot.sh
 
 ---
 
-## ⚙️ `.env` 配置示例（v2.5.2）
-
-```env
-BOT_TOKEN=你的BotToken
-ADMIN_ID=你的Telegram数字ID
-BASE_DIR=/storage512/bilivego/download
-RTMP_URL=rtmp://example.com/live/stream_key
-TOKEN_FILE=/root/video_bot/token.json
-ITEMS_PER_PAGE=8
-VIDEO_EXTENSIONS=.mp4,.mkv,.flv,.ts,.webm,.mov
-YOUTUBE_MAX_CONCURRENT_UPLOADS=2
-YOUTUBE_UPLOAD_CHUNK_MB=10
-MERGE_MIN_DURATION_RATIO=0.95
-MERGE_MIN_SIZE_RATIO=0.30
-FFPROBE_TIMEOUT_SECONDS=30
-YOUTUBE_UPLOAD_QUEUE_FILE=/root/video_bot/youtube_upload_queue.json
-LOG_LEVEL=INFO
-```
-
-> 机器人启动会读取系统环境变量优先，然后读取 `.env`。修改后需重启服务：
-> ```bash
-> systemctl restart videobot
-> ```
-
----
-
 ## 🛠️ 系统要求
 
 ### 支持系统
@@ -139,17 +113,22 @@ google-auth>=2,<3
 示例：
 
 ```env
-BOT_TOKEN=123456789:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-ADMIN_ID=123456789
+BOT_TOKEN=你的BotToken
+ADMIN_ID=你的Telegram数字ID
 BASE_DIR=/storage512/bilivego/download
-RTMP_URL=rtmp://example.com/live/your_stream_key
+RTMP_URL=rtmp://example.com/live/stream_key
 TOKEN_FILE=/root/video_bot/token.json
 ITEMS_PER_PAGE=8
+VIDEO_EXTENSIONS=.mp4,.mkv,.flv,.ts,.webm,.mov
 YOUTUBE_MAX_CONCURRENT_UPLOADS=2
 YOUTUBE_UPLOAD_CHUNK_MB=10
 MERGE_MIN_DURATION_RATIO=0.95
 MERGE_MIN_SIZE_RATIO=0.30
+FFPROBE_TIMEOUT_SECONDS=30
+YOUTUBE_UPLOAD_QUEUE_FILE=/root/video_bot/youtube_upload_queue.json
+LOG_LEVEL=INFO
 ```
+
 
 | 变量 | 说明 | 默认值 |
 | --- | --- | --- |
@@ -159,10 +138,14 @@ MERGE_MIN_SIZE_RATIO=0.30
 | `RTMP_URL` | RTMP 推流地址，可留空，不使用推流时不影响其他功能 | 空 |
 | `TOKEN_FILE` | YouTube OAuth 凭据文件路径 | `/root/video_bot/token.json` |
 | `ITEMS_PER_PAGE` | 文件列表每页显示数量 | `8` |
+| `VIDEO_EXTENSIONS` | 允许识别为视频文件的扩展名列表，多个后缀用英文逗号分隔。可按需增加 .mov、.webm 等格式 | `.mp4,.mkv,.flv,.ts,.webm,.mov` |
 | `YOUTUBE_MAX_CONCURRENT_UPLOADS` | YouTube 同时上传数量上限 | `2` |
 | `YOUTUBE_UPLOAD_CHUNK_MB` | YouTube 分片上传块大小，单位 MB | `10` |
 | `MERGE_MIN_DURATION_RATIO` | 合并输出时长校验阈值 | `0.95` |
 | `MERGE_MIN_SIZE_RATIO` | 合并输出体积辅助校验阈值 | `0.30` |
+| `FFPROBE_TIMEOUT_SECONDS` | ffprobe 获取视频时长时的超时时间，单位秒。可避免个别异常文件卡住分析流程 | `30` |
+| `YOUTUBE_UPLOAD_QUEUE_FILE` | YouTube 上传队列持久化文件路径。用于记录未完成的上传任务，便于 Bot 重启后恢复队列状态 | `/root/video_bot/youtube_upload_queue.json` |
+| `LOG_LEVEL` | 日志输出等级，用于控制日志详细程度。常见值有 DEBUG、INFO、WARNING、ERROR | `INFO` |
 
 修改配置后重启服务：
 
