@@ -70,7 +70,7 @@ if ! command -v ffprobe >/dev/null 2>&1; then
     exit 1
 fi
 
-# 4. 初始化 Python 虚拟环境并安装运行依赖
+# 4. 初始化 Python 虚拟环境并安装环境库
 echo -e "${GREEN}[3/6] 正在初始化 Python 虚拟环境并安装运行依赖...${NC}"
 python3 -m venv yt
 # shellcheck source=/dev/null
@@ -79,52 +79,32 @@ source yt/bin/activate
 pip install --upgrade pip
 pip install 'python-telegram-bot>=21,<23' 'google-api-python-client>=2,<3' 'google-auth-oauthlib>=1,<2' 'google-auth>=2,<3'
 
-# 5. 准备源码文件：支持 GitHub 模块化目录 video_bot_mod/
+# 5. 准备源码文件：优先使用安装脚本同目录下的优化版，缺失时再从 GitHub 拉取
 echo -e "${GREEN}[4/6] 正在准备脚本源码...${NC}"
 BOT_MAIN_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/bot_main.py"
 GET_JSON_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/get%20josn.py"
-MODULE_URL_BASE="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/video_bot_mod"
 
-# 拉取 bot_main.py
 if [ -s "${SCRIPT_DIR}/bot_main.py" ]; then
     cp "${SCRIPT_DIR}/bot_main.py" bot_main.py
+elif [ -s "${SCRIPT_DIR}/bot_main.py" ]; then
+    cp "${SCRIPT_DIR}/bot_main.py" bot_main.py
 else
-    echo -e "${YELLOW}未找到本地 bot_main.py，改为从 GitHub 下载...${NC}"
+    echo -e "${YELLOW}未在安装脚本同目录找到 bot_main.py，改为从 GitHub 下载。请确认仓库中已更新优化版。${NC}"
     curl -fSL -o bot_main.py "${BOT_MAIN_URL}"
 fi
 
-# 拉取模块化目录 video_bot_mod/
-BOT_CORE_DIR="${BOT_DIR}/video_bot_mod"
-mkdir -p "${BOT_CORE_DIR}"
-
-if [ -d "${SCRIPT_DIR}/video_bot_mod" ]; then
-    echo -e "${GREEN}检测到本地 video_bot_mod/，正在复制...${NC}"
-    rm -rf "${BOT_CORE_DIR}"
-    cp -r "${SCRIPT_DIR}/video_bot_mod" "${BOT_CORE_DIR}"
-else
-    echo -e "${YELLOW}未检测到本地 video_bot_mod/，从 GitHub 下载模块文件...${NC}"
-    for file in __init__.py actions.py auth.py config.py handlers.py media_utils.py task_manager.py ui.py youtube_upload.py; do
-        curl -fSL -o "${BOT_CORE_DIR}/${file}" "${MODULE_URL_BASE}/${file}"
-    done
-fi
-
-# 拉取 get_json.py
 if [ -s "${SCRIPT_DIR}/get_json.py" ]; then
     cp "${SCRIPT_DIR}/get_json.py" get_json.py
 else
     curl -fSL -o get_json.py "${GET_JSON_URL}"
 fi
 
-# 检查文件完整性
 if [ ! -s "bot_main.py" ] || [ ! -s "get_json.py" ]; then
     echo -e "${RED}❌ 错误：源码文件准备失败或为空！请检查文件是否存在或 VPS 与 GitHub 的连通性。${NC}"
     exit 1
 fi
 
-# 编译检查
-python3 -m py_compile bot_main.py "${BOT_CORE_DIR}"/*.py
-
-# 6. 交互式配置：写入 .env
+# 6. 交互式配置：写入 .env，不再 sed 修改 Python 源码
 echo -e "${GREEN}[5/6] 正在配置机器人环境参数...${NC}"
 read -r -p "请输入您的 Telegram Bot Token: " USER_TOKEN
 read -r -p "请输入您的 Telegram Admin ID (纯数字): " USER_ADMIN_ID
@@ -161,31 +141,34 @@ chmod 600 "${ENV_FILE}"
 echo -e "${GREEN}.env 配置文件已生成：${ENV_FILE}${NC}"
 echo -e "${YELLOW}注意：Bot Token、Admin ID、RTMP 地址现在只保存在 .env，不会写入 bot_main.py。${NC}"
 
-# 7. YouTube OAuth 提示
+# 7. 阻断检测：YouTube OAuth 凭据逻辑验证
 echo -e "${YELLOW}==================================================================${NC}"
 echo -e "${YELLOW}💡 提示与操作指引：YouTube API 授权认证${NC}"
 echo -e "${YELLOW}==================================================================${NC}"
-echo -e "1. 请下载 get_json.py 并在本地运行完成 OAuth 授权，生成 token.json"
-echo -e "2. 将 token.json 上传到 VPS 的 ${BOT_DIR}/ 目录"
+echo -e "1. 请下载托管在您 GitHub 上的 ${BLUE}get_json.py${NC} 并在您的${GREEN}【本地个人电脑】${NC}上运行。"
+echo -e "2. 运行前确保本地有从 Google Cloud Console 导出的 ${BLUE}client_secrets.json${NC}。"
+echo -e "3. 在本地完成浏览器鉴权解锁后，本地会生成授权文件 ${GREEN}token.json${NC}。"
+echo -e "4. 请通过 SFTP/SCP 图形化工具，将 ${GREEN}token.json${NC} 传到 VPS 的 ${BOT_DIR}/ 目录下。"
+echo -e "5. 如果暂时不使用 YouTube 上传功能，也可以之后再补传 token.json。"
 echo -e "${YELLOW}==================================================================${NC}"
 
 read -r -p "是否现在等待检测 token.json？[y/N]: " WAIT_TOKEN
 if [[ "${WAIT_TOKEN}" =~ ^[Yy]$ ]]; then
     while true; do
         if [ -f "${BOT_DIR}/token.json" ]; then
-            echo -e "${GREEN}🎉 成功检测到 token.json！${NC}"
+            echo -e "${GREEN}🎉 完美！成功检测到 token.json 认证凭据。${NC}"
             break
         else
-            echo -e "${RED}🚨 尚未检测到 token.json。${NC}"
-            read -r -p "传输完成后按 [Enter] 键重新检测（或 Ctrl+C 退出）：" _dummy
+            echo -e "${RED}🚨 尚未在目录中检测到 token.json 凭据文件。${NC}"
+            read -r -p "请在传输完成后按 [Enter] 键触发重新检测（或按 Ctrl+C 终止退出）：" _dummy
         fi
     done
 else
-    echo -e "${YELLOW}已跳过 token.json 等待，可在之后补传。${NC}"
+    echo -e "${YELLOW}已跳过 token.json 等待。YouTube 上传功能会在 token.json 补齐后可用。${NC}"
 fi
 
-# 8. 写入 Systemd 服务
-echo -e "${GREEN}[6/6] 正在注册 Systemd 服务...${NC}"
+# 8. 写入 Systemd 服务单元
+echo -e "${GREEN}[6/6] 正在向系统注册守护进程服务 (Systemd)...${NC}"
 SERVICE_FILE="/etc/systemd/system/videobot.service"
 
 cat > "${SERVICE_FILE}" <<EOF
@@ -212,7 +195,7 @@ systemctl enable videobot
 systemctl restart videobot
 
 echo -e "${GREEN}==================================================${NC}"
-echo -e "${GREEN}🎉 多媒体控制机器人已成功部署并运行！${NC}"
+echo -e "${GREEN}🎉 恭喜！多媒体控制机器人已成功部署并于后台运行。${NC}"
 echo -e "配置文件：        ${BLUE}${ENV_FILE}${NC}"
 echo -e "实时查看运行日志： ${BLUE}journalctl -u videobot -f${NC}"
 echo -e "停止服务：        ${BLUE}systemctl stop videobot${NC}"
