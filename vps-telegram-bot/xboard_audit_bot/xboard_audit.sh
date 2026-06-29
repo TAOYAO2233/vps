@@ -13,7 +13,7 @@ URL_PYTHON_HIGH="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/mai
 
 clear
 echo -e "${BLUE}====================================================${NC}"
-echo -e "${GREEN}    Xboard 节点网络访问多机集中审计一键脚本 (智能双输入版)${NC}"
+echo -e "${GREEN}    Xboard 节点网络访问多机集中审计一键脚本 (稳定守护版)${NC}"
 echo -e "${YELLOW}    系统支持: Ubuntu 20.04+ (支持使用 IP 或代号直接添加节点)${NC}"
 echo -e "${BLUE}====================================================${NC}"
 
@@ -32,14 +32,14 @@ check_rsyslog() {
         apt-get install rsyslog -y > /dev/null 2>&1
         
         mkdir -p /etc/rsyslog.d
-        if [ ! -f "/etc/rsyslog.conf" ] && [ -f "/usr/share/doc/rsyslog/examples/rsyslog.conf" ]; then
+        if [ ! -f "/etc/rsyslog.conf" ] && [ -f "/usr/share/doc/doc/rsyslog/examples/rsyslog.conf" ]; then
             cp /usr/share/doc/rsyslog/examples/rsyslog.conf /etc/rsyslog.conf
         fi
         echo -e "${GREEN}✅ rsyslog 补全成功！${NC}"
     fi
 }
 
-# 管道流重建与配置优化
+# 管道流重建与配置优化 (已改为 Systemd 强力守护模式，永不挂掉)
 start_journal_tunnel() {
     if [ -f "/etc/xboard-node/config.yml" ]; then
         if grep -q "log_level:[[:space:]]*warn" /etc/xboard-node/config.yml; then
@@ -53,14 +53,39 @@ start_journal_tunnel() {
         fi
     fi
 
-    echo -e "${YELLOW}🚀 正在建立 journalctl -> /home/xboard_log/xboard.log 实时导流管道...${NC}"
+    echo -e "${YELLOW}🚀 正在通过 Systemd 构建本地日志导流守护服务 (xboard-tunnel)...${NC}"
+    
+    # 清理旧的 nohup 残留进程
     pkill -f "journalctl -u xboard-node" > /dev/null 2>&1
-    nohup journalctl -u xboard-node -f --no-pager > /home/xboard_log/xboard.log 2>&1 &
+
+    # 直接用 Systemd 动态托管这个导流任务
+    cat << 'TUNNELEOF' > /etc/systemd/system/xboard-tunnel.service
+[Unit]
+Description=Xboard 本地日志重定向导流工具
+After=network.target xboard-node.service
+
+[Service]
+Type=simple
+User=root
+# 使用 bash -c 包装重定向，并加入垫底历史日志读取，避免无新日志时闪退
+ExecStart=/bin/bash -c '/usr/bin/journalctl -u xboard-node --since "1 hour ago" -f --no-pager > /home/xboard_log/xboard.log'
+# 核心控制：无论什么原因挂掉，5秒内必定强制重启
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+TUNNELEOF
+
+    systemctl daemon-reload
+    systemctl enable --now xboard-tunnel
+    systemctl restart xboard-tunnel
+    
     sleep 2
-    if ps ax | grep -v grep | grep "journalctl -u xboard-node" > /dev/null; then
-        echo -e "${GREEN}✅ 实时日志导流管道建立成功！${NC}"
+    if systemctl is-active --quiet xboard-tunnel; then
+        echo -e "${GREEN}✅ 本地日志强力守护管道架设成功且运行中！${NC}"
     else
-        echo -e "${RED}❌ 警告：未检测到 xboard-node 服务运行，导流管道已置于后台挂起监控。${NC}"
+        echo -e "${RED}❌ 警告：本地导流守护服务未能正常启动，请检查本地 xboard-node 的 Systemd 服务名是否正确。${NC}"
     fi
 }
 
@@ -253,7 +278,6 @@ add_new_node_on_master() {
     if grep -q "${LOG_FILE_NAME}" /root/xboard_log/xboard_monitor.py; then
         echo -e "${YELLOW}ℹ️  Python 核心中已并联此节点，跳过注入。${NC}"
     else
-        # 💡 摒弃脆弱的 sed 方案，改用 100% 稳健的 python 原生无损切片注入
         python3 -c "
 file_path = '/root/xboard_log/xboard_monitor.py'
 with open(file_path, 'r', encoding='utf-8') as f: lines = f.readlines()
