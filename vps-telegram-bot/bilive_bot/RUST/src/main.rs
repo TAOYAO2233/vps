@@ -4,11 +4,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
-use tokio::sync::Mutex;
 
 // ================= 全局配置加载 =================
 struct Config {
@@ -89,7 +87,7 @@ impl BiliLiveClient {
             }
             Err(e) => {
                 log::error!("API 请求失败: {}", e);
-                None
+                return None;
             }
         }
     }
@@ -127,7 +125,7 @@ impl BiliLiveClient {
 
 // ================= 键盘与界面构建 =================
 async fn build_main_keyboard() -> InlineKeyboardMarkup {
-    let lives = BiliLiveClient.get_lives().await;
+    let lives = BiliLiveClient::get_lives().await;
     let mut keyboard = Vec::new();
 
     for item in lives {
@@ -200,7 +198,7 @@ async fn build_detail_keyboard(live_id: &str) -> (String, Option<InlineKeyboardM
 
 // ================= 辅助函数：权限验证 =================
 fn is_admin(user_id: UserId) -> bool {
-    CONFIG.admin_ids.contains(&user_id.0)
+    CONFIG.admin_ids.contains(&(user_id.0 as i64))
 }
 
 // ================= 消息处理器逻辑 =================
