@@ -162,7 +162,7 @@ pub async fn action_convert(
     bot: Bot,
     msg: Message,
     files: Vec<PathBuf>,
-    state: Arc<AppState>,
+    _state: Arc<AppState>,
     cancel_flag: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
 ) {

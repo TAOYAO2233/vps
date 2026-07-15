@@ -181,7 +181,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         }
     } else if data.starts_with("execbatch_") {
         let action = data.strip_prefix("execbatch_").unwrap();
-        let session = state.get_session(user_id).await;
+        let mut session = state.get_session(user_id).await;
         let selected = session.get_selected(action).clone();
         
         let mut target_files = Vec::new();
