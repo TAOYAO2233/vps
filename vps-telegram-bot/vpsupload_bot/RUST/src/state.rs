@@ -63,7 +63,7 @@ pub struct AppState {
     pub sessions: Mutex<HashMap<i64, UserSession>>,
 }
 
-#[allow(dead_code)] // 允许上传元数据结构中暂未被全段读取的内存字段，消除 dead_code 警告
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct YoutubeUploadInfo {
     pub filename: String,

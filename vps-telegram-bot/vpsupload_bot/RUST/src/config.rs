@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-#[allow(dead_code)] // 允许暂未被 Rust 读取的预留配置项，消除 dead_code 警告
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bot_token: String,

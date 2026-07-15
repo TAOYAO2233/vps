@@ -71,7 +71,7 @@ pub fn format_duration(seconds: f64) -> String {
     format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
-#[allow(dead_code)] // 允许暂未使用的通用时间换算函数
+#[allow(dead_code)]
 pub fn format_elapsed(seconds: f64) -> String {
     let s_int = seconds.max(0.0) as u64;
     let h = s_int / 3600;
@@ -88,7 +88,6 @@ pub fn format_elapsed(seconds: f64) -> String {
 
 pub fn build_progress_bar(percent: f64, length: usize, theme: usize) -> String {
     let p = percent.clamp(0.0, 100.0);
-    
     match theme {
         1 => {
             let local_length = 10;
