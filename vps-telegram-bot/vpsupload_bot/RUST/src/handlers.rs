@@ -4,7 +4,6 @@ use crate::media_utils::format_elapsed;
 use crate::task_manager::AppState;
 use crate::ui::*;
 use crate::youtube_upload::start_youtube_uploads;
-use std::path::PathBuf;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;

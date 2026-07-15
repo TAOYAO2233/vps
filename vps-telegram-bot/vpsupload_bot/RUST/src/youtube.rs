@@ -1,12 +1,12 @@
 use crate::config::Config;
-use crate::media_utils::{assert_path_inside_base, build_progress_bar, format_elapsed};
+use crate::media_utils::{assert_path_inside_base, build_progress_bar};
 use crate::task_manager::{save_persisted_queue, AppState, YoutubeUploadInfo};
 use anyhow::{anyhow, Result};
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::Client;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -191,7 +191,6 @@ async fn update_status(state: &Arc<AppState>, queue_path: &Path, task_id: &str, 
 }
 
 fn abs_hash(path: &Path) -> u64 {
-    use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
     hasher.finish()

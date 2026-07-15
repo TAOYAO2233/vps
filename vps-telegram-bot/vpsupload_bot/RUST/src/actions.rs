@@ -14,7 +14,6 @@ use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::watch;
 
 pub async fn action_browse(bot: Bot, q: CallbackQuery, path: PathBuf, config: Arc<Config>) -> Result<()> {
     let safe_path = assert_path_inside_base(&config.base_dir, &path)?;
@@ -317,7 +316,6 @@ pub async fn action_convert(
         let safe_path = assert_path_inside_base(&config.base_dir, path)?;
         let stem = safe_path.file_stem().unwrap().to_str().unwrap();
         let output_path = unique_path(&safe_path.parent().unwrap().join(format!("{}.mp4", stem)));
-        let out_name = output_path.file_name().unwrap().to_str().unwrap().to_string();
         let in_name = safe_path.file_name().unwrap().to_str().unwrap().to_string();
         let duration = get_video_duration(&safe_path, config.ffprobe_timeout_seconds).await;
 

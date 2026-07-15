@@ -93,7 +93,7 @@ impl AppState {
             stopped.push(format!("独占任务 [{}]", task.name));
         }
         let mut uploads = self.youtube_uploads.lock().await;
-        for (id, info) in uploads.iter_mut() {
+        for (_, info) in uploads.iter_mut() {
             if let Some(ref tx) = info.cancel_tx {
                 let _ = tx.send(true);
                 stopped.push(format!("上传任务 [{}]", info.filename));

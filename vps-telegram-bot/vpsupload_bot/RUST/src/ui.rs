@@ -1,9 +1,9 @@
 use crate::config::{action_name_map, Config};
-use crate::media_utils::{assert_path_inside_base, get_formatted_file_size, safe_join};
+use crate::media_utils::{assert_path_inside_base, get_formatted_file_size};
 use crate::task_manager::AppState;
 use anyhow::Result;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use teloxide::payloads::EditMessageTextSetters;
 use teloxide::prelude::*;
