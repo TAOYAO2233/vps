@@ -33,7 +33,7 @@ mkdir -p "$TARGET_DIR"
 cd "$TARGET_DIR"
 
 # 2. 克隆整个仓库代码
-GITHUB_REPO="***" # 请替换为 https://github.com/TAOYAO2233/vps.git
+GITHUB_REPO="https://github.com/TAOYAO2233/vps.git" # 请替换为 
 
 if [ "$GITHUB_REPO" = "***" ] || [ -z "$GITHUB_REPO" ]; then
     echo -e "${RED}错误: 请先用文本编辑器打开本脚本，将 GITHUB_REPO=\"***\" 中的 *** 替换为您真实的 GitHub 仓库链接！${NC}"
