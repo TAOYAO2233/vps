@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
-use tracing::{info, error};
+use reqwest::header::CONTENT_LENGTH;
 
 use crate::state::{AppState, YoutubeUploadInfo};
 use crate::media_utils::build_progress_bar;
@@ -16,12 +16,12 @@ pub async fn start_youtube_upload(
     msg: Message,
     filepath: PathBuf,
     state: Arc<AppState>,
+    cancel_flag: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
 ) {
     let filename = filepath.file_name().unwrap().to_string_lossy().to_string();
     let file_size = std::fs::metadata(&filepath).map(|m| m.len()).unwrap_or(0);
 
-    // 更新内存中的上传进度表
     {
         let mut map = state.youtube_uploads.lock().await;
         map.insert(filepath.to_str().unwrap().to_string(), YoutubeUploadInfo {
@@ -29,6 +29,7 @@ pub async fn start_youtube_upload(
             filepath: filepath.clone(),
             status: "排队中".to_string(),
             progress: 0.0,
+            cancel_flag: cancel_flag.clone(),
             cancel_notify: cancel_notify.clone(),
             created_at: chrono::Utc::now().timestamp() as f64,
         });
@@ -37,28 +38,23 @@ pub async fn start_youtube_upload(
     let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("⏳ **排队等待 YouTube 分发限制**...\n`{}`", filename))
         .parse_mode(ParseMode::MarkdownV2).await;
 
-    // 申请并发上传凭据（信号量保护）
     let _permit = match state.youtube_semaphore.acquire().await {
         Ok(p) => p,
         Err(_) => return,
     };
 
-    if cancel_notify.is_notified() {
+    if cancel_flag.load(Ordering::SeqCst) {
         remove_upload_record(&filepath, &state).await;
         return;
     }
 
-    // 更新状态
     update_upload_status(&filepath, "上传中", 0.0, &state).await;
     let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🚀 **正在连接 YouTube 上传端口**...\n`{}`", filename))
         .parse_mode(ParseMode::MarkdownV2).await;
 
-    // --- 简单模拟 OAuth 令牌解析与会话建立 ---
-    // (在实际生产环境可读取 token.json 中的 access_token)
     let access_token = "YOUR_OAUTH_ACCESS_TOKEN"; 
     let client = reqwest::Client::new();
     
-    // 1. 发起初始化请求拿到 Location URL
     let init_url = "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status";
     let body_json = serde_json::json!({
         "snippet": { "title": filename.chars().take(95).collect::<String>(), "categoryId": "22" },
@@ -83,14 +79,13 @@ pub async fn start_youtube_upload(
         }
     };
 
-    // 2. 循环读取并分段发出 Chunk (根据 chunkSize 切分)
     let chunk_size = (state.config.youtube_upload_chunk_mb * 1024 * 1024) as u64;
     let mut file = File::open(&filepath).await.unwrap();
     let mut offset = 0u64;
     let mut last_update = std::time::Instant::now();
 
     while offset < file_size {
-        if cancel_notify.is_notified() {
+        if cancel_flag.load(Ordering::SeqCst) {
             let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🛑 **YouTube 上传已取消**:\n`{}`", filename)).parse_mode(ParseMode::MarkdownV2).await;
             remove_upload_record(&filepath, &state).await;
             return;
@@ -102,7 +97,6 @@ pub async fn start_youtube_upload(
 
         let content_range = format!("bytes {}-{}/{}", offset, offset + current_chunk - 1, file_size);
         
-        // 发出切片
         let _chunk_res = client.put(&upload_url)
             .header("Content-Range", content_range)
             .header(CONTENT_LENGTH, current_chunk)

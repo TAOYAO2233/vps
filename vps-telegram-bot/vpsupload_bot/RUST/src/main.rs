@@ -6,9 +6,10 @@ mod actions;
 mod youtube;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use teloxide::prelude::*;
-use teloxide::types::ParseMode;
+use teloxide::types::{MaybeInaccessibleMessage, Message, ParseMode};
 use tracing::{info, error};
 
 use config::AppConfig;
@@ -56,8 +57,9 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
         } else if text.starts_with("/stop") {
             let mut active = state.active_task.lock().await;
             if let Some(task) = active.take() {
+                task.cancel_flag.store(true, Ordering::SeqCst);
                 task.cancel_notify.notify_waiters();
-                bot.send_message(msg.chat.id, format!("🛑 **中断了任务**: `{}`", task.name)).parse_mode(ParseMode::MarkdownV2).await?;
+                bot.send_message(msg.chat.id, format!("🛑 **已发送信号终止任务**: `{}`", task.name)).parse_mode(ParseMode::MarkdownV2).await?;
             } else {
                 bot.send_message(msg.chat.id, "ℹ️ 当前没有正在运行的独占任务。").await?;
             }
@@ -151,7 +153,6 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         if let Some(filename) = session.current_files.get(idx) {
             let path = session.current_dir.join(filename);
             
-            // 独占任务检查
             let mut active_lock = state.active_task.lock().await;
             if active_lock.is_some() && action != "browse" {
                 bot.answer_callback_query(q.id).text("⚠️ 有任务正在运行中，请先 /stop 终止！").show_alert(true).await?;
@@ -164,15 +165,17 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
                 bot.answer_callback_query(q.id).text(format!("📄 {}\n大小: {}\n时长: {}", filename, size, media_utils::format_duration(dur))).show_alert(true).await?;
             } else if action == "stream" {
                 let notify = Arc::new(Notify::new());
-                *active_lock = Some(ActiveTask { name: format!("推流: {}", filename), cancel_notify: notify.clone() });
-                if let Some(m) = q.message {
-                    tokio::spawn(actions::action_stream(bot.clone(), m, path, state.clone(), notify));
+                let flag = Arc::new(AtomicBool::new(false));
+                *active_lock = Some(ActiveTask { name: format!("推流: {}", filename), cancel_flag: flag.clone(), cancel_notify: notify.clone() });
+                if let Some(MaybeInaccessibleMessage::Regular(msg)) = q.message.clone() {
+                    tokio::spawn(actions::action_stream(bot.clone(), msg, path, state.clone(), flag, notify));
                 }
             } else if action == "youtube" {
                 let notify = Arc::new(Notify::new());
-                if let Some(m) = q.message {
-                    let progress_msg = bot.send_message(m.chat().id, "正在初始化 YouTube...").await?;
-                    tokio::spawn(youtube::start_youtube_upload(bot.clone(), progress_msg, path, state.clone(), notify));
+                let flag = Arc::new(AtomicBool::new(false));
+                if let Some(MaybeInaccessibleMessage::Regular(msg)) = q.message.clone() {
+                    let progress_msg = bot.send_message(msg.chat.id, "正在初始化 YouTube...").await?;
+                    tokio::spawn(youtube::start_youtube_upload(bot.clone(), progress_msg, path, state.clone(), flag, notify));
                 }
             }
         }
@@ -200,15 +203,16 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         }
 
         let notify = Arc::new(Notify::new());
-        *active_lock = Some(ActiveTask { name: format!("批量操作: {}", action), cancel_notify: notify.clone() });
+        let flag = Arc::new(AtomicBool::new(false));
+        *active_lock = Some(ActiveTask { name: format!("批量操作: {}", action), cancel_flag: flag.clone(), cancel_notify: notify.clone() });
 
-        if let Some(m) = q.message {
+        if let Some(MaybeInaccessibleMessage::Regular(msg)) = q.message.clone() {
             if action == "concat" {
-                tokio::spawn(actions::action_concat(bot.clone(), m, target_files, state.clone(), notify));
+                tokio::spawn(actions::action_concat(bot.clone(), msg, target_files, state.clone(), flag, notify));
             } else if action == "convert" {
-                tokio::spawn(actions::action_convert(bot.clone(), m, target_files, state.clone(), notify));
+                tokio::spawn(actions::action_convert(bot.clone(), msg, target_files, state.clone(), flag, notify));
             } else if action == "delete" {
-                tokio::spawn(actions::action_delete(bot.clone(), m, target_files, state.clone()));
+                tokio::spawn(actions::action_delete(bot.clone(), msg, target_files, state.clone()));
             }
         }
     }

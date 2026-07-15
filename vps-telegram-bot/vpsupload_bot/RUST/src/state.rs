@@ -1,13 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::{Mutex, Semaphore, Notify};
 
 pub struct ActiveTask {
     pub name: String,
+    pub cancel_flag: Arc<AtomicBool>,
     pub cancel_notify: Arc<Notify>,
 }
 
+#[derive(Clone)]
 pub struct UserSession {
     pub current_dir: PathBuf,
     pub current_files: Vec<String>,
@@ -64,6 +67,7 @@ pub struct YoutubeUploadInfo {
     pub filepath: PathBuf,
     pub status: String,
     pub progress: f64,
+    pub cancel_flag: Arc<AtomicBool>,
     pub cancel_notify: Arc<Notify>,
     pub created_at: f64,
 }

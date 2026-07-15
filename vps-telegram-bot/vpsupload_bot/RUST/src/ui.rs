@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 use crate::state::AppState;
 use crate::media_utils::*;
@@ -46,7 +46,6 @@ pub async fn build_file_selector(
     let mut session = state.get_session(user_id).await;
     let current_dir = session.current_dir.clone();
 
-    // 扫描文件夹
     let mut dirs = Vec::new();
     let mut files = Vec::new();
 
@@ -109,7 +108,6 @@ pub async fn build_file_selector(
         }
     }
 
-    // 导航按键
     let mut nav = Vec::new();
     if page > 0 {
         nav.push(InlineKeyboardButton::callback("⬅️ 上一页", format!("menu_{}_{}", action_type, page - 1)));

@@ -5,13 +5,11 @@ use regex::Regex;
 use chrono::Local;
 use tracing::{warn, error};
 
-/// 防越界断言：确保操作的路径永远在 base_dir 之下
 pub fn assert_path_inside_base(base: &Path, target: &Path) -> Result<PathBuf, String> {
     let base_real = base.canonicalize().map_err(|e| format!("Base dir invalid: {}", e))?;
     let target_real = if target.exists() {
         target.canonicalize().map_err(|e| format!("Target path invalid: {}", e))?
     } else {
-        // 如果文件还未生成，判断其父目录
         let parent = target.parent().ok_or("No parent dir")?;
         let parent_real = parent.canonicalize().map_err(|e| format!("Parent invalid: {}", e))?;
         parent_real.join(target.file_name().ok_or("No filename")?)
@@ -24,7 +22,6 @@ pub fn assert_path_inside_base(base: &Path, target: &Path) -> Result<PathBuf, St
     }
 }
 
-/// 如果目标文件存在，生成 xxx_1.mp4 避免覆盖
 pub fn unique_path(path: &Path) -> PathBuf {
     if !path.exists() {
         return path.to_path_buf();
@@ -95,7 +92,6 @@ pub fn build_progress_bar(percent: f64, length: usize) -> String {
     format!("[{}] {:5.1}%", bar, p)
 }
 
-/// 智能命名解析提取真实录播时间并重新封装
 pub fn smart_rename(first_file_path: &Path) -> String {
     let base_name = first_file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
     let ext = first_file_path.extension().and_then(|s| s.to_str()).unwrap_or(".mp4");

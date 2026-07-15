@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Notify;
 use std::process::Stdio;
-use tracing::{info, warn, error};
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use regex::Regex;
@@ -17,6 +17,7 @@ pub async fn action_stream(
     msg: Message,
     filepath: PathBuf,
     state: Arc<AppState>,
+    cancel_flag: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
 ) {
     let filename = filepath.file_name().unwrap().to_string_lossy().to_string();
@@ -82,9 +83,11 @@ pub async fn action_stream(
         }
     }
     
-    if let Ok(status) = child.wait().await {
-        if status.success() {
-            let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("✅ **推流结束**:\n`{}`", filename)).parse_mode(ParseMode::MarkdownV2).await;
+    if !cancel_flag.load(Ordering::SeqCst) {
+        if let Ok(status) = child.wait().await {
+            if status.success() {
+                let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("✅ **推流结束**:\n`{}`", filename)).parse_mode(ParseMode::MarkdownV2).await;
+            }
         }
     }
 }
@@ -93,7 +96,8 @@ pub async fn action_concat(
     bot: Bot,
     msg: Message,
     files: Vec<PathBuf>,
-    state: Arc<AppState>,
+    _state: Arc<AppState>,
+    cancel_flag: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
 ) {
     if files.len() < 2 {
@@ -113,7 +117,6 @@ pub async fn action_concat(
     let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("⏳ **正在验证和准备拼接**...\n输出: `{}`", output_name))
         .parse_mode(ParseMode::MarkdownV2).await;
 
-    // 写入拼接记录文件
     let mut list_content = String::new();
     for f in &files {
         let escaped = f.to_str().unwrap().replace("'", "'\\''");
@@ -146,7 +149,9 @@ pub async fn action_concat(
                 }
                 _ => {
                     let _ = std::fs::remove_file(&output_path);
-                    let _ = bot.edit_message_text(msg.chat.id, msg.id, "❌ **直连拼接失败。** 请尝试转码后再合并。").parse_mode(ParseMode::MarkdownV2).await;
+                    if !cancel_flag.load(Ordering::SeqCst) {
+                        let _ = bot.edit_message_text(msg.chat.id, msg.id, "❌ **直连拼接失败。** 请尝试转码后再合并。").parse_mode(ParseMode::MarkdownV2).await;
+                    }
                 }
             }
         }
@@ -158,13 +163,14 @@ pub async fn action_convert(
     msg: Message,
     files: Vec<PathBuf>,
     state: Arc<AppState>,
+    cancel_flag: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
 ) {
     let total = files.len();
     let mut success = 0;
 
     for (idx, file) in files.iter().enumerate() {
-        if cancel_notify.is_notified() {
+        if cancel_flag.load(Ordering::SeqCst) {
             break;
         }
 
@@ -199,7 +205,7 @@ pub async fn action_convert(
         }
     }
 
-    if cancel_notify.is_notified() {
+    if cancel_flag.load(Ordering::SeqCst) {
         let _ = bot.edit_message_text(msg.chat.id, msg.id, "🛑 **批量转码已被终止！**").parse_mode(ParseMode::MarkdownV2).await;
     } else {
         let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("✅ **批量转码完成！** 成功: {}/{}", success, total)).parse_mode(ParseMode::MarkdownV2).await;
