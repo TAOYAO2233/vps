@@ -1,13 +1,16 @@
 use std::sync::Arc;
 use std::path::Path;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
+use teloxide::utils::markdown::escape; // <--- 引入 Teloxide 官方提供的 MarkdownV2 安全转义工具
 use crate::state::AppState;
 use crate::media_utils::*;
 
 pub async fn build_main_menu(state: Arc<AppState>) -> (String, InlineKeyboardMarkup) {
     let active_guard = state.active_task.lock().await;
+    
+    // 使用 escape 函数包裹所有可能含有特殊符号的文件名和路径
     let busy_text = match &*active_guard {
-        Some(t) => format!("\n🔒 运行中独占任务: `{}`", t.name),
+        Some(t) => format!("\n🔒 运行中独占任务: `{}`", escape(&t.name)),
         None => String::new(),
     };
 
@@ -18,9 +21,14 @@ pub async fn build_main_menu(state: Arc<AppState>) -> (String, InlineKeyboardMar
         String::new()
     };
 
+    // 此处的 === 经过了 \\ 严格转义，防范 API 解析崩溃
     let text = format!(
-        "=== 🎬 VPS 多媒体控制台 ===\n根目录: `{}`\n💡 提示: /uploads 查看上传，/stop 中断任务{}{}",
-        state.config.base_dir.display(), busy_text, upload_text
+        "\\=\\=\\= 🎬 VPS 多媒体控制台 \\=\\=\\=\n\
+         根目录: `{}`\n\
+         💡 提示: /uploads 查看上传，/stop 中断任务{}{}",
+         escape(&state.config.base_dir.to_string_lossy()), 
+         busy_text, 
+         upload_text
     );
 
     let keyboard = InlineKeyboardMarkup::new(vec![
@@ -131,8 +139,20 @@ pub async fn build_file_selector(
     rows.push(vec![InlineKeyboardButton::callback("🔙 返回主菜单", "menu_main")]);
 
     let rel_path = current_dir.strip_prefix(&state.config.base_dir).unwrap_or(Path::new(""));
-    let display_path = if rel_path.as_os_str().is_empty() { "🏠".to_string() } else { format!("🏠/{}", rel_path.display()) };
-    let header = format!("📂 路径: `{}`\n👉 模式: [{}] (页 {}/{})", display_path, action_type.to_uppercase(), page + 1, total_pages.max(1));
+    let display_path = if rel_path.as_os_str().is_empty() { 
+        "🏠".to_string() 
+    } else { 
+        format!("🏠/{}", rel_path.display()) 
+    };
+    
+    // 对路径、动作模式等动态字符，全部包裹一层 escape 处理以保证绝对安全
+    let header = format!(
+        "📂 路径: `{}`\n👉 模式: [{}] (页 {}/{})", 
+        escape(&display_path), 
+        escape(&action_type.to_uppercase()), 
+        page + 1, 
+        total_pages.max(1)
+    );
 
     (header, InlineKeyboardMarkup::new(rows))
 }

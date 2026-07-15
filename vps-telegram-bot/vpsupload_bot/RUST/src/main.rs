@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use teloxide::prelude::*;
 use teloxide::types::{MaybeInaccessibleMessage, Message, ParseMode};
+use teloxide::utils::markdown::escape; // <--- 引入转义模块
 use tracing::{info, error};
 
 use config::AppConfig;
@@ -59,7 +60,10 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
             if let Some(task) = active.take() {
                 task.cancel_flag.store(true, Ordering::SeqCst);
                 task.cancel_notify.notify_waiters();
-                bot.send_message(msg.chat.id, format!("🛑 **已发送信号终止任务**: `{}`", task.name)).parse_mode(ParseMode::MarkdownV2).await?;
+                
+                // 将终止通知名进行转义
+                bot.send_message(msg.chat.id, format!("🛑 **已发送信号终止任务**: `{}`", escape(&task.name)))
+                    .parse_mode(ParseMode::MarkdownV2).await?;
             } else {
                 bot.send_message(msg.chat.id, "ℹ️ 当前没有正在运行的独占任务。").await?;
             }
@@ -70,7 +74,14 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
             } else {
                 let mut lines = vec!["📤 **正在进行的 YouTube 队列:**\n".to_string()];
                 for (idx, (_, info)) in map.iter().enumerate() {
-                    lines.push(format!("{}. `{}`\n   状态: {} ({:.1}%)", idx + 1, info.filename, info.status, info.progress));
+                    // 对文件名和状态做 V2 规范化转义
+                    lines.push(format!(
+                        "{}\\. `{}`\n   状态: {} ({:.1}%)", 
+                        idx + 1, 
+                        escape(&info.filename), 
+                        escape(&info.status), 
+                        info.progress
+                    ));
                 }
                 bot.send_message(msg.chat.id, lines.join("\n")).parse_mode(ParseMode::MarkdownV2).await?;
             }

@@ -48,4 +48,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: vpsupload_bot_linux_x86_64
-        path: vps-telegram-bot/vpsupload_bot/RUST/target/x86_64-unknown-linux-musl/release/video_bot_rust
+        path: vps-telegram-bot/vpsupload_bot/RUST/target/x86_64-unknown-linux-musl/release/video_upload_bot_rust
