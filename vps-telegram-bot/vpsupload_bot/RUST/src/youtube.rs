@@ -4,9 +4,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use teloxide::prelude::*;
 use teloxide::types::{Message, ParseMode};
-use tracing::info; // 移除了未使用的 error 导入，消除 warning
+use tracing::info;
 
-// 💡 核心修复：引入严格的 HTML 敏感字符转义函数
+// 💡 核心修复：显式引入定义在 crate::state 模块中的结构体，解决编译未找到错误
+use crate::state::{AppState, YoutubeUploadInfo};
+
+// 专为 HTML 渲染打造的安全转义函数
 fn escape_html(input: &str) -> String {
     input.replace('&', "&amp;")
          .replace('<', "&lt;")
@@ -111,7 +114,6 @@ pub async fn start_youtube_upload(
 
         // 获取会话皮肤并正确调用进度条生成函数
         let session = state.get_session(user_id).await;
-        // 💡 修正：更改为 build_progress_bar 并补齐长度参数 20
         let pb = crate::media_utils::build_progress_bar(percent as f64, 20, session.progress_bar_theme);
 
         bot.edit_message_text(
