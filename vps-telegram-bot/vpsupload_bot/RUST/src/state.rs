@@ -19,7 +19,7 @@ pub struct UserSession {
     pub selected_convert: HashSet<usize>,
     pub selected_delete: HashSet<usize>,
     pub pending_delete_files: Vec<PathBuf>,
-    pub progress_bar_theme: usize, // <--- 新增：0=科幻方块, 1=彩色水果, 2=简约细线
+    pub progress_bar_theme: usize,
 }
 
 impl UserSession {
@@ -32,7 +32,7 @@ impl UserSession {
             selected_convert: HashSet::new(),
             selected_delete: HashSet::new(),
             pending_delete_files: Vec::new(),
-            progress_bar_theme: 0, // 默认使用科幻方块
+            progress_bar_theme: 0,
         }
     }
     
@@ -63,6 +63,7 @@ pub struct AppState {
     pub sessions: Mutex<HashMap<i64, UserSession>>,
 }
 
+#[allow(dead_code)] // 允许上传元数据结构中暂未被全段读取的内存字段，消除 dead_code 警告
 #[derive(Clone)]
 pub struct YoutubeUploadInfo {
     pub filename: String,

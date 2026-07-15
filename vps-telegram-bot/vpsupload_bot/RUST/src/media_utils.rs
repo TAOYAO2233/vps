@@ -71,6 +71,7 @@ pub fn format_duration(seconds: f64) -> String {
     format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
+#[allow(dead_code)] // 允许暂未使用的通用时间换算函数
 pub fn format_elapsed(seconds: f64) -> String {
     let s_int = seconds.max(0.0) as u64;
     let h = s_int / 3600;
@@ -85,25 +86,21 @@ pub fn format_elapsed(seconds: f64) -> String {
     }
 }
 
-/// 支持在 Telegram 端自定义一键切换的皮肤生成函数
 pub fn build_progress_bar(percent: f64, length: usize, theme: usize) -> String {
     let p = percent.clamp(0.0, 100.0);
     
     match theme {
-        // 1. 彩色水果流 (Emoji，建议短长度 10 格)
         1 => {
             let local_length = 10;
             let filled = ((p / 100.0) * local_length as f64).floor() as usize;
             let bar = "🟩".repeat(filled) + &"⬜".repeat(local_length - filled);
             format!("<code>{}</code> <b>{:5.1}%</b>", bar, p)
         }
-        // 2. 简约细线流
         2 => {
             let filled = ((p / 100.0) * length as f64).floor() as usize;
             let bar = "━".repeat(filled) + &"─".repeat(length.saturating_sub(filled));
             format!("<code>{}</code> <b>{:5.1}%</b>", bar, p)
         }
-        // 0. 默认：科幻方块流
         _ => {
             let filled = ((p / 100.0) * length as f64).floor() as usize;
             let bar = "▰".repeat(filled) + &"▱".repeat(length.saturating_sub(filled));

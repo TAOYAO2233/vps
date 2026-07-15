@@ -175,10 +175,8 @@ pub async fn action_convert(
     _state: Arc<AppState>,
     cancel_flag: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
-    user_id: i64,
+    _user_id: i64, // 前缀加上下划线表示故意不使用，消除编译器警告
 ) {
-    let session = _state.get_session(user_id).await;
-    let theme = session.progress_bar_theme;
     let total = files.len();
     let mut success = 0;
 
