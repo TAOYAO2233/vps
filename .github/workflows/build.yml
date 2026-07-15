@@ -1,4 +1,4 @@
-name: Build Rust Bot Release
+name: Build Rust Bot Release (Rustls)
 
 on:
   push:
@@ -7,7 +7,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # 【核心修正】让该 Job 下的所有步骤默认都在 Rust 项目目录下运行
     defaults:
       run:
         working-directory: vps-telegram-bot/bilive_bot/RUST
@@ -17,13 +16,13 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v3
 
-    # 2. 安装 Rust 环境及 musl 静态编译目标
+    # 2. 只需要安装 Rust 并注册 musl 目标即可，无需任何额外的 apt 系统依赖安装
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: x86_64-unknown-linux-musl
 
-    # 3. 缓存 Cargo 依赖（使用正确的 Cargo.lock 路径）
+    # 3. 缓存 Cargo 依赖（极大加快后续的编译速度）
     - name: Cache Dependencies
       uses: actions/cache@v3
       with:
@@ -33,11 +32,11 @@ jobs:
           vps-telegram-bot/bilive_bot/RUST/target
         key: ${{ runner.os }}-cargo-${{ hashFiles('vps-telegram-bot/bilive_bot/RUST/Cargo.lock') }}
 
-    # 4. 执行静态编译（由于上方设置了 defaults，此处会自动在该目录下执行）
+    # 4. 执行静态编译
     - name: Build Binary
       run: cargo build --release --target x86_64-unknown-linux-musl
 
-    # 5. 上传二进制文件
+    # 5. 上传生成的无依赖单文件二进制程序
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:

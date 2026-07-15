@@ -5,8 +5,13 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-teloxide = { version = "0.12", features = ["macros"] }
-reqwest = { version = "0.11", features = ["json"] }
+
+# 1. 禁用 teloxide 默认的 native-tls，开启 rustls 和 核心 macros
+teloxide = { version = "0.12", default-features = false, features = ["macros", "rustls"] }
+
+# 2. 禁用 reqwest 默认的 native-tls，开启 rustls-tls 后端
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dotenvy = "0.15"
