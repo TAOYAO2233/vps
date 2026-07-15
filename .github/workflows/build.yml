@@ -1,0 +1,25 @@
+name: Build Release
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-musl
+
+    - name: Build Binary
+      run: cargo build --release --target x86_64-unknown-linux-musl
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: bl_bot_rust
+        path: target/x86_64-unknown-linux-musl/release/bl_bot_rust
