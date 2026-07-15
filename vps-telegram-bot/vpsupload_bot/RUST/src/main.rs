@@ -23,7 +23,6 @@ fn escape_html(input: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 初始化多彩结构化终端日志系统
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_thread_ids(true)
@@ -157,9 +156,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
             session.current_dir = session.current_dir.join(folder_name);
             session.clear_all_selected();
             
-            // 💡 【关键修正】在所有权被 eat 掉之前，先执行日志打印！
             info!("📁 [切换目录] 进入子文件夹: {:?}", session.current_dir);
-            
             state.save_session(user_id, session).await;
         }
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, 0).await;
@@ -172,9 +169,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
                 session.current_dir = parent.to_path_buf();
                 session.clear_all_selected();
                 
-                // 💡 【关键修正】在所有权被 eat 掉之前，先执行日志打印！
                 info!("⬆️ [切换目录] 返回上层文件夹: {:?}", session.current_dir);
-                
                 state.save_session(user_id, session).await;
             }
         }
@@ -248,7 +243,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         }
 
         let mut active_lock = state.active_task.lock().await;
-        if active_lock.is_some() {
+        if active_lock.is_some() && action != "youtube" {
             bot.answer_callback_query(q.id).text("⚠️ 后台正在执行其他独占任务！").show_alert(true).await?;
             return Ok(());
         }
@@ -257,15 +252,35 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
 
         let notify = Arc::new(Notify::new());
         let flag = Arc::new(AtomicBool::new(false));
-        *active_lock = Some(ActiveTask { name: format!("批量操作: {}", action), cancel_flag: flag.clone(), cancel_notify: notify.clone() });
 
         if let Some(MaybeInaccessibleMessage::Regular(msg)) = q.message.clone() {
             if action == "concat" {
+                *active_lock = Some(ActiveTask { name: format!("批量操作: {}", action), cancel_flag: flag.clone(), cancel_notify: notify.clone() });
                 tokio::spawn(actions::action_concat(bot.clone(), msg, target_files, state.clone(), flag, notify));
             } else if action == "convert" {
+                *active_lock = Some(ActiveTask { name: format!("批量操作: {}", action), cancel_flag: flag.clone(), cancel_notify: notify.clone() });
                 tokio::spawn(actions::action_convert(bot.clone(), msg, target_files, state.clone(), flag, notify, user_id));
             } else if action == "delete" {
                 tokio::spawn(actions::action_delete(bot.clone(), msg, target_files, state.clone()));
+            } else if action == "youtube" {
+                // 💡 【关键修复】在此处无缝接入批量 YouTube 队列上传逻辑！
+                bot.answer_callback_query(q.id).text(format!("🚀 已将 {} 个视频加入 YouTube 上传队列！", target_files.len())).await?;
+                
+                for path in target_files {
+                    let bot_clone = bot.clone();
+                    let msg_clone = msg.clone();
+                    let state_clone = state.clone();
+                    let file_name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    
+                    tokio::spawn(async move {
+                        let each_notify = Arc::new(Notify::new());
+                        let each_flag = Arc::new(AtomicBool::new(false));
+                        
+                        if let Ok(progress_msg) = bot_clone.send_message(msg_clone.chat.id, format!("⏳ 准备批量上传: <code>{}</code>", escape_html(&file_name))).parse_mode(ParseMode::Html).await {
+                            let _ = youtube::start_youtube_upload(bot_clone, progress_msg, path, state_clone, each_flag, each_notify, user_id).await;
+                        }
+                    });
+                }
             }
         }
     }
