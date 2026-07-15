@@ -6,7 +6,10 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 use teloxide::prelude::*;
 use teloxide::types::{Message, ParseMode, LinkPreviewOptions};
-use tracing::error; // 💡 修正：移除了未使用的 info 导入，保留 error，消除 warning
+use tracing::error;
+
+// 💡 核心修复：显式导入请求头所需的核心 HTTP 大写常量
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 
 use crate::state::{AppState, YoutubeUploadInfo};
 use crate::media_utils::build_progress_bar;
@@ -203,11 +206,10 @@ pub async fn start_youtube_upload(
                                 escaped_filename, now_time, video_id, video_id
                             );
 
-                            // 💡 修正：将不支持的 disable_web_page_preview 替换为标准的 link_preview_options
                             bot.edit_message_text(progress_msg.chat.id, progress_msg.id, success_text)
                                 .parse_mode(ParseMode::Html)
                                 .link_preview_options(LinkPreviewOptions {
-                                    is_disabled: true, // 彻底关闭链接的网页预览图，保持气泡清爽
+                                    is_disabled: true,
                                     url: None,
                                     prefer_small_media: false,
                                     prefer_large_media: false,
