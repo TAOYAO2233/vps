@@ -6,10 +6,10 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 
-# 1. 禁用 teloxide 默认的 native-tls，开启 rustls 和 核心 macros
-teloxide = { version = "0.12", default-features = false, features = ["macros", "rustls"] }
+# 【核心修正】在 features 列表中显式加上 "ctrlc_handler"
+teloxide = { version = "0.12", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
 
-# 2. 禁用 reqwest 默认的 native-tls，开启 rustls-tls 后端
+# 保持 reqwest 使用 rustls-tls 后端
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
 serde = { version = "1.0", features = ["derive"] }
