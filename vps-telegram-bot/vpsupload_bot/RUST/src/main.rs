@@ -23,6 +23,7 @@ fn escape_html(input: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 初始化极具科技感的多彩结构化终端日志系统
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_thread_ids(true)
@@ -107,6 +108,10 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         None => return Ok(()),
     };
 
+    // 💡 实现在控制台实时捕获并展示点击事件的彩色日志追踪
+    let user_name = q.from.username.clone().unwrap_or_else(|| "未知用户".to_string());
+    info!("🔘 [点击回调] 用户: {} ({}) | 触发动作: {}", user_name, user_id, data);
+
     if data == "menu_main" {
         let (content, kb) = ui::build_main_menu(state.clone(), user_id).await;
         if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
@@ -153,6 +158,9 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
             session.current_dir = session.current_dir.join(folder_name);
             session.clear_all_selected();
             state.save_session(user_id, session).await;
+            
+            // 💡 打印详细的进深目录变化
+            info!("📁 [切换目录] 进入子文件夹: {:?}", session.current_dir);
         }
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, 0).await;
         if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
@@ -164,6 +172,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
                 session.current_dir = parent.to_path_buf();
                 session.clear_all_selected();
                 state.save_session(user_id, session).await;
+                
+                info!("⬆️ [切换目录] 返回上层文件夹: {:?}", session.current_dir);
             }
         }
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, 0).await;
@@ -201,6 +211,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
                 let dur = media_utils::get_video_duration(&path, state.config.ffprobe_timeout_seconds).await;
                 bot.answer_callback_query(q.id).text(format!("📄 {}\n大小: {}\n时长: {}", filename, size, media_utils::format_duration(dur))).show_alert(true).await?;
             } else if action == "stream" {
+                info!("▶️ [单任务触发] 开始执行单路视频推流: {:?}", path);
                 let notify = Arc::new(Notify::new());
                 let flag = Arc::new(AtomicBool::new(false));
                 *active_lock = Some(ActiveTask { name: format!("推流: {}", filename), cancel_flag: flag.clone(), cancel_notify: notify.clone() });
@@ -208,6 +219,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
                     tokio::spawn(actions::action_stream(bot.clone(), msg, path, state.clone(), flag, notify, user_id));
                 }
             } else if action == "youtube" {
+                info!("▶️ [单任务触发] 开始执行上传单个视频到 YouTube: {:?}", path);
                 let notify = Arc::new(Notify::new());
                 let flag = Arc::new(AtomicBool::new(false));
                 if let Some(MaybeInaccessibleMessage::Regular(msg)) = q.message.clone() {
@@ -238,6 +250,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
             bot.answer_callback_query(q.id).text("⚠️ 后台正在执行其他独占任务！").show_alert(true).await?;
             return Ok(());
         }
+
+        info!("▶️ [批任务触发] 触发批量处理模式 [{}], 选中文件总数: {}", action, target_files.len());
 
         let notify = Arc::new(Notify::new());
         let flag = Arc::new(AtomicBool::new(false));
