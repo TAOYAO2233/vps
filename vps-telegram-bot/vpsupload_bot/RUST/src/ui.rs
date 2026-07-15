@@ -1,32 +1,36 @@
 use std::sync::Arc;
 use std::path::Path;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
-use teloxide::utils::markdown::escape; // <--- 引入 Teloxide 官方提供的 MarkdownV2 安全转义工具
 use crate::state::AppState;
 use crate::media_utils::*;
 
+// 简单的 HTML 安全转义函数，只转义 HTML 核心保留字
+fn escape_html(input: &str) -> String {
+    input.replace('&', "&amp;")
+         .replace('<', "&lt;")
+         .replace('>', "&gt;")
+}
+
 pub async fn build_main_menu(state: Arc<AppState>) -> (String, InlineKeyboardMarkup) {
     let active_guard = state.active_task.lock().await;
-    
-    // 使用 escape 函数包裹所有可能含有特殊符号的文件名和路径
     let busy_text = match &*active_guard {
-        Some(t) => format!("\n🔒 运行中独占任务: `{}`", escape(&t.name)),
+        Some(t) => format!("\n🔒 运行中独占任务: <b>{}</b>", escape_html(&t.name)),
         None => String::new(),
     };
 
     let upload_count = state.youtube_uploads.lock().await.len();
     let upload_text = if upload_count > 0 {
-        format!("\n☁️ YouTube 排队/上传中: `{}`", upload_count)
+        format!("\n☁️ YouTube 排队/上传中: <code>{}</code>", upload_count)
     } else {
         String::new()
     };
 
-    // 此处的 === 经过了 \\ 严格转义，防范 API 解析崩溃
+    // 使用标准 HTML 标签
     let text = format!(
-        "\\=\\=\\= 🎬 VPS 多媒体控制台 \\=\\=\\=\n\
-         根目录: `{}`\n\
+        "=== 🎬 <b>VPS 多媒体控制台</b> ===\n\
+         根目录: <code>{}</code>\n\
          💡 提示: /uploads 查看上传，/stop 中断任务{}{}",
-         escape(&state.config.base_dir.to_string_lossy()), 
+         escape_html(&state.config.base_dir.to_string_lossy()), 
          busy_text, 
          upload_text
     );
@@ -145,11 +149,11 @@ pub async fn build_file_selector(
         format!("🏠/{}", rel_path.display()) 
     };
     
-    // 对路径、动作模式等动态字符，全部包裹一层 escape 处理以保证绝对安全
+    // HTML 风格排版，完全免疫括号、等号报错
     let header = format!(
-        "📂 路径: `{}`\n👉 模式: [{}] (页 {}/{})", 
-        escape(&display_path), 
-        escape(&action_type.to_uppercase()), 
+        "📂 路径: <code>{}</code>\n👉 模式: <b>[{}]</b> (页 {}/{})", 
+        escape_html(&display_path), 
+        escape_html(&action_type.to_uppercase()), 
         page + 1, 
         total_pages.max(1)
     );

@@ -10,11 +10,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use teloxide::prelude::*;
 use teloxide::types::{MaybeInaccessibleMessage, Message, ParseMode};
-use teloxide::utils::markdown::escape; // <--- 引入转义模块
 use tracing::{info, error};
 
 use config::AppConfig;
 use state::{AppState, ActiveTask};
+
+fn escape_html(input: &str) -> String {
+    input.replace('&', "&amp;")
+         .replace('<', "&lt;")
+         .replace('>', "&gt;")
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,16 +59,15 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
     if let Some(text) = msg.text() {
         if text.starts_with("/start") {
             let (content, kb) = ui::build_main_menu(state.clone()).await;
-            bot.send_message(msg.chat.id, content).parse_mode(ParseMode::MarkdownV2).reply_markup(kb).await?;
+            bot.send_message(msg.chat.id, content).parse_mode(ParseMode::Html).reply_markup(kb).await?;
         } else if text.starts_with("/stop") {
             let mut active = state.active_task.lock().await;
             if let Some(task) = active.take() {
                 task.cancel_flag.store(true, Ordering::SeqCst);
                 task.cancel_notify.notify_waiters();
                 
-                // 将终止通知名进行转义
-                bot.send_message(msg.chat.id, format!("🛑 **已发送信号终止任务**: `{}`", escape(&task.name)))
-                    .parse_mode(ParseMode::MarkdownV2).await?;
+                bot.send_message(msg.chat.id, format!("🛑 <b>已发送信号终止任务</b>: <code>{}</code>", escape_html(&task.name)))
+                    .parse_mode(ParseMode::Html).await?;
             } else {
                 bot.send_message(msg.chat.id, "ℹ️ 当前没有正在运行的独占任务。").await?;
             }
@@ -72,18 +76,17 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
             if map.is_empty() {
                 bot.send_message(msg.chat.id, "ℹ️ 当前没有 YouTube 上传任务。").await?;
             } else {
-                let mut lines = vec!["📤 **正在进行的 YouTube 队列:**\n".to_string()];
+                let mut lines = vec!["📤 <b>正在进行的 YouTube 队列:</b>\n".to_string()];
                 for (idx, (_, info)) in map.iter().enumerate() {
-                    // 对文件名和状态做 V2 规范化转义
                     lines.push(format!(
-                        "{}\\. `{}`\n   状态: {} ({:.1}%)", 
+                        "{}. <code>{}</code>\n   状态: {} ({:.1}%)", 
                         idx + 1, 
-                        escape(&info.filename), 
-                        escape(&info.status), 
+                        escape_html(&info.filename), 
+                        escape_html(&info.status), 
                         info.progress
                     ));
                 }
-                bot.send_message(msg.chat.id, lines.join("\n")).parse_mode(ParseMode::MarkdownV2).await?;
+                bot.send_message(msg.chat.id, lines.join("\n")).parse_mode(ParseMode::Html).await?;
             }
         }
     }
@@ -101,7 +104,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
 
     if data == "menu_main" {
         let (content, kb) = ui::build_main_menu(state.clone()).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::MarkdownV2).reply_markup(kb).await?; }
+        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
     } else if data.starts_with("init_") {
         let action = data.strip_prefix("init_").unwrap();
         let mut session = state.get_session(user_id).await;
@@ -110,13 +113,13 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         state.save_session(user_id, session).await;
         
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, 0).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::MarkdownV2).reply_markup(kb).await?; }
+        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
     } else if data.starts_with("menu_") {
         let parts: Vec<&str> = data.split('_').collect();
         let action = parts[1];
         let page: usize = parts[2].parse().unwrap_or(0);
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, page).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::MarkdownV2).reply_markup(kb).await?; }
+        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
     } else if data.starts_with("enterdir_") {
         let parts: Vec<&str> = data.split('_').collect();
         let action = parts[1];
@@ -129,7 +132,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
             state.save_session(user_id, session).await;
         }
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, 0).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::MarkdownV2).reply_markup(kb).await?; }
+        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
     } else if data.starts_with("updir_") {
         let action = data.strip_prefix("updir_").unwrap();
         let mut session = state.get_session(user_id).await;
@@ -141,7 +144,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
             }
         }
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, 0).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::MarkdownV2).reply_markup(kb).await?; }
+        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
     } else if data.starts_with("toggle_") {
         let parts: Vec<&str> = data.split('_').collect();
         let action = parts[1];
@@ -154,7 +157,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         state.save_session(user_id, session).await;
 
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, page).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::MarkdownV2).reply_markup(kb).await?; }
+        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
     } else if data.starts_with("execsingle_") {
         let parts: Vec<&str> = data.split('_').collect();
         let action = parts[1];
