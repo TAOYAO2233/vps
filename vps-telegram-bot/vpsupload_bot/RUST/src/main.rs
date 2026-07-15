@@ -34,12 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = match AppConfig::load_from_env() {
         Ok(c) => c,
         Err(e) => {
-            error!("加载配置失败: {}", e);
+            error!("加载应用配置严重失败: {}", e);
             std::process::exit(1);
         }
     };
 
-    info!("🚀 Rust VPS 媒体管理 Bot 正在启动... BASE_DIR: {:?}", config.base_dir);
+    info!("🚀 Rust VPS 媒体高并发管理 Bot 正在启动... 监测 BASE_DIR: {:?}", config.base_dir);
 
     let state = Arc::new(AppState::new(config.clone()));
     let bot = Bot::new(config.bot_token);
@@ -71,17 +71,17 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
                 task.cancel_flag.store(true, Ordering::SeqCst);
                 task.cancel_notify.notify_waiters();
                 
-                bot.send_message(msg.chat.id, format!("🛑 <b>已发送信号终止任务</b>: <code>{}</code>", escape_html(&task.name)))
+                bot.send_message(msg.chat.id, format!("🛑 <b>已发送信号终止执行任务</b>: <code>{}</code>", escape_html(&task.name)))
                     .parse_mode(ParseMode::Html).await?;
             } else {
-                bot.send_message(msg.chat.id, "ℹ️ 当前没有正在运行的独占任务。").await?;
+                bot.send_message(msg.chat.id, "ℹ️ 当前后台没有在运行的独占任务。").await?;
             }
         } else if text.starts_with("/uploads") {
             let map = state.youtube_uploads.lock().await;
             if map.is_empty() {
-                bot.send_message(msg.chat.id, "ℹ️ 当前没有 YouTube 上传任务。").await?;
+                bot.send_message(msg.chat.id, "ℹ️ 当前没有正在活动的 YouTube 上传任务队列。").await?;
             } else {
-                let mut lines = vec!["📤 <b>正在进行的 YouTube 队列:</b>\n".to_string()];
+                let mut lines = vec!["📤 <b>正在进行的 YouTube 高速上传队列:</b>\n".to_string()];
                 for (idx, (_, info)) in map.iter().enumerate() {
                     lines.push(format!(
                         "{}. <code>{}</code>\n   状态: {} ({:.1}%)", 
@@ -107,15 +107,19 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         None => return Ok(()),
     };
 
-    let user_name = q.from.username.clone().unwrap_or_else(|| "未知用户".to_string());
-    info!("🔘 [点击回调] 用户: {} ({}) | 触发动作: {}", user_name, user_id, data);
+    let user_name = q.from.username.clone().unwrap_or_else(|| "未知管理用户".to_string());
+    info!("🔘 [点击回调响应] 用户: {} ({}) | 触发指令: {}", user_name, user_id, data);
 
     if data == "menu_main" {
         let (content, kb) = ui::build_main_menu(state.clone(), user_id).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
+        if let Some(MaybeInaccessibleMessage::Regular(m)) = q.message { 
+            bot.edit_message_text(m.chat.id, m.id, content).parse_mode(ParseMode::Html).reply_markup(kb).await?; 
+        }
     } else if data == "menu_skin_settings" {
         let (content, kb) = ui::build_skin_selector_menu();
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
+        if let Some(MaybeInaccessibleMessage::Regular(m)) = q.message { 
+            bot.edit_message_text(m.chat.id, m.id, content).parse_mode(ParseMode::Html).reply_markup(kb).await?; 
+        }
     } else if data.starts_with("set_skin_") {
         let theme_id: usize = data.strip_prefix("set_skin_").unwrap().parse().unwrap_or(0);
         let mut session = state.get_session(user_id).await;
@@ -123,14 +127,16 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         state.save_session(user_id, session).await;
 
         let ok_text = match theme_id {
-            1 => "✅ 皮肤已成功切换为：彩色水果 🟩🟩⬜⬜",
-            2 => "✅ 皮肤已成功切换为：简约细线 ━━──",
-            _ => "✅ 皮肤已成功切换为：科幻方块 ▰▰▱▱",
+            1 => "✅ 皮肤已配置成功切换为：彩色水果 🟩🟩⬜⬜",
+            2 => "✅ 皮肤已配置成功切换为：简约细线 ━━──",
+            _ => "✅ 皮肤已配置成功切换为：科幻方块 ▰▰▱▱",
         };
         bot.answer_callback_query(q.id).text(ok_text).show_alert(true).await?;
         
         let (content, kb) = ui::build_main_menu(state.clone(), user_id).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
+        if let Some(MaybeInaccessibleMessage::Regular(m)) = q.message { 
+            bot.edit_message_text(m.chat.id, m.id, content).parse_mode(ParseMode::Html).reply_markup(kb).await?; 
+        }
     } else if data.starts_with("init_") {
         let action = data.strip_prefix("init_").unwrap();
         let mut session = state.get_session(user_id).await;
@@ -139,13 +145,17 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         state.save_session(user_id, session).await;
         
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, 0).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
+        if let Some(MaybeInaccessibleMessage::Regular(m)) = q.message { 
+            bot.edit_message_text(m.chat.id, m.id, content).parse_mode(ParseMode::Html).reply_markup(kb).await?; 
+        }
     } else if data.starts_with("menu_") {
         let parts: Vec<&str> = data.split('_').collect();
         let action = parts[1];
         let page: usize = parts[2].parse().unwrap_or(0);
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, page).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
+        if let Some(MaybeInaccessibleMessage::Regular(m)) = q.message { 
+            bot.edit_message_text(m.chat.id, m.id, content).parse_mode(ParseMode::Html).reply_markup(kb).await?; 
+        }
     } else if data.starts_with("enterdir_") {
         let parts: Vec<&str> = data.split('_').collect();
         let action = parts[1];
@@ -156,11 +166,13 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
             session.current_dir = session.current_dir.join(folder_name);
             session.clear_all_selected();
             
-            info!("📁 [切换目录] 进入子文件夹: {:?}", session.current_dir);
+            info!("📁 [切换工作目录] 深入下一层子目录: {:?}", session.current_dir);
             state.save_session(user_id, session).await;
         }
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, 0).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
+        if let Some(MaybeInaccessibleMessage::Regular(m)) = q.message { 
+            bot.edit_message_text(m.chat.id, m.id, content).parse_mode(ParseMode::Html).reply_markup(kb).await?; 
+        }
     } else if data.starts_with("updir_") {
         let action = data.strip_prefix("updir_").unwrap();
         let mut session = state.get_session(user_id).await;
@@ -169,12 +181,14 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
                 session.current_dir = parent.to_path_buf();
                 session.clear_all_selected();
                 
-                info!("⬆️ [切换目录] 返回上层文件夹: {:?}", session.current_dir);
+                info!("⬆️ [切换工作目录] 返回上一层父目录: {:?}", session.current_dir);
                 state.save_session(user_id, session).await;
             }
         }
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, 0).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
+        if let Some(MaybeInaccessibleMessage::Regular(m)) = q.message { 
+            bot.edit_message_text(m.chat.id, m.id, content).parse_mode(ParseMode::Html).reply_markup(kb).await?; 
+        }
     } else if data.starts_with("toggle_") {
         let parts: Vec<&str> = data.split('_').collect();
         let action = parts[1];
@@ -187,7 +201,9 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         state.save_session(user_id, session).await;
 
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, page).await;
-        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
+        if let Some(MaybeInaccessibleMessage::Regular(m)) = q.message { 
+            bot.edit_message_text(m.chat.id, m.id, content).parse_mode(ParseMode::Html).reply_markup(kb).await?; 
+        }
     } else if data.starts_with("execsingle_") {
         let parts: Vec<&str> = data.split('_').collect();
         let action = parts[1];
@@ -199,16 +215,16 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
             
             let mut active_lock = state.active_task.lock().await;
             if active_lock.is_some() && action != "browse" {
-                bot.answer_callback_query(q.id).text("⚠️ 有任务正在运行中，请先 /stop 终止！").show_alert(true).await?;
+                bot.answer_callback_query(q.id).text("⚠️ 有独占性后台任务正在处理中，请先发送 /stop 指令终止！").show_alert(true).await?;
                 return Ok(());
             }
 
             if action == "browse" {
-                let size = media_utils::get_formatted_file_size(&path);
+                let size = media_utils::get_formatted_file_size(&path).await;
                 let dur = media_utils::get_video_duration(&path, state.config.ffprobe_timeout_seconds).await;
                 bot.answer_callback_query(q.id).text(format!("📄 {}\n大小: {}\n时长: {}", filename, size, media_utils::format_duration(dur))).show_alert(true).await?;
             } else if action == "stream" {
-                info!("▶️ [单任务触发] 开始执行单路视频推流: {:?}", path);
+                info!("▶️ [单任务触发] 启动单路视频 RTMP 推流: {:?}", path);
                 let notify = Arc::new(Notify::new());
                 let flag = Arc::new(AtomicBool::new(false));
                 *active_lock = Some(ActiveTask { name: format!("推流: {}", filename), cancel_flag: flag.clone(), cancel_notify: notify.clone() });
@@ -216,11 +232,11 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
                     tokio::spawn(actions::action_stream(bot.clone(), msg, path, state.clone(), flag, notify, user_id));
                 }
             } else if action == "youtube" {
-                info!("▶️ [单任务触发] 开始执行上传单个视频到 YouTube: {:?}", path);
+                info!("▶️ [单任务触发] 提交上传单文件至 YouTube: {:?}", path);
                 let notify = Arc::new(Notify::new());
                 let flag = Arc::new(AtomicBool::new(false));
                 if let Some(MaybeInaccessibleMessage::Regular(msg)) = q.message.clone() {
-                    let progress_msg = bot.send_message(msg.chat.id, "正在初始化 YouTube...").await?;
+                    let progress_msg = bot.send_message(msg.chat.id, "⚡ 正在初始化 YouTube 传输云环境...").await?;
                     tokio::spawn(youtube::start_youtube_upload(bot.clone(), progress_msg, path, state.clone(), flag, notify, user_id));
                 }
             }
@@ -238,17 +254,17 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         }
 
         if target_files.is_empty() {
-            bot.answer_callback_query(q.id).text("❌ 请勾选至少一个视频！").show_alert(true).await?;
+            bot.answer_callback_query(q.id).text("❌ 请至少勾选一个有效视频文件！").show_alert(true).await?;
             return Ok(());
         }
 
         let mut active_lock = state.active_task.lock().await;
         if active_lock.is_some() && action != "youtube" {
-            bot.answer_callback_query(q.id).text("⚠️ 后台正在执行其他独占任务！").show_alert(true).await?;
+            bot.answer_callback_query(q.id).text("⚠️ 后台正在执行其他独占性任务，无法同时并发批量操作！").show_alert(true).await?;
             return Ok(());
         }
 
-        info!("▶️ [批任务触发] 触发批量处理模式 [{}], 选中文件总数: {}", action, target_files.len());
+        info!("▶️ [批任务启动] 触发多文件批量作业模式 [{}], 已选中总数: {}", action, target_files.len());
 
         let notify = Arc::new(Notify::new());
         let flag = Arc::new(AtomicBool::new(false));
@@ -263,8 +279,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
             } else if action == "delete" {
                 tokio::spawn(actions::action_delete(bot.clone(), msg, target_files, state.clone()));
             } else if action == "youtube" {
-                // 💡 【关键修复】在此处无缝接入批量 YouTube 队列上传逻辑！
-                bot.answer_callback_query(q.id).text(format!("🚀 已将 {} 个视频加入 YouTube 上传队列！", target_files.len())).await?;
+                bot.answer_callback_query(q.id).text(format!("🚀 已将 {} 个选定的视频放入 YouTube 异步高并发队列中！", target_files.len())).await?;
                 
                 for path in target_files {
                     let bot_clone = bot.clone();
@@ -276,7 +291,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
                         let each_notify = Arc::new(Notify::new());
                         let each_flag = Arc::new(AtomicBool::new(false));
                         
-                        if let Ok(progress_msg) = bot_clone.send_message(msg_clone.chat.id, format!("⏳ 准备批量上传: <code>{}</code>", escape_html(&file_name))).parse_mode(ParseMode::Html).await {
+                        if let Ok(progress_msg) = bot_clone.send_message(msg_clone.chat.id, format!("⏳ 准备进入批量高速上传队列: <code>{}</code>", escape_html(&file_name))).parse_mode(ParseMode::Html).await {
                             let _ = youtube::start_youtube_upload(bot_clone, progress_msg, path, state_clone, each_flag, each_notify, user_id).await;
                         }
                     });

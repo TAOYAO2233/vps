@@ -1,7 +1,6 @@
 use std::env;
 use std::path::PathBuf;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bot_token: String,

@@ -6,19 +6,19 @@ use chrono::Local;
 use tracing::{warn, error};
 
 pub fn assert_path_inside_base(base: &Path, target: &Path) -> Result<PathBuf, String> {
-    let base_real = base.canonicalize().map_err(|e| format!("Base dir invalid: {}", e))?;
+    let base_real = base.canonicalize().map_err(|e| format!("基础目录无效: {}", e))?;
     let target_real = if target.exists() {
-        target.canonicalize().map_err(|e| format!("Target path invalid: {}", e))?
+        target.canonicalize().map_err(|e| format!("目标路径无效: {}", e))?
     } else {
-        let parent = target.parent().ok_or("No parent dir")?;
-        let parent_real = parent.canonicalize().map_err(|e| format!("Parent invalid: {}", e))?;
-        parent_real.join(target.file_name().ok_or("No filename")?)
+        let parent = target.parent().ok_or("无上级父路径")?;
+        let parent_real = parent.canonicalize().map_err(|e| format!("上级父路径无效: {}", e))?;
+        parent_real.join(target.file_name().ok_or("文件名缺失")?)
     };
 
     if target_real == base_real || target_real.starts_with(&base_real) {
         Ok(target_real)
     } else {
-        Err(format!("非法路径，已超出 BASE_DIR: {:?}", target_real))
+        Err(format!("非法路径越界访问，已超出 BASE_DIR: {:?}", target_real))
     }
 }
 
@@ -45,8 +45,8 @@ pub fn unique_path(path: &Path) -> PathBuf {
     }
 }
 
-pub fn get_formatted_file_size(filepath: &Path) -> String {
-    match std::fs::metadata(filepath) {
+pub async fn get_formatted_file_size(filepath: &Path) -> String {
+    match tokio::fs::metadata(filepath).await {
         Ok(meta) => {
             let size = meta.len() as f64;
             let mb = size / (1024.0 * 1024.0);
@@ -69,21 +69,6 @@ pub fn format_duration(seconds: f64) -> String {
     let m = (s_int % 3600) / 60;
     let s = s_int % 60;
     format!("{:02}:{:02}:{:02}", h, m, s)
-}
-
-#[allow(dead_code)]
-pub fn format_elapsed(seconds: f64) -> String {
-    let s_int = seconds.max(0.0) as u64;
-    let h = s_int / 3600;
-    let m = (s_int % 3600) / 60;
-    let s = s_int % 60;
-    if h > 0 {
-        format!("{}h{:02}m{:02}s", h, m, s)
-    } else if m > 0 {
-        format!("{}m{:02}s", m, s)
-    } else {
-        format!("{}s", s)
-    }
 }
 
 pub fn build_progress_bar(percent: f64, length: usize, theme: usize) -> String {
@@ -110,7 +95,7 @@ pub fn build_progress_bar(percent: f64, length: usize, theme: usize) -> String {
 
 pub fn smart_rename(first_file_path: &Path) -> String {
     let base_name = first_file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
-    let ext = first_file_path.extension().and_then(|s| s.to_str()).unwrap_or(".mp4");
+    let ext = first_file_path.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
     
     let re_date = Regex::new(r"\d{4}[-_.]\d{2}[-_.]\d{2}(?:[ _-]\d{2}[-_.:]\d{2}[-_.:]\d{2})?").unwrap();
     let date_str = match re_date.find(base_name) {
@@ -152,16 +137,16 @@ pub async fn get_video_duration(filepath: &Path, timeout_sec: u64) -> f64 {
                 let text = String::from_utf8_lossy(&out.stdout);
                 text.trim().parse::<f64>().unwrap_or(0.0)
             } else {
-                warn!("ffprobe 处理失败: {:?}", filepath);
+                warn!("ffprobe 提取媒体属性失败: {:?}", filepath);
                 0.0
             }
         }
         Ok(Err(e)) => {
-            error!("执行 ffprobe 进程出错: {}", e);
+            error!("执行 ffprobe 外部子进程出错: {}", e);
             0.0
         }
         Err(_) => {
-            warn!("ffprobe 读取超时: {:?}", filepath);
+            warn!("ffprobe 读取文件超时: {:?}", filepath);
             0.0
         }
     }

@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::{Mutex, Semaphore, Notify};
 
-// 加上 pub 使得外部模块可以访问该结构体
 pub struct ActiveTask {
     pub name: String,
     pub cancel_flag: Arc<AtomicBool>,
@@ -56,7 +55,6 @@ impl UserSession {
     }
 }
 
-// 加上 pub 解决 main/ui/actions/youtube 的导入报错
 pub struct AppState {
     pub config: crate::config::AppConfig,
     pub active_task: Mutex<Option<ActiveTask>>,
@@ -65,9 +63,7 @@ pub struct AppState {
     pub sessions: Mutex<HashMap<i64, UserSession>>,
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
-// 加上 pub 解决 youtube.rs 的导入报错
 pub struct YoutubeUploadInfo {
     pub filename: String,
     pub filepath: PathBuf,

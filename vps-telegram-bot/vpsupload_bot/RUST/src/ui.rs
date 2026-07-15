@@ -91,10 +91,10 @@ pub async fn build_file_selector(
     let mut dirs = Vec::new();
     let mut files = Vec::new();
 
-    if let Ok(entries) = std::fs::read_dir(&current_dir) {
-        for entry in entries.flatten() {
+    if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             if path.is_dir() {
                 dirs.push(name);
             } else if path.is_file() {
@@ -133,7 +133,7 @@ pub async fn build_file_selector(
                 format!("enterdir_{}_{}", action_type, i),
             )]);
         } else {
-            let size = get_formatted_file_size(&path);
+            let size = get_formatted_file_size(&path).await;
             let label = if is_multi {
                 let mark = if selected_set.contains(&i) { "✅ " } else { "⬜️ " };
                 format!("{}[{}] {}", mark, size, name)
