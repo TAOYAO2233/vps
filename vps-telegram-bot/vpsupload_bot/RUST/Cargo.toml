@@ -1,5 +1,5 @@
 [package]
-name = "bl_bot_rust"
+name = "video_upload_bot_rust"
 version = "2.5.2"
 edition = "2021"
 
