@@ -1,191 +1,152 @@
+use crate::config::{action_name_map, Config};
+use crate::media_utils::{assert_path_inside_base, get_formatted_file_size, safe_join};
+use crate::task_manager::AppState;
+use anyhow::Result;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::path::Path;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
-use crate::state::AppState;
-use crate::media_utils::*;
+use teloxide::payloads::EditMessageTextSetters;
+use teloxide::prelude::*;
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 
-fn escape_html(input: &str) -> String {
-    input.replace('&', "&amp;")
-         .replace('<', "&lt;")
-         .replace('>', "&gt;")
-}
-
-pub async fn build_main_menu(state: Arc<AppState>, user_id: i64) -> (String, InlineKeyboardMarkup) {
-    let session = state.get_session(user_id).await;
-    let active_guard = state.active_task.lock().await;
-    
-    let busy_text = match &*active_guard {
-        Some(t) => format!("\n⚡ <b>[当前任务]</b> <code>{}</code>", escape_html(&t.name)),
-        None => "\n🟢 <b>[系统状态]</b> <code>空闲中 (随时就绪)</code>".to_string(),
-    };
-
-    let upload_count = state.youtube_uploads.lock().await.len();
-    let upload_text = if upload_count > 0 {
-        format!("\n☁️ <b>[上传任务]</b> <code>{} 个任务在排队/运行</code>", upload_count)
-    } else {
-        String::new()
-    };
-
-    let theme_name = match session.progress_bar_theme {
-        1 => "🟩🟩⬜⬜ 彩色水果",
-        2 => "━━── 简约细线",
-        _ => "▰▰▱▱ 科幻方块",
-    };
-
-    let text = format!(
-        "<b>╔══════ 🎬 VPS 多媒体控制面板 ══════╗</b>\n\n\
-         📁 <b>存储根目录:</b> <code>{}</code>\n\
-         🎨 <b>当前进度条皮肤:</b> <code>{}</code>\n\
-         {}\n\
-         {}\n\n\
-         <i>💡 提示: 发送 /uploads 查看上传，/stop 中断独占任务。</i>\n\
-         <b>╚════════════════════════════════╝</b>",
-         escape_html(&state.config.base_dir.to_string_lossy()),
-         theme_name,
-         busy_text,
-         upload_text
-    );
-
-    let keyboard = InlineKeyboardMarkup::new(vec![
-        vec![InlineKeyboardButton::callback("📂 浏览与操作本地文件", "init_browse")],
+pub async fn render_main_menu(bot: Bot, chat_id: ChatId, message_id: Option<MessageId>, config: Arc<Config>, state: Arc<AppState>) -> Result<()> {
+    let kb = InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback("📂 浏览远程文件", "init_browse")],
         vec![
-            InlineKeyboardButton::callback("📡 RTMP 推流", "init_stream"),
+            InlineKeyboardButton::callback("📡 RTMP 单路推流", "init_stream"),
             InlineKeyboardButton::callback("☁️ YouTube 上传", "init_youtube"),
         ],
-        vec![
-            InlineKeyboardButton::callback("✂️ 智能视频合并", "init_concat"),
-            InlineKeyboardButton::callback("🔄 批量转码 MP4", "init_convert"),
-        ],
-        vec![
-            InlineKeyboardButton::callback("🎨 切换进度条皮肤", "menu_skin_settings"),
-            InlineKeyboardButton::callback("🗑️ 批量清理文件", "init_delete"),
-        ],
+        vec![InlineKeyboardButton::callback("✂️ 智能视频合并", "init_concat")],
+        vec![InlineKeyboardButton::callback("🔄 批量转码 MP4", "init_convert")],
+        vec![InlineKeyboardButton::callback("🗑️ 批量删除文件", "init_delete")],
     ]);
 
-    (text, keyboard)
+    let active_name = state.active_task.lock().await.as_ref().map(|t| t.name.clone());
+    let busy_text = active_name.map(|n| format!("\n🔒 当前独占任务: `{}`", n)).unwrap_or_default();
+    let upload_count = state.youtube_uploads.lock().await.len();
+    let upload_text = if upload_count > 0 { format!("\n☁️ YouTube 上传/排队: `{}`", upload_count) } else { String::new() };
+
+    let text = format!(
+        "=== 🎬 VPS 多媒体主控面板 ===\n根目录: `{}`\n💡 提示: /uploads 查看上传，/stop 中断运行任务{}{}",
+        config.base_dir.display(), busy_text, upload_text
+    );
+
+    if let Some(msg_id) = message_id {
+        bot.edit_message_text(chat_id, msg_id, text).reply_markup(kb).parse_mode(ParseMode::MarkdownV2).await?;
+    } else {
+        bot.send_message(chat_id, text).reply_markup(kb).parse_mode(ParseMode::MarkdownV2).await?;
+    }
+    Ok(())
 }
 
-pub fn build_skin_selector_menu() -> (String, InlineKeyboardMarkup) {
-    let text = "<b>🎨 选择你喜爱的进度条“视觉皮肤”：</b>\n\n\
-                设置后，推流、转码、以及 YouTube 上传进度条将实时切换为该样式。".to_string();
-
-    let keyboard = InlineKeyboardMarkup::new(vec![
-        vec![InlineKeyboardButton::callback("▰▰▱▱ 科幻方块", "set_skin_0")],
-        vec![InlineKeyboardButton::callback("🟩🟩⬜⬜ 彩色水果", "set_skin_1")],
-        vec![InlineKeyboardButton::callback("━━── 简约细线", "set_skin_2")],
-        vec![InlineKeyboardButton::callback("🔙 返回主菜单", "menu_main")],
-    ]);
-
-    (text, keyboard)
-}
-
-pub async fn build_file_selector(
-    state: Arc<AppState>,
-    user_id: i64,
-    action_type: &str,
+pub async fn render_file_selector(
+    bot: Bot,
+    q: CallbackQuery,
+    action: &str,
     page: usize,
-) -> (String, InlineKeyboardMarkup) {
-    let mut session = state.get_session(user_id).await;
-    let current_dir = session.current_dir.clone();
+    config: Arc<Config>,
+    state: Arc<AppState>,
+) -> Result<()> {
+    let user_id = q.from.id.0 as i64;
+    let session = state.get_session(user_id, &config.base_dir).await;
+    let current_dir = assert_path_inside_base(&config.base_dir, &session.current_dir).unwrap_or_else(|_| config.base_dir.clone());
 
     let mut dirs = Vec::new();
     let mut files = Vec::new();
 
-    if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            if path.is_dir() {
-                dirs.push(name);
-            } else if path.is_file() {
-                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                if state.config.video_extensions.iter().any(|e| e.ends_with(&ext)) {
-                    files.push(name);
+    if let Ok(entries) = fs::read_dir(&current_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Ok(file_type) = entry.file_type() {
+                if file_type.is_dir() {
+                    dirs.push(name);
+                } else if file_type.is_file() {
+                    let lower = name.to_lowercase();
+                    if config.video_extensions.iter().any(|ext| lower.ends_with(ext)) {
+                        files.push(name);
+                    }
                 }
             }
         }
     }
     dirs.sort();
     files.sort();
+    let items: Vec<String> = dirs.into_iter().chain(files.into_iter()).collect();
 
-    let mut all_items = dirs.clone();
-    all_items.extend(files.clone());
-    session.current_files = all_items.clone();
-    state.save_session(user_id, session.clone()).await;
+    state.update_session(user_id, |s| s.current_files = items.clone()).await;
 
-    let is_multi = matches!(action_type, "youtube" | "concat" | "convert" | "delete");
-    let selected_set = session.get_selected(action_type).clone();
+    let is_multi = ["youtube", "concat", "convert", "delete"].contains(&action);
+    let selected_indices = session.selected.get(action).cloned().unwrap_or_default();
 
-    let per_page = state.config.items_per_page;
-    let total_pages = (all_items.len() + per_page - 1) / per_page;
-    let page = page.min(total_pages.saturating_sub(1));
-    let start_idx = page * per_page;
-    let end_idx = (start_idx + per_page).min(all_items.len());
+    let total_pages = ((items.len() as f64) / (config.items_per_page as f64)).ceil() as usize;
+    let total_pages = total_pages.max(1);
+    let page = page.min(total_pages - 1);
+    let start_idx = page * config.items_per_page;
+    let end_idx = (start_idx + config.items_per_page).min(items.len());
+    let page_items = &items[start_idx..end_idx];
 
-    let mut rows = Vec::new();
-    for i in start_idx..end_idx {
-        let name = &all_items[i];
-        let path = current_dir.join(name);
-        
-        if path.is_dir() {
-            rows.push(vec![InlineKeyboardButton::callback(
-                format!("📁 {}", name),
-                format!("enterdir_{}_{}", action_type, i),
-            )]);
+    let mut kb_rows = Vec::new();
+    for (i, item_name) in page_items.iter().enumerate() {
+        let real_idx = start_idx + i;
+        let item_path = current_dir.join(item_name);
+        let (btn_text, callback_data) = if item_path.is_dir() {
+            (format!("📁 {}", item_name), format!("enterdir_{}_{}", action, real_idx))
         } else {
-            let size = get_formatted_file_size(&path).await;
-            let label = if is_multi {
-                let mark = if selected_set.contains(&i) { "✅ " } else { "⬜️ " };
-                format!("{}[{}] {}", mark, size, name)
+            let size_str = get_formatted_file_size(&item_path);
+            if is_multi {
+                let checkbox = if selected_indices.contains(&real_idx) { "✅ " } else { "⬜️ " };
+                (format!("{}[{}] {}", checkbox, size_str, item_name), format!("toggle_{}_{}_{}", action, real_idx, page))
             } else {
-                format!("[{}] {}", size, name)
-            };
-
-            let cb_data = if is_multi {
-                format!("toggle_{}_{}_{}", action_type, i, page)
-            } else {
-                format!("execsingle_{}_{}", action_type, i)
-            };
-            rows.push(vec![InlineKeyboardButton::callback(label, cb_data)]);
-        }
+                (format!("[{}] {}", size_str, item_name), format!("execsingle_{}_{}", action, real_idx))
+            }
+        };
+        kb_rows.push(vec![InlineKeyboardButton::callback(btn_text, callback_data)]);
     }
 
-    let mut nav = Vec::new();
-    if page > 0 {
-        nav.push(InlineKeyboardButton::callback("⬅️ 上一页", format!("menu_{}_{}", action_type, page - 1)));
-    }
-    if page + 1 < total_pages {
-        nav.push(InlineKeyboardButton::callback("➡️ 下一页", format!("menu_{}_{}", action_type, page + 1)));
-    }
-    if !nav.is_empty() { rows.push(nav); }
+    let mut nav_row = Vec::new();
+    if page > 0 { nav_row.push(InlineKeyboardButton::callback("⬅️ 上一页", format!("menu_{}_{}", action, page - 1))); }
+    if page < total_pages - 1 { nav_row.push(InlineKeyboardButton::callback("➡️ 下一页", format!("menu_{}_{}", action, page + 1))); }
+    if !nav_row.is_empty() { kb_rows.push(nav_row); }
 
-    if current_dir != state.config.base_dir {
-        rows.push(vec![InlineKeyboardButton::callback("⬆️ 返回上一层目录", format!("updir_{}", action_type))]);
+    if current_dir.canonicalize().unwrap_or_default() != config.base_dir.canonicalize().unwrap_or_default() {
+        kb_rows.push(vec![InlineKeyboardButton::callback("⬆️ 返回上一级目录", format!("updir_{}", action))]);
     }
 
-    if is_multi && !selected_set.is_empty() {
-        rows.push(vec![InlineKeyboardButton::callback(
-            format!("▶️ 确认执行 (选中 {} 个文件)", selected_set.len()),
-            format!("execbatch_{}", action_type),
-        )]);
+    if is_multi && !selected_indices.is_empty() {
+        kb_rows.push(vec![InlineKeyboardButton::callback(format!("▶️ 确认执行 ({} 个文件)", selected_indices.len()), format!("execbatch_{}", action))]);
     }
+    kb_rows.push(vec![InlineKeyboardButton::callback("🔙 返回主菜单", "menu_main")]);
 
-    rows.push(vec![InlineKeyboardButton::callback("🔙 返回主菜单", "menu_main")]);
+    let rel_path = current_dir.strip_prefix(&config.base_dir).unwrap_or(Path::new("")).display();
+    let display_path = if rel_path.to_string().is_empty() { "🏠".to_string() } else { format!("🏠/{}", rel_path) };
+    let mut header = format!("📂 路径: `{}`\n👉 模式: [{}] (页 {}/{})", display_path, action_name_map(action), page + 1, total_pages);
 
-    let rel_path = current_dir.strip_prefix(&state.config.base_dir).unwrap_or(Path::new(""));
-    let display_path = if rel_path.as_os_str().is_empty() { 
-        "🏠".to_string() 
-    } else { 
-        format!("🏠/{}", rel_path.display()) 
-    };
-    
-    let header = format!(
-        "📂 路径: <code>{}</code>\n👉 模式: <b>[{}]</b> (页 {}/{})", 
-        escape_html(&display_path), 
-        escape_html(&action_type.to_uppercase()), 
-        page + 1, 
-        total_pages.max(1)
-    );
+    if let Some(t) = state.active_task.lock().await.as_ref() { header.push_str(&format!("\n🔒 独占任务: `{}`", t.name)); }
+    let up_cnt = state.youtube_uploads.lock().await.len();
+    if up_cnt > 0 { header.push_str(&format!("\n☁️ YouTube 上传/排队: `{}`", up_cnt)); }
+    if items.is_empty() { header.push_str("\n\n⚠️ 当前目录下既无子文件夹也无视频文件。"); }
 
-    (header, InlineKeyboardMarkup::new(rows))
+    if let Some(msg) = q.message {
+        bot.edit_message_text(msg.chat.id, msg.id, header).reply_markup(InlineKeyboardMarkup::new(kb_rows)).parse_mode(ParseMode::MarkdownV2).await?;
+    }
+    Ok(())
+}
+
+pub async fn render_delete_confirmation(bot: Bot, q: CallbackQuery, target_files: Vec<PathBuf>, state: Arc<AppState>) -> Result<()> {
+    let user_id = q.from.id.0 as i64;
+    state.update_session(user_id, |s| s.pending_delete = target_files.clone()).await;
+
+    let mut lines: Vec<String> = target_files.iter().take(12).map(|p| format!("• `{}`", p.file_name().unwrap().to_str().unwrap())).collect();
+    if target_files.len() > 12 { lines.push(format!("... 其余 {} 个文件未展开", target_files.len() - 12)); }
+
+    let kb = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("✅ 确认删除", "confirm_delete"),
+        InlineKeyboardButton::callback("取消", "cancel_delete"),
+    ]]);
+
+    if let Some(msg) = q.message {
+        bot.edit_message_text(msg.chat.id, msg.id, format!("⚠️ **二次确认：即将永久删除以下文件**\n\n{}\n\n删除后不可恢复。", lines.join("\n")))
+            .reply_markup(kb).parse_mode(ParseMode::MarkdownV2).await?;
+    }
+    Ok(())
 }

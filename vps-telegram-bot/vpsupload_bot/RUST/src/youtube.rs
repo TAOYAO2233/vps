@@ -1,277 +1,198 @@
+use crate::config::Config;
+use crate::media_utils::{assert_path_inside_base, build_progress_bar, format_elapsed};
+use crate::task_manager::{save_persisted_queue, AppState, YoutubeUploadInfo};
+use anyhow::{anyhow, Result};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest::Client;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+use teloxide::payloads::EditMessageTextSetters;
+use teloxide::prelude::*;
+use teloxide::types::ParseMode;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio::sync::Notify;
-use teloxide::prelude::*;
-use teloxide::types::{Message, ParseMode, LinkPreviewOptions};
-use tracing::error;
+use tokio::sync::watch;
 
-use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
-
-use crate::state::{AppState, YoutubeUploadInfo};
-use crate::media_utils::build_progress_bar;
-
-fn escape_html(input: &str) -> String {
-    input.replace('&', "&amp;")
-         .replace('<', "&lt;")
-         .replace('>', "&gt;")
-}
-
-async fn get_local_access_token(token_path: &Path) -> Result<String, String> {
-    let mut file = File::open(token_path).await.map_err(|e| format!("打开 API Token 凭证失败: {}", e))?;
-    let mut content = String::new();
-    file.read_to_string(&mut content).await.map_err(|e| format!("读取凭证文件失败: {}", e))?;
-    
-    let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| format!("解析凭证 JSON 数据异常: {}", e))?;
-    
-    if let Some(token) = json.get("access_token").and_then(|v| v.as_str()) {
-        Ok(token.to_string())
-    } else if let Some(token) = json.get("token").and_then(|v| v.as_str()) {
-        Ok(token.to_string())
-    } else {
-        Err("JSON 凭证中未定位到有效 access_token 字段".to_string())
-    }
-}
-
-pub async fn start_youtube_upload(
+pub async fn start_youtube_uploads(
     bot: Bot,
-    mut progress_msg: Message,
-    filepath: PathBuf,
+    q: CallbackQuery,
+    files: Vec<PathBuf>,
+    config: Arc<Config>,
     state: Arc<AppState>,
-    cancel_flag: Arc<AtomicBool>,
-    cancel_notify: Arc<Notify>,
-    user_id: i64,
-) -> ResponseResult<()> {
-    let filename = filepath.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let escaped_filename = escape_html(&filename);
-    
-    let file_meta = match tokio::fs::metadata(&filepath).await {
-        Ok(m) => m,
-        Err(e) => {
-            bot.edit_message_text(progress_msg.chat.id, progress_msg.id, format!("❌ 读取本地待传文件元数据失败: {}", e)).await.ok();
-            return Ok(());
-        }
-    };
-    let file_size = file_meta.len();
-    if file_size == 0 {
-        bot.edit_message_text(progress_msg.chat.id, progress_msg.id, "❌ 目标上传视频大小为 0 字节，已自动取消。").await.ok();
+) -> Result<()> {
+    if state.active_task.lock().await.is_some() {
+        bot.answer_callback_query(q.id).text("已有独占任务，请等待完成或停用。").show_alert(true).await?;
         return Ok(());
     }
 
-    bot.edit_message_text(
-        progress_msg.chat.id,
-        progress_msg.id,
-        format!("⏳ <b>[YouTube] 任务正在加入上传队列排队中...</b>\n文件: <code>{}</code>", escaped_filename)
-    ).parse_mode(ParseMode::Html).await.ok();
+    let valid_files: Vec<PathBuf> = files.into_iter()
+        .filter_map(|f| assert_path_inside_base(&config.base_dir, &f).ok())
+        .filter(|p| p.is_file())
+        .collect();
 
-    let _permit = match state.youtube_semaphore.acquire().await {
-        Ok(p) => p,
-        Err(_) => return Ok(()),
-    };
-
-    if cancel_flag.load(Ordering::SeqCst) {
+    if valid_files.is_empty() {
+        bot.answer_callback_query(q.id).text("❌ 没有可上传的文件。").show_alert(true).await?;
         return Ok(());
     }
 
-    let now_sec = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-    {
-        let mut uploads = state.youtube_uploads.lock().await;
-        uploads.insert(filename.clone(), YoutubeUploadInfo {
+    bot.answer_callback_query(q.id).await?;
+    let user_id = q.from.id.0 as i64;
+    let chat_id = q.message.as_ref().map(|m| m.chat.id.0).unwrap_or(config.admin_id);
+
+    for path in valid_files {
+        let filename = path.file_name().unwrap().to_str().unwrap().to_string();
+        let task_id = format!("yt_{}_{}", chrono::Utc::now().timestamp_millis(), abs_hash(&path) % 10000);
+        let (tx, rx) = watch::channel(false);
+
+        let msg = bot.send_message(ChatId(chat_id), format!("⏳ 创建 YouTube 上传: `{}`", filename))
+            .parse_mode(ParseMode::MarkdownV2).await?;
+
+        let info = YoutubeUploadInfo {
             filename: filename.clone(),
-            filepath: filepath.clone(),
-            status: "初始化云端会话中".to_string(),
+            path: path.to_string_lossy().to_string(),
+            chat_id,
+            user_id,
+            created_at: chrono::Utc::now().timestamp() as f64,
+            status: "排队中".to_string(),
             progress: 0.0,
-            cancel_flag: cancel_flag.clone(),
-            cancel_notify: cancel_notify.clone(),
-            created_at: now_sec,
+            cancel_tx: Some(tx),
+        };
+
+        {
+            let mut uploads = state.youtube_uploads.lock().await;
+            uploads.insert(task_id.clone(), info);
+            save_persisted_queue(&config.youtube_upload_queue_file, &*uploads);
+        }
+
+        let bot_cloned = bot.clone();
+        let config_cloned = config.clone();
+        let state_cloned = state.clone();
+        let path_cloned = path.clone();
+
+        tokio::spawn(async move {
+            let _ = upload_worker(bot_cloned, msg.id, ChatId(chat_id), path_cloned, task_id.clone(), rx, config_cloned, state_cloned).await;
         });
     }
 
-    let access_token = match get_local_access_token(&state.config.token_file).await {
-        Ok(t) => t,
-        Err(err) => {
-            error!("⚠️ 读取 API Token 失败: {}", err);
-            bot.edit_message_text(progress_msg.chat.id, progress_msg.id, format!("❌ 无法读取 Google Access Token: <code>{}</code>", escape_html(&err))).parse_mode(ParseMode::Html).await.ok();
-            let mut uploads = state.youtube_uploads.lock().await;
-            uploads.remove(&filename);
-            return Ok(());
-        }
-    };
+    if let Some(msg) = q.message {
+        bot.edit_message_text(msg.chat.id, msg.id, "✅ 已启动 YouTube 上传队列，发送 /uploads 查看。").await?;
+    }
+    Ok(())
+}
 
-    bot.edit_message_text(
-        progress_msg.chat.id,
-        progress_msg.id,
-        format!("🚀 <b>[YouTube] 正在向 Google 申请建立可续传分片会话...</b>\n文件: <code>{}</code>", escaped_filename)
-    ).parse_mode(ParseMode::Html).await.ok();
+async fn upload_worker(
+    bot: Bot,
+    msg_id: MessageId,
+    chat_id: ChatId,
+    file_path: PathBuf,
+    task_id: String,
+    mut rx: watch::Receiver<bool>,
+    config: Arc<Config>,
+    state: Arc<AppState>,
+) -> Result<()> {
+    let filename = file_path.file_name().unwrap().to_str().unwrap().to_string();
+    let permit = state.youtube_semaphore.acquire().await?;
 
-    let client = reqwest::Client::new();
-    let init_url = "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status";
-    
-    let metadata_body = serde_json::json!({
-        "snippet": {
-            "title": filename.chars().take(95).collect::<String>(),
-            "description": format!("Uploaded by Telegram Rust VPS Bot\nFile: {}", filename),
-            "categoryId": "22"
-        },
-        "status": {
-            "privacyStatus": "private" 
-        }
+    if *rx.borrow() {
+        update_status(&state, &config.youtube_upload_queue_file, &task_id, "已取消", 0.0).await;
+        let _ = bot.edit_message_text(chat_id, msg_id, format!("🛑 **上传已取消**: `{}`", filename)).parse_mode(ParseMode::MarkdownV2).await;
+        return Ok(());
+    }
+
+    update_status(&state, &config.youtube_upload_queue_file, &task_id, "上传中", 0.0).await;
+    let _ = bot.edit_message_text(chat_id, msg_id, format!("🚀 **开始上传 YouTube**: `{}`", filename)).parse_mode(ParseMode::MarkdownV2).await;
+
+    let token_data = fs::read_to_string(&config.token_file)?;
+    let json: Value = serde_json::from_str(&token_data)?;
+    let access_token = json["access_token"].as_str().ok_or_else(|| anyhow!("无法解析 access_token"))?;
+
+    let client = Client::new();
+    let file_size = fs::metadata(&file_path)?.len();
+    let title = file_path.file_stem().unwrap().to_str().unwrap().chars().take(95).collect::<String>();
+
+    let init_body = serde_json::json!({
+        "snippet": { "title": title, "categoryId": "22" },
+        "status": { "privacyStatus": "private", "selfDeclaredMadeForKids": false }
     });
 
-    let init_res = match client.post(init_url)
+    let res = client.post("https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status")
         .header(AUTHORIZATION, format!("Bearer {}", access_token))
-        .header("X-Upload-Content-Length", file_size)
-        .header("X-Upload-Content-Type", "video/mp4")
-        .json(&metadata_body)
-        .send().await 
-    {
-        Ok(res) if res.status().is_success() => res,
-        Ok(res) => {
-            let err_text = res.text().await.unwrap_or_default();
-            error!("初始化 YouTube 可续传接口请求失败: {}", err_text);
-            bot.edit_message_text(progress_msg.chat.id, progress_msg.id, format!("❌ 初始化 YouTube 接口失败 (Token 可能过期，请及时用脚本刷新凭证):\n<code>{}</code>", escape_html(&err_text))).parse_mode(ParseMode::Html).await.ok();
-            let mut uploads = state.youtube_uploads.lock().await;
-            uploads.remove(&filename);
-            return Ok(());
-        }
-        Err(e) => {
-            bot.edit_message_text(progress_msg.chat.id, progress_msg.id, format!("❌ 请求网络连接失败: {}", e)).await.ok();
-            let mut uploads = state.youtube_uploads.lock().await;
-            uploads.remove(&filename);
-            return Ok(());
-        }
-    };
+        .header(CONTENT_TYPE, "application/json; charset=UTF-8")
+        .header("X-Upload-Content-Length", file_size.to_string())
+        .header("X-Upload-Content-Type", "video/*")
+        .json(&init_body)
+        .send().await?;
 
-    let upload_url = match init_res.headers().get("location").and_then(|h| h.to_str().ok()) {
-        Some(url) => url.to_string(),
-        None => {
-            bot.edit_message_text(progress_msg.chat.id, progress_msg.id, "❌ 未能从 Google 响应 Header 中成功提取 Location 上传地址通道。").await.ok();
-            let mut uploads = state.youtube_uploads.lock().await;
-            uploads.remove(&filename);
-            return Ok(());
-        }
-    };
+    let upload_url = res.headers().get("location").and_then(|h| h.to_str().ok()).ok_or_else(|| anyhow!("未获取到 resumable upload url"))?.to_string();
 
-    let chunk_size = (state.config.youtube_upload_chunk_mb * 1024 * 1024) as u64; 
-    let mut file = match File::open(&filepath).await {
-        Ok(f) => f,
-        Err(e) => {
-            bot.edit_message_text(progress_msg.chat.id, progress_msg.id, format!("❌ 打开物理文件流异常: {}", e)).await.ok();
-            let mut uploads = state.youtube_uploads.lock().await;
-            uploads.remove(&filename);
-            return Ok(());
-        }
-    };
+    let mut file = File::open(&file_path).await?;
+    let chunk_size = (config.youtube_upload_chunk_mb * 1024 * 1024) as u64;
+    let mut uploaded = 0u64;
+    let mut buffer = vec![0u8; chunk_size as usize];
+    let mut last_update = Instant::now();
 
-    let mut offset = 0u64;
-    let mut last_update = std::time::Instant::now();
-
-    while offset < file_size {
-        if cancel_flag.load(Ordering::SeqCst) {
-            bot.edit_message_text(progress_msg.chat.id, progress_msg.id, format!("🛑 <b>[YouTube] 上传任务已被取消</b>\n文件: <code>{}</code>", escaped_filename)).parse_mode(ParseMode::Html).await.ok();
-            let mut uploads = state.youtube_uploads.lock().await;
-            uploads.remove(&filename);
+    while uploaded < file_size {
+        if *rx.borrow() {
+            update_status(&state, &config.youtube_upload_queue_file, &task_id, "已取消", 0.0).await;
+            let _ = bot.edit_message_text(chat_id, msg_id, format!("🛑 **上传手动终止**: `{}`", filename)).parse_mode(ParseMode::MarkdownV2).await;
             return Ok(());
         }
 
-        let current_chunk = std::cmp::min(chunk_size, file_size - offset);
-        let mut buffer = vec![0u8; current_chunk as usize];
-        if let Err(e) = file.read_exact(&mut buffer).await {
-            bot.edit_message_text(progress_msg.chat.id, progress_msg.id, format!("❌ 读取视频块 IO 数据段流异常: {}", e)).await.ok();
-            let mut uploads = state.youtube_uploads.lock().await;
-            uploads.remove(&filename);
-            return Ok(());
+        let to_read = std::cmp::min(chunk_size, file_size - uploaded) as usize;
+        let n = file.read_exact(&mut buffer[..to_read]).await?;
+        let end_byte = uploaded + n as u64 - 1;
+
+        let res = client.put(&upload_url)
+            .header(AUTHORIZATION, format!("Bearer {}", access_token))
+            .header(CONTENT_TYPE, "video/*")
+            .header(CONTENT_LENGTH, n)
+            .header("Content-Range", format!("bytes {}-{}/{}", uploaded, end_byte, file_size))
+            .body(buffer[..n].to_vec())
+            .send().await?;
+
+        uploaded += n as u64;
+        let p = (uploaded as f64 / file_size as f64) * 100.0;
+        update_status(&state, &config.youtube_upload_queue_file, &task_id, "上传中", p).await;
+
+        if last_update.elapsed().as_secs() >= 3 || uploaded == file_size {
+            let bar = build_progress_bar(p, 20);
+            let _ = bot.edit_message_text(chat_id, msg_id, format!("☁️ **上传 YouTube**: `{}`\n\n`{}`", filename, bar)).parse_mode(ParseMode::MarkdownV2).await;
+            last_update = Instant::now();
         }
 
-        let content_range = format!("bytes {}-{}/{}", offset, offset + current_chunk - 1, file_size);
-        
-        let chunk_res = match client.put(&upload_url)
-            .header("Content-Range", content_range)
-            .header(CONTENT_LENGTH, current_chunk)
-            .header(CONTENT_TYPE, "video/mp4")
-            .body(buffer)
-            .send().await 
-        {
-            Ok(r) => r,
-            Err(e) => {
-                bot.edit_message_text(progress_msg.chat.id, progress_msg.id, format!("❌ 同步数据分片至 Google 网络中断: {}", e)).await.ok();
-                let mut uploads = state.youtube_uploads.lock().await;
-                uploads.remove(&filename);
-                return Ok(());
-            }
-        };
-
-        let status = chunk_res.status();
-        
-        // 核心逻辑修复：处理 HTTP 308 (Resume Incomplete) 中间状态与 200/201 完成状态
-        if status.as_u16() == 308 {
-            offset += current_chunk;
-            let progress = (offset as f64 / file_size as f64) * 100.0;
-
-            {
-                let mut uploads = state.youtube_uploads.lock().await;
-                if let Some(info) = uploads.get_mut(&filename) {
-                    info.status = "极速上传网络传输中".to_string();
-                    info.progress = progress;
-                }
-            }
-
-            if last_update.elapsed().as_secs() >= 3 {
-                let session = state.get_session(user_id).await;
-                let pb = build_progress_bar(progress, 20, session.progress_bar_theme);
-                bot.edit_message_text(
-                    progress_msg.chat.id,
-                    progress_msg.id,
-                    format!("📤 <b>[YouTube] 正在高效同步至云端...</b>\n文件: <code>{}</code>\n\n进度: {}", escaped_filename, pb)
-                ).parse_mode(ParseMode::Html).await.ok();
-                last_update = std::time::Instant::now();
-            }
-        } else if status.is_success() || status.as_u16() == 201 {
-            if let Ok(json) = chunk_res.json::<serde_json::Value>().await {
-                if let Some(video_id) = json.get("id").and_then(|v| v.as_str()) {
-                    let now_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                    
-                    let success_text = format!(
-                        "✅ <b>YouTube 云端发布成功！</b>\n\n\
-                        🎬 <b>视频名称:</b> <code>{}</code>\n\
-                        🕒 <b>上传时间:</b> <code>{}</code>\n\n\
-                        📺 <b>观看链接:</b> https://youtu.be/{}\n\
-                        🛠️ <b>Studio 后台:</b> https://studio.youtube.com/video/{}/edit",
-                        escaped_filename, now_time, video_id, video_id
-                    );
-
-                    bot.edit_message_text(progress_msg.chat.id, progress_msg.id, success_text)
-                        .parse_mode(ParseMode::Html)
-                        .link_preview_options(LinkPreviewOptions {
-                            is_disabled: true,
-                            url: None,
-                            prefer_small_media: false,
-                            prefer_large_media: false,
-                            show_above_text: false,
-                        })
-                        .await.ok();
-
-                    let mut uploads = state.youtube_uploads.lock().await;
-                    uploads.remove(&filename);
-                    return Ok(());
-                }
-            }
-            bot.edit_message_text(progress_msg.chat.id, progress_msg.id, "❌ 上传结束但解析 YouTube 分发 ID 失败。").await.ok();
-            let mut uploads = state.youtube_uploads.lock().await;
-            uploads.remove(&filename);
-            return Ok(());
-        } else {
-            let err_body = chunk_res.text().await.unwrap_or_default();
-            bot.edit_message_text(progress_msg.chat.id, progress_msg.id, format!("❌ YouTube 拒绝接收分片请求 [HTTP {}]:\n<code>{}</code>", status.as_u16(), escape_html(&err_body))).parse_mode(ParseMode::Html).await.ok();
-            let mut uploads = state.youtube_uploads.lock().await;
-            uploads.remove(&filename);
-            return Ok(());
+        if res.status().is_success() {
+            let resp_json: Value = res.json().await?;
+            let vid_id = resp_json["id"].as_str().unwrap_or("unknown");
+            update_status(&state, &config.youtube_upload_queue_file, &task_id, "完成", 100.0).await;
+            let text = format!("✅ **上传成功！**\n🎬 视频: `{}`\n📺 链接: `https://youtu.be/{}`", filename, vid_id);
+            let _ = bot.edit_message_text(chat_id, msg_id, text).parse_mode(ParseMode::MarkdownV2).await;
+            break;
         }
     }
 
+    drop(permit);
     let mut uploads = state.youtube_uploads.lock().await;
-    uploads.remove(&filename);
+    uploads.remove(&task_id);
+    save_persisted_queue(&config.youtube_upload_queue_file, &*uploads);
     Ok(())
+}
+
+async fn update_status(state: &Arc<AppState>, queue_path: &Path, task_id: &str, status: &str, progress: f64) {
+    let mut uploads = state.youtube_uploads.lock().await;
+    if let Some(info) = uploads.get_mut(task_id) {
+        info.status = status.to_string();
+        info.progress = progress;
+        save_persisted_queue(queue_path, &*uploads);
+    }
+}
+
+fn abs_hash(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
 }
