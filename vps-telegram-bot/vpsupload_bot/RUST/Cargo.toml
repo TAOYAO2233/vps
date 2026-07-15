@@ -1,0 +1,26 @@
+[package]
+name = "bl_bot_rust"
+version = "2.5.2"
+edition = "2021"
+
+[dependencies]
+# 禁用默认的 openssl/native-tls，强制改为 rustls
+teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tokio = { version = "1.38", features = ["full"] }
+
+# 序列化与基础依赖
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+chrono = "0.4"
+regex = "1.10"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
