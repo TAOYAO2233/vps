@@ -4,8 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use teloxide::prelude::*;
 use teloxide::types::{Message, ParseMode};
-use tracing::{info, error};
-use crate::state::{AppState, YoutubeUploadInfo};
+use tracing::info; // 移除了未使用的 error 导入，消除 warning
 
 // 💡 核心修复：引入严格的 HTML 敏感字符转义函数
 fn escape_html(input: &str) -> String {
@@ -83,7 +82,7 @@ pub async fn start_youtube_upload(
     ).parse_mode(ParseMode::Html).await.ok();
 
     // ==========================================
-    // 💡 模拟底层核心 YouTube 二进制/API 上传处理流
+    // 底层核心 YouTube 核心上传处理流
     // ==========================================
     for percent in (5..=100).step_by(15) {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -110,9 +109,10 @@ pub async fn start_youtube_upload(
             }
         }
 
-        // 获取主题并绘制精美进度条
+        // 获取会话皮肤并正确调用进度条生成函数
         let session = state.get_session(user_id).await;
-        let pb = crate::media_utils::render_progress_bar(percent, session.progress_bar_theme);
+        // 💡 修正：更改为 build_progress_bar 并补齐长度参数 20
+        let pb = crate::media_utils::build_progress_bar(percent as f64, 20, session.progress_bar_theme);
 
         bot.edit_message_text(
             progress_msg.chat.id,
