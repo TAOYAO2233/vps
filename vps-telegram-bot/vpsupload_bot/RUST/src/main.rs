@@ -23,7 +23,7 @@ fn escape_html(input: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 初始化极具科技感的多彩结构化终端日志系统
+    // 初始化多彩结构化终端日志系统
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_thread_ids(true)
@@ -108,7 +108,6 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         None => return Ok(()),
     };
 
-    // 💡 实现在控制台实时捕获并展示点击事件的彩色日志追踪
     let user_name = q.from.username.clone().unwrap_or_else(|| "未知用户".to_string());
     info!("🔘 [点击回调] 用户: {} ({}) | 触发动作: {}", user_name, user_id, data);
 
@@ -157,10 +156,11 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
         if let Some(folder_name) = session.current_files.get(idx).cloned() {
             session.current_dir = session.current_dir.join(folder_name);
             session.clear_all_selected();
-            state.save_session(user_id, session).await;
             
-            // 💡 打印详细的进深目录变化
+            // 💡 【关键修正】在所有权被 eat 掉之前，先执行日志打印！
             info!("📁 [切换目录] 进入子文件夹: {:?}", session.current_dir);
+            
+            state.save_session(user_id, session).await;
         }
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, 0).await;
         if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
@@ -171,9 +171,11 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
             if let Some(parent) = session.current_dir.parent() {
                 session.current_dir = parent.to_path_buf();
                 session.clear_all_selected();
-                state.save_session(user_id, session).await;
                 
+                // 💡 【关键修正】在所有权被 eat 掉之前，先执行日志打印！
                 info!("⬆️ [切换目录] 返回上层文件夹: {:?}", session.current_dir);
+                
+                state.save_session(user_id, session).await;
             }
         }
         let (content, kb) = ui::build_file_selector(state.clone(), user_id, action, 0).await;
