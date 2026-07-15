@@ -5,9 +5,8 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 use teloxide::prelude::*;
-use teloxide::types::{Message, ParseMode};
-use tracing::{info, error};
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, AUTHORIZATION};
+use teloxide::types::{Message, ParseMode, LinkPreviewOptions};
+use tracing::error; // 💡 修正：移除了未使用的 info 导入，保留 error，消除 warning
 
 use crate::state::{AppState, YoutubeUploadInfo};
 use crate::media_utils::build_progress_bar;
@@ -19,7 +18,7 @@ fn escape_html(input: &str) -> String {
          .replace('>', "&gt;")
 }
 
-// 💡 动态从本地 token.json 提取真实的 Google API Access Token
+// 动态从本地 token.json 提取真实的 Google API Access Token
 async fn get_local_access_token(token_path: &std::path::Path) -> Result<String, String> {
     let mut file = File::open(token_path).await.map_err(|e| format!("打开 token.json 失败: {}", e))?;
     let mut content = String::new();
@@ -27,7 +26,6 @@ async fn get_local_access_token(token_path: &std::path::Path) -> Result<String, 
     
     let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| format!("解析 token.json 失败: {}", e))?;
     
-    // 支持标准 Google OAuth2 格式的 token 数据提取
     if let Some(token) = json.get("access_token").and_then(|v| v.as_str()) {
         Ok(token.to_string())
     } else if let Some(token) = json.get("token").and_then(|v| v.as_str()) {
@@ -193,7 +191,6 @@ pub async fn start_youtube_upload(
             if let Ok(res) = chunk_res {
                 if res.status().is_success() || res.status().as_u16() == 201 {
                     if let Ok(json) = res.json::<serde_json::Value>().await {
-                        // 🟢 【终极提取】从 Google 返回的数据报文中提取真实的 video id
                         if let Some(video_id) = json.get("id").and_then(|v| v.as_str()) {
                             let now_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                             
@@ -206,9 +203,16 @@ pub async fn start_youtube_upload(
                                 escaped_filename, now_time, video_id, video_id
                             );
 
+                            // 💡 修正：将不支持的 disable_web_page_preview 替换为标准的 link_preview_options
                             bot.edit_message_text(progress_msg.chat.id, progress_msg.id, success_text)
                                 .parse_mode(ParseMode::Html)
-                                .disable_web_page_preview(true)
+                                .link_preview_options(LinkPreviewOptions {
+                                    is_disabled: true, // 彻底关闭链接的网页预览图，保持气泡清爽
+                                    url: None,
+                                    prefer_small_media: false,
+                                    prefer_large_media: false,
+                                    show_above_text: false,
+                                })
                                 .await.ok();
 
                             let mut uploads = state.youtube_uploads.lock().await;
