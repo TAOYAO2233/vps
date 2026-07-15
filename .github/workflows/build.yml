@@ -1,4 +1,4 @@
-name: Build Rust Bot Release (Rustls)
+name: Build Rust Bot Release (Rustls + Musl)
 
 on:
   push:
@@ -16,13 +16,17 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v3
 
-    # 2. 只需要安装 Rust 并注册 musl 目标即可，无需任何额外的 apt 系统依赖安装
+    # 2. 【关键修正】安装 musl-tools 补齐 musl-gcc 编译器驱动
+    - name: Install musl-tools
+      run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+    # 3. 安装 Rust 并注册 musl 目标
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: x86_64-unknown-linux-musl
 
-    # 3. 缓存 Cargo 依赖（极大加快后续的编译速度）
+    # 4. 缓存 Cargo 依赖
     - name: Cache Dependencies
       uses: actions/cache@v3
       with:
@@ -32,11 +36,11 @@ jobs:
           vps-telegram-bot/bilive_bot/RUST/target
         key: ${{ runner.os }}-cargo-${{ hashFiles('vps-telegram-bot/bilive_bot/RUST/Cargo.lock') }}
 
-    # 4. 执行静态编译
+    # 5. 执行静态编译（此时能够顺利找到 musl-gcc 并编译 ring 库）
     - name: Build Binary
       run: cargo build --release --target x86_64-unknown-linux-musl
 
-    # 5. 上传生成的无依赖单文件二进制程序
+    # 6. 上传生成的无依赖单文件二进制程序
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
