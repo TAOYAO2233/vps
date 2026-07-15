@@ -23,7 +23,12 @@ fn escape_html(input: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_thread_ids(true)
+        .with_ansi(true) 
+        .init();
+
     let _ = dotenvy::dotenv();
 
     let config = match AppConfig::load_from_env() {
@@ -58,7 +63,7 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Respons
     
     if let Some(text) = msg.text() {
         if text.starts_with("/start") {
-            let (content, kb) = ui::build_main_menu(state.clone()).await;
+            let (content, kb) = ui::build_main_menu(state.clone(), msg.chat.id.0 as i64).await;
             bot.send_message(msg.chat.id, content).parse_mode(ParseMode::Html).reply_markup(kb).await?;
         } else if text.starts_with("/stop") {
             let mut active = state.active_task.lock().await;
@@ -103,7 +108,25 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
     };
 
     if data == "menu_main" {
-        let (content, kb) = ui::build_main_menu(state.clone()).await;
+        let (content, kb) = ui::build_main_menu(state.clone(), user_id).await;
+        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
+    } else if data == "menu_skin_settings" {
+        let (content, kb) = ui::build_skin_selector_menu();
+        if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
+    } else if data.starts_with("set_skin_") {
+        let theme_id: usize = data.strip_prefix("set_skin_").unwrap().parse().unwrap_or(0);
+        let mut session = state.get_session(user_id).await;
+        session.progress_bar_theme = theme_id;
+        state.save_session(user_id, session).await;
+
+        let ok_text = match theme_id {
+            1 => "✅ 皮肤已成功切换为：彩色水果 🟩🟩⬜⬜",
+            2 => "✅ 皮肤已成功切换为：简约细线 ━━──",
+            _ => "✅ 皮肤已成功切换为：科幻方块 ▰▰▱▱",
+        };
+        bot.answer_callback_query(q.id).text(ok_text).show_alert(true).await?;
+        
+        let (content, kb) = ui::build_main_menu(state.clone(), user_id).await;
         if let Some(m) = q.message { bot.edit_message_text(m.chat().id, m.id(), content).parse_mode(ParseMode::Html).reply_markup(kb).await?; }
     } else if data.starts_with("init_") {
         let action = data.strip_prefix("init_").unwrap();
@@ -182,14 +205,14 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
                 let flag = Arc::new(AtomicBool::new(false));
                 *active_lock = Some(ActiveTask { name: format!("推流: {}", filename), cancel_flag: flag.clone(), cancel_notify: notify.clone() });
                 if let Some(MaybeInaccessibleMessage::Regular(msg)) = q.message.clone() {
-                    tokio::spawn(actions::action_stream(bot.clone(), msg, path, state.clone(), flag, notify));
+                    tokio::spawn(actions::action_stream(bot.clone(), msg, path, state.clone(), flag, notify, user_id));
                 }
             } else if action == "youtube" {
                 let notify = Arc::new(Notify::new());
                 let flag = Arc::new(AtomicBool::new(false));
                 if let Some(MaybeInaccessibleMessage::Regular(msg)) = q.message.clone() {
                     let progress_msg = bot.send_message(msg.chat.id, "正在初始化 YouTube...").await?;
-                    tokio::spawn(youtube::start_youtube_upload(bot.clone(), progress_msg, path, state.clone(), flag, notify));
+                    tokio::spawn(youtube::start_youtube_upload(bot.clone(), progress_msg, path, state.clone(), flag, notify, user_id));
                 }
             }
         }
@@ -224,7 +247,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<AppState>) -> Re
             if action == "concat" {
                 tokio::spawn(actions::action_concat(bot.clone(), msg, target_files, state.clone(), flag, notify));
             } else if action == "convert" {
-                tokio::spawn(actions::action_convert(bot.clone(), msg, target_files, state.clone(), flag, notify));
+                tokio::spawn(actions::action_convert(bot.clone(), msg, target_files, state.clone(), flag, notify, user_id));
             } else if action == "delete" {
                 tokio::spawn(actions::action_delete(bot.clone(), msg, target_files, state.clone()));
             }

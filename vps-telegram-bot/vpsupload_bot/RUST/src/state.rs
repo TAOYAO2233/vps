@@ -19,6 +19,7 @@ pub struct UserSession {
     pub selected_convert: HashSet<usize>,
     pub selected_delete: HashSet<usize>,
     pub pending_delete_files: Vec<PathBuf>,
+    pub progress_bar_theme: usize, // <--- 新增：0=科幻方块, 1=彩色水果, 2=简约细线
 }
 
 impl UserSession {
@@ -31,6 +32,7 @@ impl UserSession {
             selected_convert: HashSet::new(),
             selected_delete: HashSet::new(),
             pending_delete_files: Vec::new(),
+            progress_bar_theme: 0, // 默认使用科幻方块
         }
     }
     

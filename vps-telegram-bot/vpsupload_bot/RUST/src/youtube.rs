@@ -11,6 +11,12 @@ use reqwest::header::CONTENT_LENGTH;
 use crate::state::{AppState, YoutubeUploadInfo};
 use crate::media_utils::build_progress_bar;
 
+fn escape_html(input: &str) -> String {
+    input.replace('&', "&amp;")
+         .replace('<', "&lt;")
+         .replace('>', "&gt;")
+}
+
 pub async fn start_youtube_upload(
     bot: Bot,
     msg: Message,
@@ -18,7 +24,11 @@ pub async fn start_youtube_upload(
     state: Arc<AppState>,
     cancel_flag: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
+    user_id: i64,
 ) {
+    let session = state.get_session(user_id).await;
+    let theme = session.progress_bar_theme;
+
     let filename = filepath.file_name().unwrap().to_string_lossy().to_string();
     let file_size = std::fs::metadata(&filepath).map(|m| m.len()).unwrap_or(0);
 
@@ -35,8 +45,8 @@ pub async fn start_youtube_upload(
         });
     }
 
-    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("⏳ **排队等待 YouTube 分发限制**...\n`{}`", filename))
-        .parse_mode(ParseMode::MarkdownV2).await;
+    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("⏳ <b>排队等待 YouTube 分发限制</b>...\n<code>{}</code>", escape_html(&filename)))
+        .parse_mode(ParseMode::Html).await;
 
     let _permit = match state.youtube_semaphore.acquire().await {
         Ok(p) => p,
@@ -49,8 +59,8 @@ pub async fn start_youtube_upload(
     }
 
     update_upload_status(&filepath, "上传中", 0.0, &state).await;
-    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🚀 **正在连接 YouTube 上传端口**...\n`{}`", filename))
-        .parse_mode(ParseMode::MarkdownV2).await;
+    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🚀 <b>正在连接 YouTube 上传端口</b>...\n<code>{}</code>", escape_html(&filename)))
+        .parse_mode(ParseMode::Html).await;
 
     let access_token = "YOUR_OAUTH_ACCESS_TOKEN"; 
     let client = reqwest::Client::new();
@@ -86,7 +96,7 @@ pub async fn start_youtube_upload(
 
     while offset < file_size {
         if cancel_flag.load(Ordering::SeqCst) {
-            let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🛑 **YouTube 上传已取消**:\n`{}`", filename)).parse_mode(ParseMode::MarkdownV2).await;
+            let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🛑 <b>YouTube 上传已取消</b>:\n<code>{}</code>", escape_html(&filename))).parse_mode(ParseMode::Html).await;
             remove_upload_record(&filepath, &state).await;
             return;
         }
@@ -108,14 +118,14 @@ pub async fn start_youtube_upload(
         update_upload_status(&filepath, "上传中", progress, &state).await;
 
         if last_update.elapsed().as_secs() >= 3 || offset >= file_size {
-            let bar = build_progress_bar(progress, 20);
-            let text = format!("☁️ **上传 YouTube**:\n`{}`\n\n`{}`", filename, bar);
-            let _ = bot.edit_message_text(msg.chat.id, msg.id, text).parse_mode(ParseMode::MarkdownV2).await;
+            let bar = build_progress_bar(progress, 20, theme);
+            let text = format!("☁️ <b>上传 YouTube</b>:\n<code>{}</code>\n\n{}", escape_html(&filename), bar);
+            let _ = bot.edit_message_text(msg.chat.id, msg.id, text).parse_mode(ParseMode::Html).await;
             last_update = std::time::Instant::now();
         }
     }
 
-    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("✅ **上传完成！**\n🎬 视频名称: `{}`", filename)).parse_mode(ParseMode::MarkdownV2).await;
+    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("✅ <b>上传完成！</b>\n🎬 视频名称: <code>{}</code>", escape_html(&filename))).parse_mode(ParseMode::Html).await;
     remove_upload_record(&filepath, &state).await;
 }
 

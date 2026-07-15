@@ -4,46 +4,76 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 use crate::state::AppState;
 use crate::media_utils::*;
 
-// 简单的 HTML 安全转义函数，只转义 HTML 核心保留字
 fn escape_html(input: &str) -> String {
     input.replace('&', "&amp;")
          .replace('<', "&lt;")
          .replace('>', "&gt;")
 }
 
-pub async fn build_main_menu(state: Arc<AppState>) -> (String, InlineKeyboardMarkup) {
+pub async fn build_main_menu(state: Arc<AppState>, user_id: i64) -> (String, InlineKeyboardMarkup) {
+    let session = state.get_session(user_id).await;
     let active_guard = state.active_task.lock().await;
+    
     let busy_text = match &*active_guard {
-        Some(t) => format!("\n🔒 运行中独占任务: <b>{}</b>", escape_html(&t.name)),
-        None => String::new(),
+        Some(t) => format!("\n⚡ <b>[当前任务]</b> <code>{}</code>", escape_html(&t.name)),
+        None => "\n🟢 <b>[系统状态]</b> <code>空闲中 (随时就绪)</code>".to_string(),
     };
 
     let upload_count = state.youtube_uploads.lock().await.len();
     let upload_text = if upload_count > 0 {
-        format!("\n☁️ YouTube 排队/上传中: <code>{}</code>", upload_count)
+        format!("\n☁️ <b>[上传任务]</b> <code>{} 个任务在排队/运行</code>", upload_count)
     } else {
         String::new()
     };
 
-    // 使用标准 HTML 标签
+    let theme_name = match session.progress_bar_theme {
+        1 => "🟩🟩⬜⬜ 彩色水果",
+        2 => "━━── 简约细线",
+        _ => "▰▰▱▱ 科幻方块",
+    };
+
     let text = format!(
-        "=== 🎬 <b>VPS 多媒体控制台</b> ===\n\
-         根目录: <code>{}</code>\n\
-         💡 提示: /uploads 查看上传，/stop 中断任务{}{}",
-         escape_html(&state.config.base_dir.to_string_lossy()), 
-         busy_text, 
+        "<b>╔══════ 🎬 VPS 多媒体控制面板 ══════╗</b>\n\n\
+         📁 <b>存储根目录:</b> <code>{}</code>\n\
+         🎨 <b>当前进度条皮肤:</b> <code>{}</code>\n\
+         {}\n\
+         {}\n\n\
+         <i>💡 提示: 发送 /uploads 查看上传，/stop 中断独占任务。</i>\n\
+         <b>╚════════════════════════════════╝</b>",
+         escape_html(&state.config.base_dir.to_string_lossy()),
+         theme_name,
+         busy_text,
          upload_text
     );
 
     let keyboard = InlineKeyboardMarkup::new(vec![
-        vec![InlineKeyboardButton::callback("📂 浏览远程目录", "init_browse")],
+        vec![InlineKeyboardButton::callback("📂 浏览与操作本地文件", "init_browse")],
         vec![
-            InlineKeyboardButton::callback("📡 RTMP 单路推流", "init_stream"),
+            InlineKeyboardButton::callback("📡 RTMP 推流", "init_stream"),
             InlineKeyboardButton::callback("☁️ YouTube 上传", "init_youtube"),
         ],
-        vec![InlineKeyboardButton::callback("✂️ 智能视频合并", "init_concat")],
-        vec![InlineKeyboardButton::callback("🔄 批量转码 MP4", "init_convert")],
-        vec![InlineKeyboardButton::callback("🗑️ 批量删除文件", "init_delete")],
+        vec![
+            InlineKeyboardButton::callback("✂️ 智能视频合并", "init_concat"),
+            InlineKeyboardButton::callback("🔄 批量转码 MP4", "init_convert"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("🎨 切换进度条皮肤", "menu_skin_settings"),
+            InlineKeyboardButton::callback("🗑️ 批量清理文件", "init_delete"),
+        ],
+    ]);
+
+    (text, keyboard)
+}
+
+pub fn build_skin_selector_menu() -> (String, InlineKeyboardMarkup) {
+    let text = "<b>🎨 选择你喜爱的进度条“视觉皮肤”：</b>\n\n\
+                设置后，推流、转码、以及 YouTube 上传进度条将实时切换为该样式。".to_string();
+
+    let keyboard = InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback("▰▰▱▱ 科幻方块", "set_skin_0")],
+        vec![InlineKeyboardButton::callback("🟩🟩⬜⬜ 彩色水果", "set_skin_1")],
+        vec![InlineKeyboardButton::callback("━━── 简约细线", "set_skin_2")],
+        vec![InlineKeyboardButton::callback("🔙 返回主菜单", "menu_main")],
     ]);
 
     (text, keyboard)
@@ -149,7 +179,6 @@ pub async fn build_file_selector(
         format!("🏠/{}", rel_path.display()) 
     };
     
-    // HTML 风格排版，完全免疫括号、等号报错
     let header = format!(
         "📂 路径: <code>{}</code>\n👉 模式: <b>[{}]</b> (页 {}/{})", 
         escape_html(&display_path), 

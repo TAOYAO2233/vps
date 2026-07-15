@@ -12,6 +12,12 @@ use regex::Regex;
 use crate::state::AppState;
 use crate::media_utils::*;
 
+fn escape_html(input: &str) -> String {
+    input.replace('&', "&amp;")
+         .replace('<', "&lt;")
+         .replace('>', "&gt;")
+}
+
 pub async fn action_stream(
     bot: Bot,
     msg: Message,
@@ -19,7 +25,11 @@ pub async fn action_stream(
     state: Arc<AppState>,
     cancel_flag: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
+    user_id: i64,
 ) {
+    let session = state.get_session(user_id).await;
+    let theme = session.progress_bar_theme;
+
     let filename = filepath.file_name().unwrap().to_string_lossy().to_string();
     let rtmp = &state.config.rtmp_url;
     if rtmp.is_empty() {
@@ -33,8 +43,8 @@ pub async fn action_stream(
         return;
     }
 
-    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("⏳ 正在开始推流: `{}`...", filename))
-        .parse_mode(ParseMode::MarkdownV2).await;
+    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("⏳ 正在开始推流: <code>{}</code>...", escape_html(&filename)))
+        .parse_mode(ParseMode::Html).await;
 
     let mut child = Command::new("ffmpeg")
         .args(&["-re", "-i", filepath.to_str().unwrap(), "-c", "copy", "-f", "flv", rtmp])
@@ -54,8 +64,8 @@ pub async fn action_stream(
         tokio::select! {
             _ = cancel_notify.notified() => {
                 let _ = child.kill().await;
-                let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🛑 **推流已手动终止**:\n`{}`", filename))
-                    .parse_mode(ParseMode::MarkdownV2).await;
+                let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🛑 <b>推流已手动终止</b>:\n<code>{}</code>", escape_html(&filename)))
+                    .parse_mode(ParseMode::Html).await;
                 break;
             }
             line = reader.next_line() => {
@@ -69,9 +79,9 @@ pub async fn action_stream(
                             let percent = (curr_sec / duration) * 100.0;
                             
                             if (percent - last_percent >= 1.0) && last_update.elapsed().as_secs() >= 2 {
-                                let bar = build_progress_bar(percent, 20);
-                                let text = format!("📡 **推流中**: `{}`\n\n`{}`\n⏱️ {:.0}s / {:.0}s", filename, bar, curr_sec, duration);
-                                let _ = bot.edit_message_text(msg.chat.id, msg.id, text).parse_mode(ParseMode::MarkdownV2).await;
+                                let bar = build_progress_bar(percent, 20, theme);
+                                let text = format!("📡 <b>推流中</b>: <code>{}</code>\n\n{}\n⏱️ {}s / {}s", escape_html(&filename), bar, curr_sec, duration);
+                                let _ = bot.edit_message_text(msg.chat.id, msg.id, text).parse_mode(ParseMode::Html).await;
                                 last_update = std::time::Instant::now();
                                 last_percent = percent;
                             }
@@ -86,7 +96,7 @@ pub async fn action_stream(
     if !cancel_flag.load(Ordering::SeqCst) {
         if let Ok(status) = child.wait().await {
             if status.success() {
-                let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("✅ **推流结束**:\n`{}`", filename)).parse_mode(ParseMode::MarkdownV2).await;
+                let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("✅ <b>推流结束</b>:\n<code>{}</code>", escape_html(&filename))).parse_mode(ParseMode::Html).await;
             }
         }
     }
@@ -114,8 +124,8 @@ pub async fn action_concat(
     let output_path = unique_path(&work_dir.join(format!("{}.mp4", stem)));
     let output_name = output_path.file_name().unwrap().to_string_lossy().to_string();
 
-    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("⏳ **正在验证和准备拼接**...\n输出: `{}`", output_name))
-        .parse_mode(ParseMode::MarkdownV2).await;
+    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("⏳ <b>正在验证和准备拼接</b>...\n输出: <code>{}</code>", escape_html(&output_name)))
+        .parse_mode(ParseMode::Html).await;
 
     let mut list_content = String::new();
     for f in &files {
@@ -139,18 +149,18 @@ pub async fn action_concat(
         _ = cancel_notify.notified() => {
             let _ = child.kill().await;
             let _ = std::fs::remove_file(&output_path);
-            let _ = bot.edit_message_text(msg.chat.id, msg.id, "🛑 **合并任务已手动终止。**").parse_mode(ParseMode::MarkdownV2).await;
+            let _ = bot.edit_message_text(msg.chat.id, msg.id, "🛑 <b>合并任务已手动终止。</b>").parse_mode(ParseMode::Html).await;
         }
         res = child.wait() => {
             let _ = std::fs::remove_file(&list_file);
             match res {
                 Ok(status) if status.success() => {
-                    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("✅ **合并成功！**\n📁 新文件: `{}`", output_name)).parse_mode(ParseMode::MarkdownV2).await;
+                    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("✅ <b>合并成功！</b>\n📁 新文件: <code>{}</code>", escape_html(&output_name))).parse_mode(ParseMode::Html).await;
                 }
                 _ => {
                     let _ = std::fs::remove_file(&output_path);
                     if !cancel_flag.load(Ordering::SeqCst) {
-                        let _ = bot.edit_message_text(msg.chat.id, msg.id, "❌ **直连拼接失败。** 请尝试转码后再合并。").parse_mode(ParseMode::MarkdownV2).await;
+                        let _ = bot.edit_message_text(msg.chat.id, msg.id, "❌ <b>直连拼接失败。</b> 请尝试转码后再合并。").parse_mode(ParseMode::Html).await;
                     }
                 }
             }
@@ -165,7 +175,10 @@ pub async fn action_convert(
     _state: Arc<AppState>,
     cancel_flag: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
+    user_id: i64,
 ) {
+    let session = _state.get_session(user_id).await;
+    let theme = session.progress_bar_theme;
     let total = files.len();
     let mut success = 0;
 
@@ -178,8 +191,8 @@ pub async fn action_convert(
         let out_path = unique_path(&file.with_file_name(format!("{}.mp4", stem)));
         let filename = file.file_name().unwrap().to_string_lossy().to_string();
 
-        let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🔄 **转换中** ({}/{})\n`{}` -> `.mp4`", idx + 1, total, filename))
-            .parse_mode(ParseMode::MarkdownV2).await;
+        let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🔄 <b>转换中</b> ({}/{})\n<code>{}</code> -> <code>.mp4</code>", idx + 1, total, escape_html(&filename)))
+            .parse_mode(ParseMode::Html).await;
 
         let mut child = Command::new("ffmpeg")
             .args(&["-y", "-i", file.to_str().unwrap(), "-c", "copy", "-movflags", "+faststart", out_path.to_str().unwrap()])
@@ -206,9 +219,9 @@ pub async fn action_convert(
     }
 
     if cancel_flag.load(Ordering::SeqCst) {
-        let _ = bot.edit_message_text(msg.chat.id, msg.id, "🛑 **批量转码已被终止！**").parse_mode(ParseMode::MarkdownV2).await;
+        let _ = bot.edit_message_text(msg.chat.id, msg.id, "🛑 <b>批量转码已被终止！</b>").parse_mode(ParseMode::Html).await;
     } else {
-        let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("✅ **批量转码完成！** 成功: {}/{}", success, total)).parse_mode(ParseMode::MarkdownV2).await;
+        let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("✅ <b>批量转码完成！</b> 成功: {}/{}", success, total)).parse_mode(ParseMode::Html).await;
     }
 }
 
@@ -226,6 +239,6 @@ pub async fn action_delete(
             }
         }
     }
-    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🗑️ **清理完成!** 成功删除 {} 个文件。", deleted))
-        .parse_mode(ParseMode::MarkdownV2).await;
+    let _ = bot.edit_message_text(msg.chat.id, msg.id, format!("🗑️ <b>清理完成!</b> 成功删除 {} 个文件。", deleted))
+        .parse_mode(ParseMode::Html).await;
 }
