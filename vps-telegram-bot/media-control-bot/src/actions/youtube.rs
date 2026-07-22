@@ -238,10 +238,9 @@ async fn do_upload(
             {
                 let bar = progress_bar.render(percent);
                 let text = format!(
-                    "📤 <b>YouTube 上传中</b>:\n<code>{}</code>\n\n<code>{}</code> {:.1}%\n\n发送 /stop 取消任务",
+                    "📤 <b>YouTube 上传中</b>:\n<code>{}</code>\n\n<code>{}</code>\n\n发送 /stop 取消任务",
                     escape_html(&filename_bg),
-                    bar,
-                    percent
+                    bar
                 );
                 let _ = bot_bg
                     .edit_message_text(chat_id, msg_id, text)
@@ -253,14 +252,20 @@ async fn do_upload(
         }
     });
 
-    // 执行上传并传入闭包
+    // 执行上传并传入进度回调与取消检测闭包
     let uploader = YoutubeUploader::new(config.token_file.clone(), config.youtube_chunk_bytes());
     update_task_status(&state, &task_id, "上传中", Some(0.0)).await;
 
+    let cancel_rx_clone = cancel_rx.clone();
     let result = uploader
-        .upload(&file_path, &filename, move |percent| {
-            let _ = progress_tx.try_send(percent);
-        })
+        .upload(
+            &file_path,
+            &filename,
+            move |percent| {
+                let _ = progress_tx.try_send(percent);
+            },
+            move || *cancel_rx_clone.borrow(),
+        )
         .await;
 
     // 等待刷新任务结束
@@ -286,6 +291,21 @@ async fn do_upload(
             info!(filename = %filename, video_id = %video_id, "YouTube upload completed");
         }
         Err(e) => {
+            // 如果是因为用户手动点击 /stop 导致的中断
+            if *cancel_rx.borrow() {
+                update_task_status(&state, &task_id, "已取消", Some(0.0)).await;
+                let _ = bot
+                    .edit_message_text(
+                        progress_msg.chat.id,
+                        progress_msg.id,
+                        format!("🛑 <b>YouTube 上传已取消</b>:\n<code>{}</code>", escape_html(&filename)),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await;
+                info!(filename = %filename, "YouTube upload cancelled by user");
+                return Ok(());
+            }
+
             update_task_status(&state, &task_id, "失败", None).await;
             let _ = bot
                 .edit_message_text(

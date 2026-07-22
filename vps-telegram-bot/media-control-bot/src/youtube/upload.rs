@@ -7,7 +7,7 @@
 //!
 //! 使用 `google-youtube3 v5` 的 `VideoSnippet` / `VideoStatus` 类型（非 `Snippet`/`Status`）。
 
-use std::io::{Read, Seek, SeekFrom, Result as IoResult};
+use std::io::{ErrorKind, Read, Result as IoResult, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -16,28 +16,39 @@ use tracing::{debug, info};
 
 use super::api::build_youtube_hub;
 
-/// 带上传进度回调的 Reader 包装器。
-/// 必须同时实现 `Read + Seek + Send`，因为 google-youtube3 的 upload_resumable 要求 `RS: client::ReadSeek` (要求 Send)。
-pub struct ProgressReader<R: Read + Seek, F: FnMut(f64) + Send> {
+/// 带上传进度回调与取消检测的 Reader 包装器。
+/// 必须同时实现 `Read + Seek + Send` 特征。
+pub struct ProgressReader<R: Read + Seek, F: FnMut(f64) + Send, C: Fn() -> bool + Send> {
     pub inner: R,
     pub total: u64,
     pub current: u64,
     pub callback: F,
+    pub cancel_check: C,
 }
 
-impl<R: Read + Seek, F: FnMut(f64) + Send> ProgressReader<R, F> {
-    pub fn new(inner: R, total: u64, callback: F) -> Self {
+impl<R: Read + Seek, F: FnMut(f64) + Send, C: Fn() -> bool + Send> ProgressReader<R, F, C> {
+    pub fn new(inner: R, total: u64, callback: F, cancel_check: C) -> Self {
         Self {
             inner,
             total,
             current: 0,
             callback,
+            cancel_check,
         }
     }
 }
 
-impl<R: Read + Seek, F: FnMut(f64) + Send> Read for ProgressReader<R, F> {
+impl<R: Read + Seek, F: FnMut(f64) + Send, C: Fn() -> bool + Send> Read for ProgressReader<R, F, C> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        // 关键点：在每次从文件读取 Chunk 传输前检查取消信号
+        // 若收到取消信号，立即主动中断 HTTP 传输流
+        if (self.cancel_check)() {
+            return Err(std::io::Error::new(
+                ErrorKind::Interrupted,
+                "Upload cancelled by user",
+            ));
+        }
+
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.current += n as u64;
@@ -50,10 +61,12 @@ impl<R: Read + Seek, F: FnMut(f64) + Send> Read for ProgressReader<R, F> {
     }
 }
 
-impl<R: Read + Seek, F: FnMut(f64) + Send> Seek for ProgressReader<R, F> {
+impl<R: Read + Seek, F: FnMut(f64) + Send, C: Fn() -> bool + Send> Seek
+    for ProgressReader<R, F, C>
+{
     fn seek(&mut self, pos: SeekFrom) -> IoResult<u64> {
         let new_pos = self.inner.seek(pos)?;
-        self.current = new_pos; // 保持游标与当前读取字节同步
+        self.current = new_pos; // 保持游标与已读字节同步
         Ok(new_pos)
     }
 }
@@ -86,7 +99,8 @@ impl YoutubeUploader {
     ///
     /// * `file_path` - 视频文件路径
     /// * `title` - 视频标题（最多 100 字符）
-    /// * `progress_callback` - 进度回调函数（接收 0.0~100.0 的进度百分比，必须实现 Send）
+    /// * `progress_callback` - 进度回调函数（接收 0.0~100.0 的进度百分比）
+    /// * `cancel_check` - 取消检查闭包（返回 true 表示需强行中断上传）
     ///
     /// # Returns
     ///
@@ -94,12 +108,13 @@ impl YoutubeUploader {
     ///
     /// # Errors
     ///
-    /// 若上传失败，返回错误。
+    /// 若上传失败或被手动取消，返回错误。
     pub async fn upload(
         &self,
         file_path: &Path,
         title: &str,
-        progress_callback: impl FnMut(f64) + Send, // ✅ 增加了 + Send 约束
+        progress_callback: impl FnMut(f64) + Send,
+        cancel_check: impl Fn() -> bool + Send,
     ) -> Result<String> {
         let hub = build_youtube_hub(&self.token_file)
             .await
@@ -133,7 +148,7 @@ impl YoutubeUploader {
             "Starting YouTube upload"
         );
 
-        let reader = ProgressReader::new(file, file_size, progress_callback);
+        let reader = ProgressReader::new(file, file_size, progress_callback, cancel_check);
 
         let (_response, video_result) = hub
             .videos()
