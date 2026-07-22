@@ -104,7 +104,7 @@ impl YoutubeUploader {
     ///
     /// # Returns
     ///
-    /// 上传成功后的 YouTube 视频 ID。
+    /// 上传成功后的 YouTube 视频 ID 。
     ///
     /// # Errors
     ///
