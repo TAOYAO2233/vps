@@ -51,6 +51,8 @@ jobs:
 
     # 5. 执行静态编译
     - name: Build Binary
+      env:
+        OPENSSL_VENDORED: 1
       run: |
         cargo build --release --target x86_64-unknown-linux-musl
 
