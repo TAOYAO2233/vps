@@ -256,17 +256,26 @@ async fn do_upload(
     let uploader = YoutubeUploader::new(config.token_file.clone(), config.youtube_chunk_bytes());
     update_task_status(&state, &task_id, "上传中", Some(0.0)).await;
 
-    let cancel_rx_clone = cancel_rx.clone();
-    let result = uploader
-        .upload(
+    let mut cancel_rx_select = cancel_rx.clone();
+
+    // 💡 使用 tokio::select! 监听取消信号，瞬间 drop 上传 Future 解决 CPU 爆满死循环
+    let result = tokio::select! {
+        res = uploader.upload(
             &file_path,
             &filename,
             move |percent| {
                 let _ = progress_tx.try_send(percent);
             },
-            move || *cancel_rx_clone.borrow(),
-        )
-        .await;
+            move || *cancel_rx.borrow(),
+        ) => res,
+
+        _ = cancel_rx_select.changed() => {
+            info!(filename = %filename, "Upload future dropped by cancel signal");
+            Err(AppError::YoutubeUploadCancelled {
+                filename: filename.clone(),
+            }.into())
+        }
+    };
 
     // 等待刷新任务结束
     let _ = progress_updater.await;

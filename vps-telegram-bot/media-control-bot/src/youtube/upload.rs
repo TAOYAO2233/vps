@@ -41,8 +41,9 @@ impl<R: Read + Seek, F: FnMut(f64) + Send, C: Fn() -> bool + Send> ProgressReade
 impl<R: Read + Seek, F: FnMut(f64) + Send, C: Fn() -> bool + Send> Read for ProgressReader<R, F, C> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
         // 关键点：在每次从文件读取 Chunk 传输前检查取消信号
-        // 若收到取消信号，立即主动中断 HTTP 传输流
         if (self.cancel_check)() {
+            // 💡 增加微小休眠，防止底层 SDK 在收到 Err 后紧凑重试拉满 CPU
+            std::thread::sleep(std::time::Duration::from_millis(50));
             return Err(std::io::Error::new(
                 ErrorKind::Interrupted,
                 "Upload cancelled by user",
