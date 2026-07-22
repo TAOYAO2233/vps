@@ -17,6 +17,7 @@ use crate::storage::filesystem::format_file_size;
 use crate::storage::path::PathGuard;
 use crate::storage::scanner::scan_directory;
 use crate::ui::pagination::Paginator;
+use crate::utils::format::escape_html;
 
 /// 渲染文件选择器界面并编辑现有消息。
 ///
@@ -63,8 +64,12 @@ pub async fn render_file_selector(
     let listing = match scan_directory(&current_dir, &path_guard) {
         Ok(l) => l,
         Err(e) => {
-            bot.edit_message_text(msg.chat.id, msg.id, format!("❌ 无法读取目录: {e}"))
-                .await?;
+            bot.edit_message_text(
+                msg.chat.id,
+                msg.id,
+                format!("❌ 无法读取目录: {}", escape_html(&e.to_string())),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -147,9 +152,10 @@ pub async fn render_file_selector(
     };
 
     let mut header = format!(
-        "📂 路径: `{display_path}`\n\
+        "📂 路径: <code>{}</code>\n\
          👉 模式: [{}] (页 {}/{})",
-        action.display_name(),
+        escape_html(&display_path),
+        escape_html(action.display_name()),
         paginator.current_page + 1,
         paginator.total_pages()
     );
@@ -160,11 +166,11 @@ pub async fn render_file_selector(
         s.cleanup_active_task();
         s.cleanup_youtube_pool();
         if let Some(name) = s.active_task_name() {
-            header.push_str(&format!("\n🔒 独占任务: `{name}`"));
+            header.push_str(&format!("\n🔒 独占任务: <code>{}</code>", escape_html(name)));
         }
         let upload_count = s.active_youtube_count();
         if upload_count > 0 {
-            header.push_str(&format!("\n☁️ YouTube 上传/排队: `{upload_count}`"));
+            header.push_str(&format!("\n☁️ YouTube 上传/排队: <code>{upload_count}</code>"));
         }
     }
 
@@ -173,7 +179,7 @@ pub async fn render_file_selector(
     }
 
     bot.edit_message_text(msg.chat.id, msg.id, header)
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .reply_markup(keyboard)
         .await?;
 

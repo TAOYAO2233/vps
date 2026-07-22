@@ -23,7 +23,7 @@ use crate::media::ffprobe::get_video_duration;
 use crate::media::merge::{format_merge_check, validate_merged_file};
 use crate::storage::filesystem::{remove_if_exists, write_concat_list};
 use crate::storage::path::unique_path;
-use crate::utils::format::smart_rename;
+use crate::utils::format::{escape_html, smart_rename};
 
 /// 启动视频合并独占任务。
 pub async fn start_concat(
@@ -110,11 +110,12 @@ async fn do_concat(
         .send_message(
             msg.chat.id,
             format!(
-                "⏳ **正在分析 {} 个文件的大小和时长...**\n输出文件:\n`{output_filename}`",
-                files_to_merge.len()
+                "⏳ <b>正在分析 {} 个文件的大小和时长...</b>\n输出文件:\n<code>{}</code>",
+                files_to_merge.len(),
+                escape_html(&output_filename)
             ),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
 
     // 计算总大小和总时长
@@ -127,8 +128,8 @@ async fn do_concat(
     let mut input_total_duration = 0.0_f64;
     for path in &files_to_merge {
         if state.read().await.cancel_flag {
-            bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 **合并任务已手动终止。**")
-                .parse_mode(ParseMode::MarkdownV2)
+            bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 <b>合并任务已手动终止。</b>")
+                .parse_mode(ParseMode::Html)
                 .await?;
             return Err(AppError::Cancelled.into());
         }
@@ -139,9 +140,12 @@ async fn do_concat(
     bot.edit_message_text(
         msg.chat.id,
         progress_msg.id,
-        format!("⏳ **正在尝试极速直连拼接...**\n输出文件:\n`{output_filename}`"),
+        format!(
+            "⏳ <b>正在尝试极速直连拼接...</b>\n输出文件:\n<code>{}</code>",
+            escape_html(&output_filename)
+        ),
     )
-    .parse_mode(ParseMode::MarkdownV2)
+    .parse_mode(ParseMode::Html)
     .await?;
 
     write_concat_list(&list_file, &files_to_merge)?;
@@ -155,8 +159,8 @@ async fn do_concat(
         remove_if_exists(&output_path);
         cleanup_ts(&ts_files);
         remove_if_exists(&list_file_ts);
-        bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 **合并任务已手动终止。**")
-            .parse_mode(ParseMode::MarkdownV2)
+        bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 <b>合并任务已手动终止。</b>")
+            .parse_mode(ParseMode::Html)
             .await?;
         return Err(AppError::Cancelled.into());
     }
@@ -180,11 +184,11 @@ async fn do_concat(
             msg.chat.id,
             progress_msg.id,
             format!(
-                "⚠️ **直连拼接未通过时长/体积校验！**\n{}\n\n正在触发 `.ts` 容错处理机制，请耐心等待...",
+                "⚠️ <b>直连拼接未通过时长/体积校验！</b>\n{}\n\n正在触发 <code>.ts</code> 容错处理机制，请耐心等待...",
                 format_merge_check(&check)
             ),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
 
         let mut ts_convert_ok = true;
@@ -196,17 +200,18 @@ async fn do_concat(
             let ts_path = work_dir.join(format!(".temp_merge_fallback_{run_id}_{idx}.ts"));
             ts_files.push(ts_path.clone());
 
+            let curr_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             bot.edit_message_text(
                 msg.chat.id,
                 progress_msg.id,
                 format!(
-                    "⚙️ **TS 容错转换中** ({}/{}):\n`{}`",
+                    "⚙️ <b>TS 容错转换中</b> ({}/{}):\n<code>{}</code>",
                     idx + 1,
                     files_to_merge.len(),
-                    file_path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+                    escape_html(curr_name)
                 ),
             )
-            .parse_mode(ParseMode::MarkdownV2)
+            .parse_mode(ParseMode::Html)
             .await?;
 
             let ts_status = ffmpeg
@@ -227,8 +232,8 @@ async fn do_concat(
             remove_if_exists(&output_path);
             cleanup_ts(&ts_files);
             remove_if_exists(&list_file_ts);
-            bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 **合并任务已手动终止。**")
-                .parse_mode(ParseMode::MarkdownV2)
+            bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 <b>合并任务已手动终止。</b>")
+                .parse_mode(ParseMode::Html)
                 .await?;
             return Err(AppError::Cancelled.into());
         }
@@ -240,9 +245,9 @@ async fn do_concat(
             bot.edit_message_text(
                 msg.chat.id,
                 progress_msg.id,
-                "❌ **TS 容错转换失败**\n部分片段无法无损封装为 TS，建议先单文件转码后再试。",
+                "❌ <b>TS 容错转换失败</b>\n部分片段无法无损封装为 TS，建议先单文件转码后再试。",
             )
-            .parse_mode(ParseMode::MarkdownV2)
+            .parse_mode(ParseMode::Html)
             .await?;
             return Ok(());
         }
@@ -252,9 +257,12 @@ async fn do_concat(
         bot.edit_message_text(
             msg.chat.id,
             progress_msg.id,
-            format!("✂️ **TS 容错转换完成，正在进行最终拼接...**\n输出文件:\n`{output_filename}`"),
+            format!(
+                "✂️ <b>TS 容错转换完成，正在进行最终拼接...</b>\n输出文件:\n<code>{}</code>",
+                escape_html(&output_filename)
+            ),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
 
         let ts_status = ffmpeg
@@ -284,8 +292,8 @@ async fn do_concat(
 
     if state.read().await.cancel_flag {
         remove_if_exists(&output_path);
-        bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 **合并任务已手动终止。**")
-            .parse_mode(ParseMode::MarkdownV2)
+        bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 <b>合并任务已手动终止。</b>")
+            .parse_mode(ParseMode::Html)
             .await?;
         return Err(AppError::Cancelled.into());
     }
@@ -295,11 +303,12 @@ async fn do_concat(
             msg.chat.id,
             progress_msg.id,
             format!(
-                "✅ **合并完成!**\n\n📁 新文件: `{output_filename}`\n{}",
+                "✅ <b>合并完成!</b>\n\n📁 新文件: <code>{}</code>\n{}",
+                escape_html(&output_filename),
                 format_merge_check(&final_check)
             ),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
         info!(output = %output_filename, "Concat completed successfully");
     } else {
@@ -308,11 +317,11 @@ async fn do_concat(
             msg.chat.id,
             progress_msg.id,
             format!(
-                "❌ **合并彻底失败**\n{}\n\n输出文件未通过时长/体积校验。两段视频的编码、分辨率或时间戳可能严重不一致，建议先单文件转码后再试。",
+                "❌ <b>合并彻底失败</b>\n{}\n\n输出文件未通过时长/体积校验。两段视频的编码、分辨率或时间戳可能严重不一致，建议先单文件转码后再试。",
                 format_merge_check(&final_check)
             ),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
         warn!(output = %output_filename, "Concat failed validation");
     }

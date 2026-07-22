@@ -23,6 +23,7 @@ use crate::errors::AppError;
 use crate::media::ffprobe::get_video_duration;
 use crate::storage::filesystem::remove_if_exists;
 use crate::storage::path::unique_path;
+use crate::utils::format::escape_html;
 
 /// 匹配 FFmpeg stderr 输出中的时间戳
 static TIME_REGEX: Lazy<Regex> =
@@ -83,8 +84,8 @@ async fn do_convert(
 
     for (idx, file_path) in files_to_convert.iter().enumerate() {
         if state.read().await.cancel_flag {
-            bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 **批量转换已手动终止。**")
-                .parse_mode(ParseMode::MarkdownV2)
+            bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 <b>批量转换已手动终止。</b>")
+                .parse_mode(ParseMode::Html)
                 .await?;
             return Err(AppError::Cancelled.into());
         }
@@ -112,8 +113,8 @@ async fn do_convert(
         let duration = get_video_duration(file_path).await.unwrap_or(0.0);
 
         if state.read().await.cancel_flag {
-            bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 **批量转换已手动终止。**")
-                .parse_mode(ParseMode::MarkdownV2)
+            bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 <b>批量转换已手动终止。</b>")
+                .parse_mode(ParseMode::Html)
                 .await?;
             return Err(AppError::Cancelled.into());
         }
@@ -122,11 +123,13 @@ async fn do_convert(
             msg.chat.id,
             progress_msg.id,
             format!(
-                "🔄 **正在转换** ({}/{total}):\n`{filename}`\n-> `{output_filename}`\n⏳ 获取进度中...",
-                idx + 1
+                "🔄 <b>正在转换</b> ({}/{total}):\n<code>{}</code>\n-&gt; <code>{}</code>\n⏳ 获取进度中...",
+                idx + 1,
+                escape_html(&filename),
+                escape_html(&output_filename)
             ),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
 
         // 启动 FFmpeg 转码进程
@@ -180,12 +183,14 @@ async fn do_convert(
                                 msg.chat.id,
                                 progress_msg.id,
                                 format!(
-                                    "🔄 **正在转换** ({}/{total}):\n`{filename}`\n\n`{bar}`\n⏱️ {current_sec}s / {}s",
+                                    "🔄 <b>正在转换</b> ({}/{total}):\n<code>{}</code>\n\n<code>{}</code>\n⏱️ {current_sec}s / {}s",
                                     idx + 1,
+                                    escape_html(&filename),
+                                    bar,
                                     duration as u64
                                 ),
                             )
-                            .parse_mode(ParseMode::MarkdownV2)
+                            .parse_mode(ParseMode::Html)
                             .await;
                         last_update = Instant::now();
                         last_percent = percent.floor();
@@ -199,8 +204,8 @@ async fn do_convert(
 
         if state.read().await.cancel_flag {
             remove_if_exists(&output_path);
-            bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 **批量转换已手动终止。**")
-                .parse_mode(ParseMode::MarkdownV2)
+            bot.edit_message_text(msg.chat.id, progress_msg.id, "🛑 <b>批量转换已手动终止。</b>")
+                .parse_mode(ParseMode::Html)
                 .await?;
             return Err(AppError::Cancelled.into());
         }
@@ -221,10 +226,10 @@ async fn do_convert(
         msg.chat.id,
         progress_msg.id,
         format!(
-            "✅ **批量转换完成!**\n成功转换 {success_count}/{total} 个文件。\n同名输出已自动避让。"
+            "✅ <b>批量转换完成!</b>\n成功转换 {success_count}/{total} 个文件。\n同名输出已自动避让。"
         ),
     )
-    .parse_mode(ParseMode::MarkdownV2)
+    .parse_mode(ParseMode::Html)
     .await?;
 
     Ok(())

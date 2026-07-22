@@ -17,6 +17,7 @@ use crate::config::Config;
 use crate::core::state::SharedState;
 use crate::core::task_manager::TaskManager;
 use crate::errors::AppError;
+use crate::utils::format::escape_html;
 use crate::youtube::upload::YoutubeUploader;
 
 #[allow(dead_code)]
@@ -89,9 +90,9 @@ pub async fn start_youtube_uploads(
         let progress_msg = bot
             .send_message(
                 msg.chat.id,
-                format!("⏳ 创建 YouTube 上传任务:\n`{filename}`"),
+                format!("⏳ 创建 YouTube 上传任务:\n<code>{}</code>", escape_html(&filename)),
             )
-            .parse_mode(ParseMode::MarkdownV2)
+            .parse_mode(ParseMode::Html)
             .await?;
 
         let bot_clone = bot.clone();
@@ -137,10 +138,10 @@ pub async fn start_youtube_uploads(
             msg.chat.id,
             msg.id,
             format!(
-                "✅ 已启动 `{created_count}` 个 YouTube 上传任务。\n并发上限: `{max_concurrent}`\n发送 /uploads 查看任务，/stop 停止所有任务。"
+                "✅ 已启动 <code>{created_count}</code> 个 YouTube 上传任务。\n并发上限: <code>{max_concurrent}</code>\n发送 /uploads 查看任务，/stop 停止所有任务。"
             ),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await;
 
     Ok(())
@@ -170,11 +171,12 @@ async fn do_upload(
             progress_msg.chat.id,
             progress_msg.id,
             format!(
-                "⏳ **已加入 YouTube 上传队列**\n`{filename}`\n并发上限: `{}`\n发送 /uploads 查看，/stop 停止。",
+                "⏳ <b>已加入 YouTube 上传队列</b>\n<code>{}</code>\n并发上限: <code>{}</code>\n发送 /uploads 查看，/stop 停止。",
+                escape_html(&filename),
                 config.youtube_max_concurrent_uploads
             ),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await;
 
     // 等待 Semaphore 许可
@@ -190,9 +192,9 @@ async fn do_upload(
             .edit_message_text(
                 progress_msg.chat.id,
                 progress_msg.id,
-                format!("🛑 **YouTube 上传已取消**:\n`{filename}`"),
+                format!("🛑 <b>YouTube 上传已取消</b>:\n<code>{}</code>", escape_html(&filename)),
             )
-            .parse_mode(ParseMode::MarkdownV2)
+            .parse_mode(ParseMode::Html)
             .await;
         return Err(AppError::YoutubeUploadCancelled {
             filename: filename.clone(),
@@ -205,9 +207,9 @@ async fn do_upload(
         .edit_message_text(
             progress_msg.chat.id,
             progress_msg.id,
-            format!("🔄 初始化 YouTube API...\n`{filename}`"),
+            format!("🔄 初始化 YouTube API...\n<code>{}</code>", escape_html(&filename)),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await;
 
     // 执行上传
@@ -221,15 +223,17 @@ async fn do_upload(
             update_task_status(&state, &task_id, "完成", Some(100.0)).await;
             let upload_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let success_text = format!(
-                "✅ **上传成功！**\n\
-                 🎬 视频名称: `{filename}`\n\
-                 🕒 上传时间: `{upload_time}`\n\
-                 📺 观看链接: `https://youtu.be/{video_id}`\n\
-                 🛠️ Studio: `https://studio.youtube.com/video/{video_id}/edit`"
+                "✅ <b>上传成功！</b>\n\
+                 🎬 视频名称: <code>{}</code>\n\
+                 🕒 上传时间: <code>{}</code>\n\
+                 📺 观看链接: <a href=\"https://youtu.be/{video_id}\">https://youtu.be/{video_id}</a>\n\
+                 🛠️ Studio: <a href=\"https://studio.youtube.com/video/{video_id}/edit\">https://studio.youtube.com/video/{video_id}/edit</a>",
+                escape_html(&filename),
+                escape_html(&upload_time)
             );
             let _ = bot
                 .edit_message_text(progress_msg.chat.id, progress_msg.id, success_text)
-                .parse_mode(ParseMode::MarkdownV2)
+                .parse_mode(ParseMode::Html)
                 .await;
             info!(filename = %filename, video_id = %video_id, "YouTube upload completed");
         }
@@ -239,9 +243,9 @@ async fn do_upload(
                 .edit_message_text(
                     progress_msg.chat.id,
                     progress_msg.id,
-                    format!("❌ 上传异常:\n`{e}`"),
+                    format!("❌ 上传异常:\n<code>{}</code>", escape_html(&e.to_string())),
                 )
-                .parse_mode(ParseMode::MarkdownV2)
+                .parse_mode(ParseMode::Html)
                 .await;
             warn!(filename = %filename, error = %e, "YouTube upload failed");
             return Err(e);

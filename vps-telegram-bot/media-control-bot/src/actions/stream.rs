@@ -21,6 +21,7 @@ use crate::core::ProgressBar;
 use crate::errors::AppError;
 use crate::media::ffprobe::get_video_duration;
 use crate::storage::filesystem::format_file_size;
+use crate::utils::format::escape_html;
 
 /// 匹配 FFmpeg stderr 输出中的时间戳，例如 `time=00:01:23.45`
 static TIME_REGEX: Lazy<Regex> =
@@ -52,9 +53,9 @@ pub async fn start_stream(
         let _edit_msg = bot
             .send_message(
                 msg.chat.id,
-                "❌ RTMP\\_URL 未配置。请在 `.env` 中添加 `RTMP_URL=你的推流地址`。",
+                "❌ RTMP_URL 未配置。请在 <code>.env</code> 中添加 <code>RTMP_URL=你的推流地址</code>。",
             )
-            .parse_mode(ParseMode::MarkdownV2)
+            .parse_mode(ParseMode::Html)
             .await?;
         return Ok(());
     }
@@ -112,9 +113,12 @@ async fn do_stream(
     let progress_msg = bot
         .send_message(
             msg.chat.id,
-            format!("⏳ 正在分析推流文件: `{filename}` ({size_str})..."),
+            format!(
+                "⏳ 正在分析推流文件: <code>{}</code> ({size_str})...",
+                escape_html(&filename)
+            ),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
 
     // 检查取消标志
@@ -122,9 +126,9 @@ async fn do_stream(
         bot.edit_message_text(
             msg.chat.id,
             progress_msg.id,
-            format!("🛑 **推流已手动终止**:\n`{filename}`"),
+            format!("🛑 <b>推流已手动终止</b>:\n<code>{}</code>", escape_html(&filename)),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
         return Err(AppError::Cancelled.into());
     }
@@ -200,11 +204,13 @@ async fn do_stream(
                         msg.chat.id,
                         progress_msg.id,
                         format!(
-                            "📡 **推流中**: `{filename}`\n\n`{bar}`\n⏱️ {current_sec}s / {}s",
+                            "📡 <b>推流中</b>: <code>{}</code>\n\n<code>{}</code>\n⏱️ {current_sec}s / {}s",
+                            escape_html(&filename),
+                            bar,
                             duration as u64
                         ),
                     )
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .await;
                 last_update = Instant::now();
                 last_percent = percent.floor();
@@ -221,9 +227,9 @@ async fn do_stream(
         bot.edit_message_text(
             msg.chat.id,
             progress_msg.id,
-            format!("🛑 **推流已手动终止**:\n`{filename}`"),
+            format!("🛑 <b>推流已手动终止</b>:\n<code>{}</code>", escape_html(&filename)),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
         return Err(AppError::Cancelled.into());
     }
@@ -232,9 +238,9 @@ async fn do_stream(
         bot.edit_message_text(
             msg.chat.id,
             progress_msg.id,
-            format!("✅ **推流结束**:\n`{filename}`"),
+            format!("✅ <b>推流结束</b>:\n<code>{}</code>", escape_html(&filename)),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
         info!(filename = %filename, "RTMP stream completed successfully");
     } else {
@@ -242,9 +248,12 @@ async fn do_stream(
         bot.edit_message_text(
             msg.chat.id,
             progress_msg.id,
-            format!("❌ **推流异常结束**:\n`{filename}`\n退出码: `{code}`"),
+            format!(
+                "❌ <b>推流异常结束</b>:\n<code>{}</code>\n退出码: <code>{code}</code>",
+                escape_html(&filename)
+            ),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
         return Err(AppError::RtmpStreamFailed { exit_code: code }.into());
     }

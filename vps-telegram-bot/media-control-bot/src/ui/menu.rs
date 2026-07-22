@@ -12,6 +12,7 @@ use teloxide::types::{InlineKeyboardMarkup, ParseMode};
 use crate::bot::keyboard::main_menu_keyboard;
 use crate::config::Config;
 use crate::core::state::SharedState;
+use crate::utils::format::escape_html;
 
 /// 主菜单 UI 构建器。
 pub struct MainMenu;
@@ -35,22 +36,22 @@ impl MainMenu {
         upload_count: usize,
     ) -> (String, InlineKeyboardMarkup) {
         let busy_text = active_task_name
-            .map(|name| format!("\n🔒 当前独占任务: `{name}`"))
+            .map(|name| format!("\n🔒 当前独占任务: <code>{}</code>", escape_html(name)))
             .unwrap_or_default();
 
         let upload_text = if upload_count > 0 {
-            format!("\n☁️ YouTube 上传/排队: `{upload_count}`")
+            format!("\n☁️ YouTube 上传/排队: <code>{upload_count}</code>")
         } else {
             String::new()
         };
 
         let text = format!(
-            "=== 🎬 VPS 多媒体主控面板 ===\n\
-             根目录: `{}`\n\
+            "=== 🎬 <b>VPS 多媒体主控面板</b> ===\n\
+             根目录: <code>{}</code>\n\
              💡 提示: /uploads 查看上传，/stop 中断运行任务\
              {busy_text}\
              {upload_text}",
-            base_dir.display()
+            escape_html(&base_dir.display().to_string())
         );
 
         (text, main_menu_keyboard())
@@ -76,7 +77,7 @@ pub async fn render_main_menu(
     let (text, keyboard) = MainMenu::render(&config.base_dir, active_name.as_deref(), upload_count);
 
     bot.edit_message_text(msg.chat.id, msg.id, text)
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .reply_markup(keyboard)
         .await?;
 

@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::core::state::SharedState;
 use crate::core::task_manager::TaskManager;
 use crate::errors::AppError;
+use crate::utils::format::escape_html;
 
 /// 渲染删除确认界面（二次确认）。
 ///
@@ -37,7 +38,7 @@ pub async fn render_delete_confirmation(
         .iter()
         .take(preview_count)
         .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
-        .map(|name| format!("• `{name}`"))
+        .map(|name| format!("• <code>{}</code>", escape_html(name)))
         .collect();
 
     if target_files.len() > preview_count {
@@ -48,12 +49,12 @@ pub async fn render_delete_confirmation(
     }
 
     let text = format!(
-        "⚠️ **二次确认：即将永久删除以下文件**\n\n{}\n\n删除后不可恢复。",
+        "⚠️ <b>二次确认：即将永久删除以下文件</b>\n\n{}\n\n删除后不可恢复。",
         preview_lines.join("\n")
     );
 
     bot.edit_message_text(msg.chat.id, msg.id, text)
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .reply_markup(delete_confirmation_keyboard())
         .await?;
 
@@ -136,9 +137,9 @@ async fn do_delete(
         bot.edit_message_text(
             msg.chat.id,
             msg.id,
-            format!("🛑 **删除任务已手动终止。**\n已删除 {deleted} 个文件。"),
+            format!("🛑 <b>删除任务已手动终止。</b>\n已删除 {deleted} 个文件。"),
         )
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
         return Err(AppError::Cancelled.into());
     }
@@ -146,9 +147,9 @@ async fn do_delete(
     bot.edit_message_text(
         msg.chat.id,
         msg.id,
-        format!("🗑️ **清理完成!**\n成功删除 {deleted} 个文件，失败 {failed} 个。"),
+        format!("🗑️ <b>清理完成!</b>\n成功删除 {deleted} 个文件，失败 {failed} 个。"),
     )
-    .parse_mode(ParseMode::MarkdownV2)
+    .parse_mode(ParseMode::Html)
     .await?;
 
     Ok(())

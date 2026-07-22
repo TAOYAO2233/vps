@@ -37,7 +37,7 @@ pub async fn cmd_start(
     };
 
     bot.send_message(msg.chat.id, text)
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .reply_markup(keyboard)
         .await?;
 
@@ -89,12 +89,12 @@ pub async fn cmd_stop(
     }
 
     let reply = format!(
-        "🛑 **已接收停止指令！**\n{}\n\nYouTube 上传会在当前 chunk 返回后停止。",
+        "🛑 <b>已接收停止指令！</b>\n{}\n\nYouTube 上传会在当前 chunk 返回后停止。",
         parts.join("\n")
     );
 
     bot.send_message(msg.chat.id, reply)
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
 
     info!("Stop command executed: has_active={has_active}, upload_count={upload_count}");
@@ -127,7 +127,7 @@ pub async fn cmd_uploads(
     };
 
     bot.send_message(msg.chat.id, text)
-        .parse_mode(ParseMode::MarkdownV2)
+        .parse_mode(ParseMode::Html)
         .await?;
 
     Ok(())

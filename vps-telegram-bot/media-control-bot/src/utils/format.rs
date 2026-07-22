@@ -12,6 +12,14 @@ use regex::Regex;
 
 use crate::core::state::UploadTask;
 
+/// HTML 文本转义函数，处理 Telegram HTML 模式保留字符
+#[must_use]
+pub fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// 匹配文件名中的日期时间模式（如 `2026-06-07` 或 `2026-06-07 20-00-00`）
 static DATE_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\d{4}[-_.]\d{2}[-_.]\d{2}(?:[ _-]\d{2}[-_.:]\d{2}[-_.:]\d{2})?").unwrap()
@@ -98,7 +106,6 @@ pub fn smart_rename(first_file: &Path) -> String {
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
 
-    // 提取日期时间字符串
     let date_str = if let Some(m) = DATE_REGEX.find(base_name) {
         m.as_str().to_string()
     } else {
@@ -107,10 +114,8 @@ pub fn smart_rename(first_file: &Path) -> String {
             .to_string()
     };
 
-    // 清理开头的日期时间括号，保留后面的标题
     let title_part = BRACKET_DATE_REGEX.replace(base_name, "").to_string();
     let title_part = if title_part == base_name {
-        // 没有括号格式，移除日期字符串本身
         let cleaned = base_name.replace(&date_str, "");
         let cleaned = cleaned.trim_start_matches(|c: char| "-_. ".contains(c));
         cleaned.to_string()
@@ -124,24 +129,22 @@ pub fn smart_rename(first_file: &Path) -> String {
         format!("{date_str}_{title_part}{ext}")
     };
 
-    // 清理连续下划线
     output_name.replace("__", "_")
 }
-
 /// 格式化 YouTube 上传任务列表为 Telegram 消息文本。
 ///
 /// 对应 Python 版本的 `cmd_uploads` 中的格式化逻辑。
 #[must_use]
 pub fn format_upload_list(uploads: &HashMap<String, UploadTask>) -> String {
-    let mut lines = vec![format!("📤 **YouTube 上传任务** ({} 个)\n", uploads.len())];
+    let mut lines = vec![format!("📤 <b>YouTube 上传任务</b> ({} 个)\n", uploads.len())];
 
     for (idx, task) in uploads.values().enumerate() {
         let progress_text = format!(" {:.1}%", task.progress);
         lines.push(format!(
-            "{}. `{}`\n   状态: {}{}\n   已运行: `{}`",
+            "{}. <code>{}</code>\n   状态: {}{}\n   已运行: <code>{}</code>",
             idx + 1,
-            task.filename,
-            task.status,
+            escape_html(&task.filename),
+            escape_html(&task.status),
             progress_text,
             format_elapsed(task.elapsed_secs()),
         ));
@@ -185,5 +188,10 @@ mod tests {
         let path = Path::new("/tmp/random_video.mkv");
         let result = smart_rename(path);
         assert!(result.contains("Merged_") || result.contains("random"));
+    }
+    
+    #[test]
+    fn test_escape_html() {
+        assert_eq!(escape_html("a & b < c > d"), "a &amp; b &lt; c &gt; d");
     }
 }
