@@ -17,16 +17,15 @@ use tracing::{debug, info};
 use super::api::build_youtube_hub;
 
 /// 带上传进度回调的 Reader 包装器。
-/// 必须同时实现 `Read` 和 `Seek`，因为 google-youtube3 的 upload_resumable 要求 `R: Read + Seek`。
-pub struct ProgressReader<R: Read + Seek, F: FnMut(f64)> {
+/// 必须同时实现 `Read + Seek + Send`，因为 google-youtube3 的 upload_resumable 要求 `RS: client::ReadSeek` (要求 Send)。
+pub struct ProgressReader<R: Read + Seek, F: FnMut(f64) + Send> {
     pub inner: R,
     pub total: u64,
     pub current: u64,
     pub callback: F,
 }
 
-// ✅ 补全声明包含 new 方法的 impl 块
-impl<R: Read + Seek, F: FnMut(f64)> ProgressReader<R, F> {
+impl<R: Read + Seek, F: FnMut(f64) + Send> ProgressReader<R, F> {
     pub fn new(inner: R, total: u64, callback: F) -> Self {
         Self {
             inner,
@@ -37,7 +36,7 @@ impl<R: Read + Seek, F: FnMut(f64)> ProgressReader<R, F> {
     }
 }
 
-impl<R: Read + Seek, F: FnMut(f64)> Read for ProgressReader<R, F> {
+impl<R: Read + Seek, F: FnMut(f64) + Send> Read for ProgressReader<R, F> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
         let n = self.inner.read(buf)?;
         if n > 0 {
@@ -51,7 +50,7 @@ impl<R: Read + Seek, F: FnMut(f64)> Read for ProgressReader<R, F> {
     }
 }
 
-impl<R: Read + Seek, F: FnMut(f64)> Seek for ProgressReader<R, F> {
+impl<R: Read + Seek, F: FnMut(f64) + Send> Seek for ProgressReader<R, F> {
     fn seek(&mut self, pos: SeekFrom) -> IoResult<u64> {
         let new_pos = self.inner.seek(pos)?;
         self.current = new_pos; // 保持游标与当前读取字节同步
@@ -87,7 +86,7 @@ impl YoutubeUploader {
     ///
     /// * `file_path` - 视频文件路径
     /// * `title` - 视频标题（最多 100 字符）
-    /// * `progress_callback` - 进度回调函数（接收 0.0~100.0 的进度百分比）
+    /// * `progress_callback` - 进度回调函数（接收 0.0~100.0 的进度百分比，必须实现 Send）
     ///
     /// # Returns
     ///
@@ -100,7 +99,7 @@ impl YoutubeUploader {
         &self,
         file_path: &Path,
         title: &str,
-        progress_callback: impl FnMut(f64),
+        progress_callback: impl FnMut(f64) + Send, // ✅ 增加了 + Send 约束
     ) -> Result<String> {
         let hub = build_youtube_hub(&self.token_file)
             .await
@@ -134,7 +133,6 @@ impl YoutubeUploader {
             "Starting YouTube upload"
         );
 
-        // ✅ 现在可以正常调用 ProgressReader::new 构造函数了
         let reader = ProgressReader::new(file, file_size, progress_callback);
 
         let (_response, video_result) = hub
