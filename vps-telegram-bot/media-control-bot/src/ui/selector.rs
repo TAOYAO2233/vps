@@ -113,7 +113,7 @@ pub async fn render_file_selector(
                 button_items.push((
                     format!("{checkbox}[{size_str}] {item_name}"),
                     format!(
-                        "toggle_{}_{}_{real_idx}_{}",
+                        "toggle_{}_{}_{}_{}",
                         action.as_str(),
                         real_idx,
                         paginator.current_page
