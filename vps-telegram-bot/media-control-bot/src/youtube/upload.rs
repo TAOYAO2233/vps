@@ -7,6 +7,7 @@
 //!
 //! 使用 `google-youtube3 v5` 的 `VideoSnippet` / `VideoStatus` 类型（非 `Snippet`/`Status`）。
 
+use std::io::{Read, Seek, SeekFrom, Result as IoResult};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -14,6 +15,39 @@ use google_youtube3::api::{Video, VideoSnippet, VideoStatus};
 use tracing::{debug, info};
 
 use super::api::build_youtube_hub;
+
+/// 带上传进度回调的 Reader 包装器。
+/// 必须同时实现 `Read` 和 `Seek`，因为 google-youtube3 的 upload_resumable 要求 `R: Read + Seek`。
+pub struct ProgressReader<R: Read + Seek, F: FnMut(f64)> {
+    pub inner: R,
+    pub total: u64,
+    pub current: u64,
+    pub callback: F,
+}
+
+impl<R: Read + Seek, F: FnMut(f64)> Read for ProgressReader<R, F> {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        let n = self.inner.read(buf)?;
+        // 2. 只有当实际读到了字节 (n > 0) 且总大小大于 0 时才计算进度
+        if n > 0 {
+            self.current += n as u64;
+            if self.total > 0 {
+                let percent = (self.current as f64 / self.total as f64) * 100.0;
+                // 3. 确保百分比最高不会超过 100.0%
+                (self.callback)(percent.min(100.0));
+            }
+        }
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek, F: FnMut(f64)> Seek for ProgressReader<R, F> {
+    fn seek(&mut self, pos: SeekFrom) -> IoResult<u64> {
+        let res = self.inner.seek(pos)?;
+        self.current = res; // 正确：同步当前偏移量
+        Ok(res)
+    }
+}
 
 /// YouTube 视频上传器。
 pub struct YoutubeUploader {
@@ -56,7 +90,7 @@ impl YoutubeUploader {
         &self,
         file_path: &Path,
         title: &str,
-        progress_callback: impl Fn(f64),
+        progress_callback: impl FnMut(f64),
     ) -> Result<String> {
         let hub = build_youtube_hub(&self.token_file)
             .await
@@ -80,7 +114,9 @@ impl YoutubeUploader {
             ..Default::default()
         };
 
-        let file_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+        let file = std::fs::File::open(file_path)
+            .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
+        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
 
         debug!(
             title = %title_truncated,
@@ -88,14 +124,13 @@ impl YoutubeUploader {
             "Starting YouTube upload"
         );
 
-        // google-youtube3 v5 需要同步 Read（std::fs::File）
-        let file = std::fs::File::open(file_path)
-            .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
+        // 使用 ProgressReader 包装文件
+        let reader = ProgressReader::new(file, file_size, progress_callback);
 
         let (_response, video_result) = hub
             .videos()
             .insert(video)
-            .upload_resumable(file, "video/*".parse().unwrap())
+            .upload_resumable(reader, "video/*".parse().unwrap())
             .await
             .context("YouTube upload API call failed")?;
 
@@ -104,7 +139,6 @@ impl YoutubeUploader {
             .ok_or_else(|| anyhow::anyhow!("YouTube API returned no video ID"))?;
 
         info!(video_id = %video_id, title = %title_truncated, "YouTube upload completed");
-        progress_callback(100.0);
 
         Ok(video_id)
     }

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use teloxide::prelude::*;
@@ -16,13 +16,12 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::core::state::SharedState;
 use crate::core::task_manager::TaskManager;
+use crate::core::ProgressBar;
 use crate::errors::AppError;
 use crate::utils::format::escape_html;
 use crate::youtube::upload::YoutubeUploader;
 
-#[allow(dead_code)]
 const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(2);
-#[allow(dead_code)]
 const PROGRESS_UPDATE_THRESHOLD: f64 = 1.0;
 
 /// 启动一批 YouTube 上传任务（加入上传池，并发执行）。
@@ -212,11 +211,60 @@ async fn do_upload(
         .parse_mode(ParseMode::Html)
         .await;
 
-    // 执行上传
+    // 创建 mpsc 异步消息通道
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<f64>(100);
+
+    // 启动后台刷新任务
+    let bot_bg = bot.clone();
+    let msg_id = progress_msg.id;
+    let chat_id = progress_msg.chat.id;
+    let filename_bg = filename.clone();
+    let state_bg = Arc::clone(&state);
+    let task_id_bg = task_id.clone();
+
+    let progress_updater = tokio::spawn(async move {
+        let progress_bar = ProgressBar::default();
+        let mut last_update = Instant::now();
+        let mut last_percent = -1.0_f64;
+
+        while let Some(percent) = progress_rx.recv().await {
+            // 更新全局状态（使 /uploads 指令可见）
+            update_task_status(&state_bg, &task_id_bg, "上传中", Some(percent)).await;
+
+            // 节流刷新 Telegram 界面消息
+            if (percent - last_percent >= PROGRESS_UPDATE_THRESHOLD
+                && last_update.elapsed() >= PROGRESS_UPDATE_INTERVAL)
+                || percent >= 100.0
+            {
+                let bar = progress_bar.render(percent);
+                let text = format!(
+                    "📤 <b>YouTube 上传中</b>:\n<code>{}</code>\n\n<code>{}</code> {:.1}%\n\n发送 /stop 取消任务",
+                    escape_html(&filename_bg),
+                    bar,
+                    percent
+                );
+                let _ = bot_bg
+                    .edit_message_text(chat_id, msg_id, text)
+                    .parse_mode(ParseMode::Html)
+                    .await;
+                last_update = Instant::now();
+                last_percent = percent.floor();
+            }
+        }
+    });
+
+    // 执行上传并传入闭包
     let uploader = YoutubeUploader::new(config.token_file.clone(), config.youtube_chunk_bytes());
     update_task_status(&state, &task_id, "上传中", Some(0.0)).await;
 
-    let result = uploader.upload(&file_path, &filename, |_percent| {}).await;
+    let result = uploader
+        .upload(&file_path, &filename, move |percent| {
+            let _ = progress_tx.try_send(percent);
+        })
+        .await;
+
+    // 等待刷新任务结束
+    let _ = progress_updater.await;
 
     match result {
         Ok(video_id) => {
