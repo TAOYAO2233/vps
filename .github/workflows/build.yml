@@ -1,51 +1,62 @@
-name: Build Rust Bot Release (Rustls + Musl)
+name: Build Rust Bot Release (Musl Static)
 
 on:
   push:
-    branches: [ "main" ]
-    # 【核心修改点】只有当以下目录下的文件发生变化时，才触发此工作流
+    branches: [ "main", "master" ]
     paths:
-      - 'vps-telegram-bot/vpsupload_bot/RUST/**'
+      - 'vps-telegram-bot/media-control-bot/**'
+  pull_request:
+    branches: [ "main", "master" ]
+    paths:
+      - 'vps-telegram-bot/media-control-bot/**'
+
+# 设置全局默认工作目录，后续所有 run 步骤都会在此目录下执行
+defaults:
+  run:
+    working-directory: vps-telegram-bot/media-control-bot
 
 jobs:
   build:
+    name: Build x86_64-musl
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: vps-telegram-bot/vpsupload_bot/RUST
 
     steps:
-    # 1. 拉取仓库代码
+    # 1. 拉取代码
     - name: Checkout Code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
-    # 2. 安装 musl-tools 补齐 musl-gcc 编译器驱动
+    # 2. 安装 musl-tools (提供 musl-gcc)
     - name: Install musl-tools
-      run: sudo apt-get update && sudo apt-get install -y musl-tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools pkg-config libssl-dev
 
-    # 3. 安装 Rust 并注册 musl 目标
+    # 3. 安装 Rust 工具链并添加 musl target
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: x86_64-unknown-linux-musl
 
-    # 4. 缓存 Cargo 依赖（已更新为 vpsupload_bot 路径）
+    # 4. 缓存 Cargo 依赖以加速构建
     - name: Cache Dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
-          vps-telegram-bot/vpsupload_bot/RUST/target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('vps-telegram-bot/vpsupload_bot/RUST/Cargo.lock') }}
+          vps-telegram-bot/media-control-bot/target
+        key: ${{ runner.os }}-cargo-musl-${{ hashFiles('vps-telegram-bot/media-control-bot/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-musl-
 
     # 5. 执行静态编译
     - name: Build Binary
-      run: cargo build --release --target x86_64-unknown-linux-musl
+      run: |
+        cargo build --release --target x86_64-unknown-linux-musl
 
-    # 6. 上传生成的无依赖单文件二进制程序
+    # 6. 上传生成的二进制文件
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: vpsupload_bot_linux_x86_64
-        path: vps-telegram-bot/vpsupload_bot/RUST/target/x86_64-unknown-linux-musl/release/video_upload_bot_rust
+        name: media-control-bot-linux-x86_64
+        path: vps-telegram-bot/media-control-bot/target/x86_64-unknown-linux-musl/release/media-control-bot
