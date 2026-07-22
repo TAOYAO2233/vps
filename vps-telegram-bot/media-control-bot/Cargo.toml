@@ -20,7 +20,7 @@ tokio = { version = "1", features = ["full"] }
 
 # ── Telegram Bot ───────────────────────────────────────────────────────────────
 #teloxide = { version = "0.13", features = ["macros", "throttle"] }
-teloxide = { version = "0.13", default-features = false, features = ["macros", "throttle", "rustls"] }
+teloxide = { version = "0.13", default-features = false, features = ["macros", "throttle", "rustls", "ctrlc_handler"] }
 
 # ── Error handling ─────────────────────────────────────────────────────────────
 anyhow = "1"
