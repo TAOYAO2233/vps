@@ -25,15 +25,25 @@ pub struct ProgressReader<R: Read + Seek, F: FnMut(f64)> {
     pub callback: F,
 }
 
+// ✅ 补全声明包含 new 方法的 impl 块
+impl<R: Read + Seek, F: FnMut(f64)> ProgressReader<R, F> {
+    pub fn new(inner: R, total: u64, callback: F) -> Self {
+        Self {
+            inner,
+            total,
+            current: 0,
+            callback,
+        }
+    }
+}
+
 impl<R: Read + Seek, F: FnMut(f64)> Read for ProgressReader<R, F> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
         let n = self.inner.read(buf)?;
-        // 2. 只有当实际读到了字节 (n > 0) 且总大小大于 0 时才计算进度
         if n > 0 {
             self.current += n as u64;
             if self.total > 0 {
                 let percent = (self.current as f64 / self.total as f64) * 100.0;
-                // 3. 确保百分比最高不会超过 100.0%
                 (self.callback)(percent.min(100.0));
             }
         }
@@ -43,9 +53,9 @@ impl<R: Read + Seek, F: FnMut(f64)> Read for ProgressReader<R, F> {
 
 impl<R: Read + Seek, F: FnMut(f64)> Seek for ProgressReader<R, F> {
     fn seek(&mut self, pos: SeekFrom) -> IoResult<u64> {
-        let res = self.inner.seek(pos)?;
-        self.current = res; // 正确：同步当前偏移量
-        Ok(res)
+        let new_pos = self.inner.seek(pos)?;
+        self.current = new_pos; // 保持游标与当前读取字节同步
+        Ok(new_pos)
     }
 }
 
@@ -124,7 +134,7 @@ impl YoutubeUploader {
             "Starting YouTube upload"
         );
 
-        // 使用 ProgressReader 包装文件
+        // ✅ 现在可以正常调用 ProgressReader::new 构造函数了
         let reader = ProgressReader::new(file, file_size, progress_callback);
 
         let (_response, video_result) = hub
