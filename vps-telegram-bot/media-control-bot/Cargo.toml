@@ -19,7 +19,8 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 
 # ── Telegram Bot ───────────────────────────────────────────────────────────────
-teloxide = { version = "0.13", features = ["macros", "throttle"] }
+#teloxide = { version = "0.13", features = ["macros", "throttle"] }
+teloxide = { version = "0.13", default-features = false, features = ["macros", "throttle", "rustls-tls-webpki-roots"] }
 
 # ── Error handling ─────────────────────────────────────────────────────────────
 anyhow = "1"
