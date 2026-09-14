@@ -63,7 +63,7 @@ pub struct Config {
     #[serde(default = "default_merge_min_duration_ratio")]
     pub merge_min_duration_ratio: f64,
 
-    /// 合并结果体积最低比例（默认 0.30）
+    /// 合并结果体积最低比例（默认 0.80）
     #[serde(default = "default_merge_min_size_ratio")]
     pub merge_min_size_ratio: f64,
 
@@ -95,7 +95,7 @@ fn default_merge_min_duration_ratio() -> f64 {
 }
 
 fn default_merge_min_size_ratio() -> f64 {
-    0.30
+    0.80
 }
 
 fn default_log_format() -> String {
@@ -282,7 +282,7 @@ mod tests {
         assert_eq!(default_youtube_max_concurrent_uploads(), 2);
         assert_eq!(default_youtube_upload_chunk_mb(), 10);
         assert!((default_merge_min_duration_ratio() - 0.95).abs() < f64::EPSILON);
-        assert!((default_merge_min_size_ratio() - 0.30).abs() < f64::EPSILON);
+        assert!((default_merge_min_size_ratio() - 0.80).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -297,7 +297,7 @@ mod tests {
             youtube_max_concurrent_uploads: 2,
             youtube_upload_chunk_mb: 10,
             merge_min_duration_ratio: 0.95,
-            merge_min_size_ratio: 0.30,
+            merge_min_size_ratio: 0.80,
             log_format: "pretty".into(),
         };
         assert_eq!(config.youtube_chunk_bytes(), 10 * 1024 * 1024);

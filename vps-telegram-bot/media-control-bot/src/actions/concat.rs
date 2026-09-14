@@ -170,7 +170,6 @@ async fn do_concat(
         status,
         input_total_duration,
         total_input_size,
-        config.merge_min_duration_ratio,
         config.merge_min_size_ratio,
     )
     .await;
@@ -184,7 +183,7 @@ async fn do_concat(
             msg.chat.id,
             progress_msg.id,
             format!(
-                "⚠️ <b>直连拼接未通过时长/体积校验！</b>\n{}\n\n正在触发 <code>.ts</code> 容错处理机制，请耐心等待...",
+                "⚠️ <b>直连拼接失败或输出体积不足！</b>\n{}\n\n正在触发 <code>.ts</code> 容错处理机制，请耐心等待...",
                 format_merge_check(&check)
             ),
         )
@@ -274,7 +273,6 @@ async fn do_concat(
             ts_status,
             input_total_duration,
             total_input_size,
-            config.merge_min_duration_ratio,
             config.merge_min_size_ratio,
         )
         .await;
@@ -317,7 +315,7 @@ async fn do_concat(
             msg.chat.id,
             progress_msg.id,
             format!(
-                "❌ <b>合并彻底失败</b>\n{}\n\n输出文件未通过时长/体积校验。两段视频的编码、分辨率或时间戳可能严重不一致，建议先单文件转码后再试。",
+                "❌ <b>合并彻底失败</b>\n{}\n\nFFmpeg 未能生成有效输出，或输出文件大小低于输入总大小的 80%。建议先单文件转码后再试。",
                 format_merge_check(&final_check)
             ),
         )

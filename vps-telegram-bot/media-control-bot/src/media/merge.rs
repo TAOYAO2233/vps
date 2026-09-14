@@ -1,7 +1,7 @@
 //! 合并结果校验逻辑。
 //!
 //! 对应 Python 版本的 `validate_merged_file` 和 `format_merge_check` 函数。
-//! 通过时长比例和体积比例双重校验，判断合并结果是否合格。
+//! 根据 FFmpeg 退出状态和输出文件是否有效，判断合并是否完成。
 
 use std::path::Path;
 
@@ -37,8 +37,7 @@ pub struct MergeCheckDetails {
 /// 校验规则：
 /// 1. FFmpeg 退出码为 0
 /// 2. 输出文件存在且大小 > 0
-/// 3. 输出时长 >= 输入总时长 × `min_duration_ratio`
-/// 4. 输出大小 >= 输入总大小 × `min_size_ratio`
+/// 3. 输出大小 >= 输入总大小 × `min_size_ratio`
 ///
 /// # Arguments
 ///
@@ -46,8 +45,7 @@ pub struct MergeCheckDetails {
 /// * `exit_code` - FFmpeg 退出码（`None` 表示被取消）
 /// * `input_total_duration` - 输入文件总时长（秒）
 /// * `input_total_size` - 输入文件总大小（字节）
-/// * `min_duration_ratio` - 时长最低比例阈值（如 0.95）
-/// * `min_size_ratio` - 大小最低比例阈值（如 0.30）
+/// * `min_size_ratio` - 输出文件大小最低比例（如 0.8）
 ///
 /// # Returns
 ///
@@ -57,7 +55,6 @@ pub async fn validate_merged_file(
     exit_code: Option<i32>,
     input_total_duration: f64,
     input_total_size: u64,
-    min_duration_ratio: f64,
     min_size_ratio: f64,
 ) -> (bool, MergeCheckDetails) {
     let output_size = if output_path.exists() {
@@ -72,17 +69,10 @@ pub async fn validate_merged_file(
         0.0
     };
 
-    let duration_ok = if input_total_duration > 0.0 {
-        output_duration >= input_total_duration * min_duration_ratio
-    } else {
-        true
-    };
-
-    let size_ok = if input_total_size > 0 {
-        output_size >= (input_total_size as f64 * min_size_ratio) as u64
-    } else {
-        true
-    };
+    // 时长仅用于结果展示，不参与合并成功判定。
+    let duration_ok = true;
+    let size_ok = input_total_size == 0
+        || output_size >= (input_total_size as f64 * min_size_ratio) as u64;
 
     let duration_ratio = if input_total_duration > 0.0 {
         output_duration / input_total_duration
@@ -96,7 +86,7 @@ pub async fn validate_merged_file(
         0.0
     };
 
-    let is_success = exit_code == Some(0) && output_size > 0 && duration_ok && size_ok;
+    let is_success = exit_code == Some(0) && output_size > 0 && size_ok;
 
     let details = MergeCheckDetails {
         input_duration: input_total_duration,
