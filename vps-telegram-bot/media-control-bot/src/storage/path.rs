@@ -14,7 +14,8 @@ use crate::errors::AppError;
 /// 封装 `BASE_DIR` 边界校验逻辑，确保所有文件操作都限制在根目录内，
 /// 防止路径遍历攻击（`../../../etc/passwd` 等）。
 pub struct PathGuard {
-    base_dir: PathBuf,
+    /// 规范化后的安全边界根目录（构造时计算一次，避免每次校验都做系统调用）
+    canonical_base: PathBuf,
 }
 
 impl PathGuard {
@@ -25,7 +26,8 @@ impl PathGuard {
     /// * `base_dir` - 安全边界根目录
     #[must_use]
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        let canonical_base = base_dir.canonicalize().unwrap_or(base_dir);
+        Self { canonical_base }
     }
 
     /// 校验路径是否在 BASE_DIR 内，并返回规范化后的路径。
@@ -40,14 +42,9 @@ impl PathGuard {
     ///
     /// 若路径超出 BASE_DIR，返回 [`AppError::PathTraversal`]。
     pub fn assert_inside<'a>(&self, path: &'a Path) -> Result<&'a Path> {
-        let base = self
-            .base_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.base_dir.clone());
-
         let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
-        if target == base || target.starts_with(&base) {
+        if target == self.canonical_base || target.starts_with(&self.canonical_base) {
             Ok(path)
         } else {
             Err(AppError::PathTraversal { path: target }.into())

@@ -4,7 +4,8 @@
 //!
 //! ## 版本说明
 //!
-//! 使用 `hyper v0.14` 和 `yup-oauth2 v9`，与 `google-youtube3 v5` 兼容。
+//! 使用 `hyper v0.14` 和 `yup-oauth2 v9`，与 `google-youtube3 v5` 兼容；
+//! `hyper-rustls` 固定为 `v0.25`（`yup-oauth2 v9` 内部使用的版本），避免两套 rustls 栈。
 
 use std::path::Path;
 

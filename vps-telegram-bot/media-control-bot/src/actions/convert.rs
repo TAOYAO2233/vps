@@ -4,13 +4,12 @@
 //! 将选中的视频文件无损封装转换为 MP4 格式（`-c copy -movflags +faststart`），
 //! 实时解析 FFmpeg 进度并更新 Telegram 消息。
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
-use once_cell::sync::Lazy;
-use regex::Regex;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use tracing::{info, warn};
@@ -20,19 +19,20 @@ use crate::core::state::SharedState;
 use crate::core::task_manager::TaskManager;
 use crate::core::ProgressBar;
 use crate::errors::AppError;
+use crate::media::ffmpeg::FfmpegProcess;
 use crate::media::ffprobe::get_video_duration;
 use crate::storage::filesystem::remove_if_exists;
 use crate::storage::path::unique_path;
 use crate::utils::format::escape_html;
 
-/// 匹配 FFmpeg stderr 输出中的时间戳
-static TIME_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"time=(\d{2}):(\d{2}):(\d{2})\.\d{2}").unwrap());
-
-const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(2);
-const PROGRESS_UPDATE_THRESHOLD: f64 = 1.0;
+/// 取消标志轮询间隔：即使 FFmpeg 长时间不输出内容，也能及时响应 `/stop`。
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 启动批量转码独占任务。
+///
+/// # Errors
+///
+/// 已有任务占用时返回错误。
 pub async fn start_convert(
     bot: &Bot,
     msg: &Message,
@@ -133,74 +133,54 @@ async fn do_convert(
         .await?;
 
         // 启动 FFmpeg 转码进程
-        let mut child = tokio::process::Command::new("ffmpeg")
-            .args(["-y", "-i"])
-            .arg(file_path)
-            .args(["-c", "copy", "-movflags", "+faststart"])
-            .arg(&output_path)
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn ffmpeg: {e}"))?;
-
-        if let Some(pid) = child.id() {
-            state.write().await.current_process_pid = Some(pid);
-        }
-
-        let stderr = child.stderr.take().unwrap();
-        let mut reader = tokio::io::BufReader::new(stderr);
-        let mut line_buf = String::new();
-        let mut last_update = Instant::now();
-        let mut last_percent = -1.0_f64;
+        let args = vec![
+            OsString::from("-y"),
+            OsString::from("-i"),
+            file_path.as_os_str().to_os_string(),
+            OsString::from("-c"),
+            OsString::from("copy"),
+            OsString::from("-movflags"),
+            OsString::from("+faststart"),
+            output_path.as_os_str().to_os_string(),
+        ];
+        let mut process = FfmpegProcess::spawn(args, duration, &state).await?;
 
         loop {
             if state.read().await.cancel_flag {
-                let _ = child.kill().await;
+                let _ = process.kill().await;
                 break;
             }
 
-            line_buf.clear();
-
-            match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line_buf).await {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-
-            if duration > 0.0 {
-                if let Some(caps) = TIME_REGEX.captures(&line_buf) {
-                    let h: u64 = caps[1].parse().unwrap_or(0);
-                    let m: u64 = caps[2].parse().unwrap_or(0);
-                    let s: u64 = caps[3].parse().unwrap_or(0);
-                    let current_sec = h * 3600 + m * 60 + s;
-                    let percent = (current_sec as f64 / duration) * 100.0;
-
-                    if (percent - last_percent) >= PROGRESS_UPDATE_THRESHOLD
-                        && last_update.elapsed() >= PROGRESS_UPDATE_INTERVAL
-                    {
-                        let bar = progress_bar.render(percent);
-                        let _ = bot
-                            .edit_message_text(
-                                msg.chat.id,
-                                progress_msg.id,
-                                format!(
-                                    "🔄 <b>正在转换</b> ({}/{total}):\n<code>{}</code>\n\n<code>{}</code>\n⏱️ {current_sec}s / {}s",
-                                    idx + 1,
-                                    escape_html(&filename),
-                                    bar,
-                                    duration as u64
-                                ),
-                            )
-                            .parse_mode(ParseMode::Html)
-                            .await;
-                        last_update = Instant::now();
-                        last_percent = percent.floor();
+            // 进度读取与取消轮询并行：即使 FFmpeg 不再输出，也能在 500ms 内响应 /stop
+            tokio::select! {
+                progress = process.next_progress() => {
+                    match progress {
+                        Ok(Some((percent, current_sec))) => {
+                            let bar = progress_bar.render(percent);
+                            let _ = bot
+                                .edit_message_text(
+                                    msg.chat.id,
+                                    progress_msg.id,
+                                    format!(
+                                        "🔄 <b>正在转换</b> ({}/{total}):\n<code>{}</code>\n\n<code>{}</code>\n⏱️ {}s / {}s",
+                                        idx + 1,
+                                        escape_html(&filename),
+                                        bar,
+                                        current_sec as u64,
+                                        duration as u64
+                                    ),
+                                )
+                                .parse_mode(ParseMode::Html)
+                                .await;
+                        }
+                        Ok(None) | Err(_) => break,
                     }
                 }
+                _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => {}
             }
         }
 
-        let status = child.wait().await?;
-        state.write().await.current_process_pid = None;
+        let exit_code = process.wait().await?;
 
         if state.read().await.cancel_flag {
             remove_if_exists(&output_path);
@@ -210,7 +190,7 @@ async fn do_convert(
             return Err(AppError::Cancelled.into());
         }
 
-        if status.success()
+        if exit_code == Some(0)
             && output_path.exists()
             && output_path.metadata().map(|m| m.len()).unwrap_or(0) > 0
         {

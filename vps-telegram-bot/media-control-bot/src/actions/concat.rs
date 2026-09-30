@@ -165,11 +165,15 @@ async fn do_concat(
         return Err(AppError::Cancelled.into());
     }
 
+    let min_duration_pct = config.merge_min_duration_ratio * 100.0;
+    let min_size_pct = config.merge_min_size_ratio * 100.0;
+
     let (is_success, check) = validate_merged_file(
         &output_path,
         status,
         input_total_duration,
         total_input_size,
+        config.merge_min_duration_ratio,
         config.merge_min_size_ratio,
     )
     .await;
@@ -273,6 +277,7 @@ async fn do_concat(
             ts_status,
             input_total_duration,
             total_input_size,
+            config.merge_min_duration_ratio,
             config.merge_min_size_ratio,
         )
         .await;
@@ -315,7 +320,7 @@ async fn do_concat(
             msg.chat.id,
             progress_msg.id,
             format!(
-                "❌ <b>合并彻底失败</b>\n{}\n\nFFmpeg 未能生成有效输出，或输出文件大小低于输入总大小的 80%。建议先单文件转码后再试。",
+                "❌ <b>合并彻底失败</b>\n{}\n\nFFmpeg 未能生成有效输出，或未达到校验阈值（时长 ≥ {min_duration_pct:.0}%、体积 ≥ {min_size_pct:.0}%）。建议先单文件转码后再试。",
                 format_merge_check(&final_check)
             ),
         )

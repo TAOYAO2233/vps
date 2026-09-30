@@ -3,13 +3,12 @@
 //! 对应 Python 版本的 `action_stream` 函数。
 //! 使用 FFmpeg 将视频文件推送到 RTMP 地址，实时解析进度并更新 Telegram 消息。
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
-use once_cell::sync::Lazy;
-use regex::Regex;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use tracing::info;
@@ -19,19 +18,13 @@ use crate::core::state::SharedState;
 use crate::core::task_manager::TaskManager;
 use crate::core::ProgressBar;
 use crate::errors::AppError;
+use crate::media::ffmpeg::FfmpegProcess;
 use crate::media::ffprobe::get_video_duration;
 use crate::storage::filesystem::format_file_size;
 use crate::utils::format::escape_html;
 
-/// 匹配 FFmpeg stderr 输出中的时间戳，例如 `time=00:01:23.45`
-static TIME_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"time=(\d{2}):(\d{2}):(\d{2})\.\d{2}").unwrap());
-
-/// 进度更新最小间隔（秒）
-const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(2);
-
-/// 进度更新最小变化量（百分比）
-const PROGRESS_UPDATE_THRESHOLD: f64 = 1.0;
+/// 取消标志轮询间隔：即使 FFmpeg 长时间不输出内容，也能及时响应 `/stop`。
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 启动 RTMP 推流独占任务。
 ///
@@ -42,6 +35,10 @@ const PROGRESS_UPDATE_THRESHOLD: f64 = 1.0;
 /// * `state` - 全局共享状态
 /// * `config` - 应用配置
 /// * `file_path` - 要推流的视频文件路径（已通过路径安全校验）
+///
+/// # Errors
+///
+/// 已有任务占用、RTMP 地址未配置或推流启动失败时返回错误。
 pub async fn start_stream(
     bot: &Bot,
     msg: &Message,
@@ -146,81 +143,62 @@ async fn do_stream(
     }
 
     // 启动 FFmpeg 推流进程
-    let mut child = tokio::process::Command::new("ffmpeg")
-        .args(["-re", "-i"])
-        .arg(&file_path)
-        .args(["-c", "copy", "-f", "flv"])
-        .arg(&rtmp_url)
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn ffmpeg: {e}"))?;
+    let args = vec![
+        OsString::from("-re"),
+        OsString::from("-i"),
+        file_path.as_os_str().to_os_string(),
+        OsString::from("-c"),
+        OsString::from("copy"),
+        OsString::from("-f"),
+        OsString::from("flv"),
+        OsString::from(rtmp_url.as_str()),
+    ];
+    let mut process = FfmpegProcess::spawn(args, duration, &state).await?;
 
-    // 记录 PID 以便强制终止
-    if let Some(pid) = child.id() {
-        state.write().await.current_process_pid = Some(pid);
-    }
-
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to capture ffmpeg stderr"))?;
-
-    let mut reader = tokio::io::BufReader::new(stderr);
-    let mut line_buf = String::new();
     let progress_bar = ProgressBar::default();
-    let mut last_update = Instant::now();
-    let mut last_percent = -1.0_f64;
-
-    info!(filename = %filename, rtmp_url = %rtmp_url, "RTMP stream started");
+    info!(
+        filename = %filename,
+        rtmp_url = %rtmp_url,
+        pid = ?process.pid(),
+        "RTMP stream started"
+    );
 
     loop {
         // 检查取消标志
         if state.read().await.cancel_flag {
-            let _ = child.kill().await;
+            let _ = process.kill().await;
             break;
         }
 
-        line_buf.clear();
-
-        match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line_buf).await {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(_) => break,
-        }
-
-        if let Some(caps) = TIME_REGEX.captures(&line_buf) {
-            let h: u64 = caps[1].parse().unwrap_or(0);
-            let m: u64 = caps[2].parse().unwrap_or(0);
-            let s: u64 = caps[3].parse().unwrap_or(0);
-            let current_sec = h * 3600 + m * 60 + s;
-            let percent = (current_sec as f64 / duration) * 100.0;
-
-            if (percent - last_percent) >= PROGRESS_UPDATE_THRESHOLD
-                && last_update.elapsed() >= PROGRESS_UPDATE_INTERVAL
-            {
-                let bar = progress_bar.render(percent);
-                let _ = bot
-                    .edit_message_text(
-                        msg.chat.id,
-                        progress_msg.id,
-                        format!(
-                            "📡 <b>推流中</b>: <code>{}</code>\n\n<code>{}</code>\n⏱️ {current_sec}s / {}s",
-                            escape_html(&filename),
-                            bar,
-                            duration as u64
-                        ),
-                    )
-                    .parse_mode(ParseMode::Html)
-                    .await;
-                last_update = Instant::now();
-                last_percent = percent.floor();
+        // 进度读取与取消轮询并行：即使 FFmpeg 不再输出，也能在 500ms 内响应 /stop
+        tokio::select! {
+            progress = process.next_progress() => {
+                match progress {
+                    Ok(Some((percent, current_sec))) => {
+                        let bar = progress_bar.render(percent);
+                        let _ = bot
+                            .edit_message_text(
+                                msg.chat.id,
+                                progress_msg.id,
+                                format!(
+                                    "📡 <b>推流中</b>: <code>{}</code>\n\n<code>{}</code>\n⏱️ {}s / {}s",
+                                    escape_html(&filename),
+                                    bar,
+                                    current_sec as u64,
+                                    duration as u64
+                                ),
+                            )
+                            .parse_mode(ParseMode::Html)
+                            .await;
+                    }
+                    Ok(None) | Err(_) => break,
+                }
             }
+            _ = tokio::time::sleep(CANCEL_POLL_INTERVAL) => {}
         }
     }
 
-    let status = child.wait().await?;
-    state.write().await.current_process_pid = None;
-
+    let exit_code = process.wait().await?;
     let cancelled = state.read().await.cancel_flag;
 
     if cancelled {
@@ -234,7 +212,7 @@ async fn do_stream(
         return Err(AppError::Cancelled.into());
     }
 
-    if status.success() {
+    if exit_code == Some(0) {
         bot.edit_message_text(
             msg.chat.id,
             progress_msg.id,
@@ -244,7 +222,7 @@ async fn do_stream(
         .await?;
         info!(filename = %filename, "RTMP stream completed successfully");
     } else {
-        let code = status.code().unwrap_or(-1);
+        let code = exit_code.unwrap_or(-1);
         bot.edit_message_text(
             msg.chat.id,
             progress_msg.id,

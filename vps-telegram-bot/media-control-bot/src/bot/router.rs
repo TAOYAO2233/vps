@@ -67,7 +67,6 @@ pub fn build_dispatcher(
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![])
-        .enable_ctrlc_handler()
         .build()
 }
 

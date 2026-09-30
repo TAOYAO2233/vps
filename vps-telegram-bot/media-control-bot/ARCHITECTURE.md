@@ -50,8 +50,7 @@ media-control-bot/
 │   │   ├── mod.rs
 │   │   ├── ffmpeg.rs      # 封装 FFmpeg 命令行调用
 │   │   ├── ffprobe.rs     # 封装 FFprobe 获取时长
-│   │   ├── merge.rs       # 合并校验逻辑（时长、大小比对）
-│   │   └── convert.rs     # 转码进度解析（time_regex）
+│   │   └── merge.rs       # 合并校验逻辑（时长、大小双指标比对）
 │   ├── youtube/           # YouTube API 基础设施层
 │   │   ├── mod.rs
 │   │   ├── api.rs         # 构建 API Client
@@ -69,7 +68,6 @@ media-control-bot/
 │   │   └── selector.rs    # 文件选择器状态与渲染
 │   └── utils/             # 通用工具层
 │       ├── mod.rs
-│       ├── env.rs         # 环境变量辅助读取
 │       ├── logger.rs      # Tracing 初始化
 │       ├── format.rs      # 时长、进度等字符串格式化
 │       └── datetime.rs    # 时间处理
@@ -86,8 +84,7 @@ media-control-bot/
 - `walkdir`: 高效目录遍历
 - `regex`: 正则表达式（用于解析 ffmpeg 输出和智能命名）
 - `google-youtube3`, `hyper`, `hyper-rustls`, `yup-oauth2`: YouTube API 交互
-- `dashmap`: 并发安全的哈希表（可选，视 AppState 设计而定）
-- `lazy_static` 或 `once_cell`: 全局静态变量
+- `once_cell`: 全局静态变量（`Lazy<Regex>`）
 
 ## 4. 状态管理设计
 

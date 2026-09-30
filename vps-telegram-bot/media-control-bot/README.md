@@ -1,6 +1,6 @@
 # VPS Media Control Bot (Rust Edition)
 
-基于 Rust 2024 Edition + Tokio + Teloxide 重构的企业级 Telegram 媒体控制机器人。
+基于 Rust 2021 Edition + Tokio + Teloxide 重构的企业级 Telegram 媒体控制机器人。
 用于在 VPS 上远程管理视频文件，支持合并、转码、RTMP 推流、YouTube 批量上传等操作。
 
 ## 🌟 核心特性
@@ -15,7 +15,7 @@
 
 ## 🛠️ 技术栈
 
-- **语言**: Rust 2024 Edition
+- **语言**: Rust 2021 Edition
 - **异步运行时**: `tokio`
 - **Telegram 框架**: `teloxide`
 - **错误处理**: `anyhow` + `thiserror`
@@ -66,7 +66,6 @@ media-control-bot/
 │   ├── actions/        # 业务逻辑层 (合并、转码、上传等)
 │   ├── media/          # 基础设施层 (FFmpeg/FFprobe 封装)
 │   ├── youtube/        # 基础设施层 (OAuth2 & YouTube API)
-│   ├── rtmp/           # 基础设施层 (RTMP 推流封装)
 │   ├── storage/        # 基础设施层 (文件系统、路径安全)
 │   ├── ui/             # 表示层组件 (分页、菜单、键盘)
 │   ├── utils/          # 通用工具 (格式化、日志、时间)

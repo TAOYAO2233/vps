@@ -13,38 +13,43 @@ mod config;
 mod core;
 mod errors;
 mod media;
-mod rtmp;
 mod storage;
 mod ui;
 mod utils;
 mod youtube;
 
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info};
 
 use crate::bot::router::build_dispatcher;
 use crate::config::Config;
 use crate::core::state::AppState;
-use crate::utils::logger::init_logger;
+use crate::utils::logger::init_logger_from_env;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. 加载配置（Config::load 内部已处理 .env 加载）
+    // 1. 先初始化日志系统（内部会加载 .env），保证后续启动日志能被输出
+    init_logger_from_env()?;
+
+    // 2. 加载配置（Config::load 内部同样会加载 .env，重复调用是幂等的）
     let config = match Config::load() {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            eprintln!("Configuration error: {e:#}");
+            error!("Configuration error: {e:#}");
             std::process::exit(1);
         }
     };
 
-    // 2. 初始化日志系统（必须在 Config::load 之后，因为 Config::load 会调用 tracing）
-    init_logger(&config.log_format)?;
     info!("Starting Media Control Bot v{}", env!("CARGO_PKG_VERSION"));
     info!("Base directory: {}", config.base_dir.display());
     info!(
         "YouTube max concurrent uploads: {}",
         config.youtube_max_concurrent_uploads
+    );
+    info!(
+        "YouTube upload chunk hint: {} bytes (实际分块由依赖库控制，仅作预留)",
+        config.youtube_chunk_bytes()
     );
 
     // 3. 初始化全局状态
@@ -59,9 +64,9 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. 构建 Dispatcher（dptree 路由树）
     info!("Setting up Telegram dispatcher...");
-    let mut dispatcher = build_dispatcher(tg_bot, app_state, Arc::clone(&config));
+    let mut dispatcher = build_dispatcher(tg_bot, Arc::clone(&app_state), Arc::clone(&config));
 
-    // 6. 注册优雅停机信号 (Ctrl+C / SIGTERM)
+    // 6. 注册优雅停机信号 (Ctrl+C)
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -76,6 +81,10 @@ async fn main() -> anyhow::Result<()> {
             error!("Dispatcher exited unexpectedly");
         }
         _ = ctrl_c => {
+            // 通知所有任务退出：独占任务会在下一次轮询时终止 FFmpeg 子进程，
+            // YouTube 上传会在 chunk 边界退出，kill_on_drop 作为兜底。
+            app_state.write().await.cancel_all();
+            tokio::time::sleep(Duration::from_millis(300)).await;
             info!("Shutdown complete.");
         }
     }

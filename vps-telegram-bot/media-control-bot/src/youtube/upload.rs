@@ -6,6 +6,11 @@
 //! ## 版本说明
 //!
 //! 使用 `google-youtube3 v5` 的 `VideoSnippet` / `VideoStatus` 类型（非 `Snippet`/`Status`）。
+//!
+//! ## 关于分块大小
+//!
+//! 分块由 `google-apis-common` 的 resumable 上传实现内部控制，
+//! 因此 `YOUTUBE_UPLOAD_CHUNK_MB` 目前仅作为预留配置，不参与实际上传分块。
 
 use std::io::{ErrorKind, Read, Result as IoResult, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -75,8 +80,6 @@ impl<R: Read + Seek, F: FnMut(f64) + Send, C: Fn() -> bool + Send> Seek
 /// YouTube 视频上传器。
 pub struct YoutubeUploader {
     token_file: PathBuf,
-    #[allow(dead_code)]
-    chunk_size: usize,
 }
 
 impl YoutubeUploader {
@@ -85,13 +88,9 @@ impl YoutubeUploader {
     /// # Arguments
     ///
     /// * `token_file` - OAuth2 token.json 文件路径
-    /// * `chunk_size` - 上传分块大小（字节）
     #[must_use]
-    pub fn new(token_file: PathBuf, chunk_size: usize) -> Self {
-        Self {
-            token_file,
-            chunk_size,
-        }
+    pub fn new(token_file: PathBuf) -> Self {
+        Self { token_file }
     }
 
     /// 上传视频文件到 YouTube（私享）。

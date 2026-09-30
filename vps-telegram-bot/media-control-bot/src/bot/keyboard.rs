@@ -110,7 +110,6 @@ pub fn delete_confirmation_keyboard() -> InlineKeyboardMarkup {
 
 /// 构建“返回主菜单”单按鈕键盘（用于错误提示等场景）。
 #[must_use]
-#[allow(dead_code)]
 pub fn back_to_main_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
         "🔙 返回主菜单",

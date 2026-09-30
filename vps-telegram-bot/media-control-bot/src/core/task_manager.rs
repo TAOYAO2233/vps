@@ -44,29 +44,30 @@ impl TaskManager {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        // 检查互斥条件
-        {
-            let mut state = self.state.write().await;
-            state.cleanup_active_task();
-            state.cleanup_youtube_pool();
+        // 单次持写锁完成「清理 → 互斥检查 → 注册」，避免并发回调同时通过检查。
+        // 任务收尾同样需要写锁，因此它必然在本函数释放锁之后才执行，
+        // 不会出现「任务秒退后又被写入陈旧 active_task」的情况。
+        let state_clone = Arc::clone(&self.state);
+        let mut state = self.state.write().await;
 
-            if state.has_active_task() {
-                let name = state.active_task_name().unwrap_or("运行中任务").to_string();
-                return Err(AppError::TaskAlreadyRunning { task_name: name }.into());
-            }
+        state.cleanup_active_task();
+        state.cleanup_youtube_pool();
 
-            let upload_count = state.active_youtube_count();
-            if upload_count > 0 {
-                return Err(AppError::YoutubeUploadBlocking {
-                    count: upload_count,
-                }
-                .into());
-            }
-
-            state.cancel_flag = false;
+        if state.has_active_task() {
+            let name = state.active_task_name().unwrap_or("运行中任务").to_string();
+            return Err(AppError::TaskAlreadyRunning { task_name: name }.into());
         }
 
-        let state_clone = Arc::clone(&self.state);
+        let upload_count = state.active_youtube_count();
+        if upload_count > 0 {
+            return Err(AppError::YoutubeUploadBlocking {
+                count: upload_count,
+            }
+            .into());
+        }
+
+        state.cancel_flag = false;
+
         let task_name_owned = task_name.to_string();
         let task_name_log = task_name.to_string();
 
@@ -91,15 +92,11 @@ impl TaskManager {
             state.current_process_pid = None;
         });
 
-        // 写入任务信息
-        {
-            let mut state = self.state.write().await;
-            state.active_task = Some(TaskInfo {
-                name: task_name_log,
-                handle,
-                started_at: std::time::Instant::now(),
-            });
-        }
+        state.active_task = Some(TaskInfo {
+            name: task_name_log,
+            handle,
+            started_at: std::time::Instant::now(),
+        });
 
         Ok(())
     }
@@ -130,21 +127,19 @@ impl TaskManager {
         F: FnOnce(tokio::sync::watch::Receiver<bool>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
-        // 检查独占任务
-        {
-            let mut state = self.state.write().await;
-            state.cleanup_active_task();
+        // 检查独占任务并与注册上传池共用同一次写锁
+        let state_clone = Arc::clone(&self.state);
+        let mut state = self.state.write().await;
+        state.cleanup_active_task();
 
-            if state.has_active_task() {
-                let name = state.active_task_name().unwrap_or("运行中任务").to_string();
-                return Err(AppError::TaskAlreadyRunning { task_name: name }.into());
-            }
+        if state.has_active_task() {
+            let name = state.active_task_name().unwrap_or("运行中任务").to_string();
+            return Err(AppError::TaskAlreadyRunning { task_name: name }.into());
         }
 
         let (upload_task, cancel_rx) = UploadTask::new(filename.clone(), path);
         let cancel_rx_clone = cancel_rx.clone();
 
-        let state_clone = Arc::clone(&self.state);
         let task_id_clone = task_id.clone();
         let filename_log = filename.clone();
 
@@ -164,13 +159,9 @@ impl TaskManager {
             state.youtube_pool.remove(&task_id_clone);
         });
 
-        // 写入上传池
-        {
-            let mut state = self.state.write().await;
-            let mut task = upload_task;
-            task.handle = Some(handle);
-            state.youtube_pool.insert(task_id, task);
-        }
+        let mut task = upload_task;
+        task.handle = Some(handle);
+        state.youtube_pool.insert(task_id, task);
 
         Ok(cancel_rx)
     }
@@ -203,5 +194,58 @@ impl TaskManager {
         let mut state = self.state.write().await;
         state.cleanup_youtube_pool();
         state.active_youtube_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn make_manager() -> TaskManager {
+        let state = crate::core::state::AppState::new(PathBuf::from("."), 2).into_shared();
+        TaskManager::new(state)
+    }
+
+    #[tokio::test]
+    async fn test_start_exclusive_rejects_second_task() {
+        let manager = make_manager();
+
+        // 第一个任务保持挂起，确保第二个任务启动时它仍在运行
+        manager
+            .start_exclusive("任务 A", || async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .unwrap();
+
+        let second = manager
+            .start_exclusive("任务 B", || async { Ok::<(), anyhow::Error>(()) })
+            .await;
+
+        let err = second.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<AppError>(),
+            Some(AppError::TaskAlreadyRunning { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_start_exclusive_allows_task_after_completion() {
+        let manager = make_manager();
+
+        manager
+            .start_exclusive("任务 A", || async { Ok::<(), anyhow::Error>(()) })
+            .await
+            .unwrap();
+
+        // 等待第一个任务结束（含状态清理）
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(manager
+            .start_exclusive("任务 B", || async { Ok::<(), anyhow::Error>(()) })
+            .await
+            .is_ok());
     }
 }

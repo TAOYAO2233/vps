@@ -13,7 +13,7 @@ use teloxide::types::ParseMode;
 use crate::bot::keyboard::file_selector_keyboard;
 use crate::config::Config;
 use crate::core::state::{ActionType, SharedState};
-use crate::storage::filesystem::format_file_size;
+use crate::storage::filesystem::format_file_size_bytes;
 use crate::storage::path::PathGuard;
 use crate::storage::scanner::scan_directory;
 use crate::ui::pagination::Paginator;
@@ -60,10 +60,11 @@ pub async fn render_file_selector(
         return Ok(());
     }
 
-    // 扫描目录
-    let listing = match scan_directory(&current_dir, &path_guard) {
-        Ok(l) => l,
-        Err(e) => {
+    // 扫描目录：同步文件系统调用放入阻塞线程池，避免卡住异步运行时
+    let scan_dir = current_dir.clone();
+    let listing = match tokio::task::spawn_blocking(move || scan_directory(&scan_dir)).await {
+        Ok(Ok(listing)) => listing,
+        Ok(Err(e)) => {
             bot.edit_message_text(
                 msg.chat.id,
                 msg.id,
@@ -72,19 +73,26 @@ pub async fn render_file_selector(
             .await?;
             return Ok(());
         }
+        Err(e) => {
+            bot.edit_message_text(
+                msg.chat.id,
+                msg.id,
+                format!("❌ 目录扫描失败: {}", escape_html(&e.to_string())),
+            )
+            .await?;
+            return Ok(());
+        }
     };
-
-    let all_items = listing.all_items();
 
     // 更新状态中的文件列表缓存
     {
         let mut s = state.write().await;
-        s.current_files = all_items.clone();
+        s.current_files = listing.all_items();
     }
 
     // 分页计算
-    let paginator = Paginator::new(all_items.len(), config.items_per_page, page);
-    let page_items = &all_items[paginator.range()];
+    let paginator = Paginator::new(listing.total(), config.items_per_page, page);
+    let page_items = &listing.items[paginator.range()];
 
     // 获取当前选中集合
     let selected_paths: HashSet<PathBuf> = {
@@ -96,22 +104,22 @@ pub async fn render_file_selector(
 
     // 构建按钮数据
     let mut button_items: Vec<(String, String)> = Vec::new();
-    for (i, item_name) in page_items.iter().enumerate() {
+    for (i, item) in page_items.iter().enumerate() {
         let real_idx = paginator.start_index() + i;
-        let item_path = current_dir.join(item_name);
+        let item_path = current_dir.join(&item.name);
 
-        if item_path.is_dir() {
+        if item.is_dir {
             button_items.push((
-                format!("📁 {item_name}"),
+                format!("📁 {}", item.name),
                 format!("enterdir_{}_{real_idx}", action.as_str()),
             ));
         } else {
-            let size_str = format_file_size(&item_path);
+            let size_str = format_file_size_bytes(item.size);
             if is_multi_select {
                 let is_selected = selected_paths.contains(&item_path);
                 let checkbox = if is_selected { "✅ " } else { "⬜️ " };
                 button_items.push((
-                    format!("{checkbox}[{size_str}] {item_name}"),
+                    format!("{checkbox}[{size_str}] {}", item.name),
                     format!(
                         "toggle_{}_{}_{}",
                         action.as_str(),
@@ -121,7 +129,7 @@ pub async fn render_file_selector(
                 ));
             } else {
                 button_items.push((
-                    format!("[{size_str}] {item_name}"),
+                    format!("[{size_str}] {}", item.name),
                     format!("execsingle_{}_{real_idx}", action.as_str()),
                 ));
             }
@@ -174,7 +182,7 @@ pub async fn render_file_selector(
         }
     }
 
-    if all_items.is_empty() {
+    if listing.is_empty() {
         header.push_str("\n\n⚠️ 当前目录下既无子文件夹也无视频文件。");
     }
 

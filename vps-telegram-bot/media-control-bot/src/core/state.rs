@@ -14,6 +14,8 @@ use std::time::Instant;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinHandle;
 
+use crate::errors::AppError;
+
 /// 全局共享状态的类型别名。
 ///
 /// 使用 `Arc<RwLock<AppState>>` 实现：
@@ -38,21 +40,28 @@ pub enum ActionType {
     Delete,
 }
 
-impl ActionType {
+impl std::str::FromStr for ActionType {
+    type Err = AppError;
+
     /// 从字符串解析操作类型。
-    #[must_use]
-    pub fn from_str(s: &str) -> Option<Self> {
+    ///
+    /// # Errors
+    ///
+    /// 传入未知操作名时返回 [`AppError::InvalidArgument`]。
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "browse" => Some(Self::Browse),
-            "stream" => Some(Self::Stream),
-            "youtube" => Some(Self::Youtube),
-            "concat" => Some(Self::Concat),
-            "convert" => Some(Self::Convert),
-            "delete" => Some(Self::Delete),
-            _ => None,
+            "browse" => Ok(Self::Browse),
+            "stream" => Ok(Self::Stream),
+            "youtube" => Ok(Self::Youtube),
+            "concat" => Ok(Self::Concat),
+            "convert" => Ok(Self::Convert),
+            "delete" => Ok(Self::Delete),
+            other => Err(AppError::invalid_argument(format!("Unknown action: {other}"))),
         }
     }
+}
 
+impl ActionType {
     /// 转换为字符串表示。
     #[must_use]
     pub fn as_str(&self) -> &'static str {
@@ -189,7 +198,7 @@ pub struct AppState {
     /// 待确认删除的文件列表
     pub pending_delete_files: Vec<PathBuf>,
 
-    /// 当前正在运行的子进程 PID（用于强制终止）
+    /// 当前正在运行的子进程 PID（诊断用：便于与 `ps` 输出对应）
     pub current_process_pid: Option<u32>,
 }
 
@@ -283,26 +292,12 @@ impl AppState {
         self.selections.remove(action);
     }
 
-    /// 取消所有正在运行的任务（设置 cancel_flag，终止子进程，通知 YouTube 上传）。
+    /// 取消所有正在运行的任务（设置 `cancel_flag`，并通知 YouTube 上传任务取消）。
+    ///
+    /// 子进程的实际终止由持有 `Child` 句柄的 FFmpeg 任务在检测到 `cancel_flag` 后执行，
+    /// 避免在此处按 PID 发信号带来的竞态与僵尸进程。
     pub fn cancel_all(&mut self) {
         self.cancel_flag = true;
-
-        // 终止子进程（通过 kill 命令调用，避免 unsafe 块）
-        if let Some(pid) = self.current_process_pid {
-            #[cfg(unix)]
-            {
-                let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .spawn();
-            }
-            #[cfg(windows)]
-            {
-                // Windows 下通过 taskkill 终止
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/F"])
-                    .spawn();
-            }
-        }
 
         // 通知所有 YouTube 上传任务取消
         for task in self.youtube_pool.values() {
@@ -330,7 +325,7 @@ mod tests {
             ActionType::Delete,
         ] {
             let s = action.as_str();
-            let parsed = ActionType::from_str(s).unwrap();
+            let parsed: ActionType = s.parse().unwrap();
             assert_eq!(action, parsed);
         }
     }

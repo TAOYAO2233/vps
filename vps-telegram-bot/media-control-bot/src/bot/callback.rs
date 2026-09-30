@@ -29,7 +29,6 @@ use crate::actions;
 use crate::config::Config;
 use crate::core::state::{ActionType, SharedState};
 use crate::core::PermissionGuard;
-use crate::errors::AppError;
 use crate::storage::path::PathGuard;
 use crate::ui::menu::render_main_menu;
 use crate::ui::selector::render_file_selector;
@@ -132,8 +131,7 @@ async fn dispatch_callback(
 
     // ── init_{action} ──────────────────────────────────────────────────────────
     if let Some(action_str) = data.strip_prefix("init_") {
-        let action = ActionType::from_str(action_str)
-            .ok_or_else(|| AppError::invalid_argument(format!("Unknown action: {action_str}")))?;
+        let action = action_str.parse::<ActionType>()?;
         {
             let mut s = state.write().await;
             s.current_dir = config.base_dir.clone();
@@ -150,10 +148,7 @@ async fn dispatch_callback(
         let parts: Vec<&str> = rest.rsplitn(2, '_').collect();
         if parts.len() == 2 {
             let page: usize = parts[0].parse().unwrap_or(0);
-            let action_str = parts[1];
-            let action = ActionType::from_str(action_str).ok_or_else(|| {
-                AppError::invalid_argument(format!("Unknown action: {action_str}"))
-            })?;
+            let action = parts[1].parse::<ActionType>()?;
             bot.answer_callback_query(&q.id).await?;
             render_file_selector(bot, msg, &state, &config, &action, page).await?;
         }
@@ -165,10 +160,7 @@ async fn dispatch_callback(
         let parts: Vec<&str> = rest.rsplitn(2, '_').collect();
         if parts.len() == 2 {
             let idx: usize = parts[0].parse().unwrap_or(0);
-            let action_str = parts[1];
-            let action = ActionType::from_str(action_str).ok_or_else(|| {
-                AppError::invalid_argument(format!("Unknown action: {action_str}"))
-            })?;
+            let action = parts[1].parse::<ActionType>()?;
 
             let item_name = {
                 let s = state.read().await;
@@ -195,8 +187,7 @@ async fn dispatch_callback(
 
     // ── updir_{action} ─────────────────────────────────────────────────────────
     if let Some(action_str) = data.strip_prefix("updir_") {
-        let action = ActionType::from_str(action_str)
-            .ok_or_else(|| AppError::invalid_argument(format!("Unknown action: {action_str}")))?;
+        let action = action_str.parse::<ActionType>()?;
 
         {
             let mut s = state.write().await;
@@ -224,10 +215,7 @@ async fn dispatch_callback(
         if parts.len() == 3 {
             let page: usize = parts[0].parse().unwrap_or(0);
             let idx: usize = parts[1].parse().unwrap_or(0);
-            let action_str = parts[2];
-            let action = ActionType::from_str(action_str).ok_or_else(|| {
-                AppError::invalid_argument(format!("Unknown action: {action_str}"))
-            })?;
+            let action = parts[2].parse::<ActionType>()?;
 
             let file_path = {
                 let s = state.read().await;
@@ -260,10 +248,7 @@ async fn dispatch_callback(
         let parts: Vec<&str> = rest.rsplitn(2, '_').collect();
         if parts.len() == 2 {
             let idx: usize = parts[0].parse().unwrap_or(0);
-            let action_str = parts[1];
-            let action = ActionType::from_str(action_str).ok_or_else(|| {
-                AppError::invalid_argument(format!("Unknown action: {action_str}"))
-            })?;
+            let action = parts[1].parse::<ActionType>()?;
 
             let file_path = {
                 let s = state.read().await;
@@ -278,7 +263,7 @@ async fn dispatch_callback(
 
                 match action {
                     ActionType::Browse => {
-                        actions::browse::action_browse(bot, q, safe_path).await?;
+                        actions::browse::action_browse(bot, q, msg, safe_path).await?;
                     }
                     ActionType::Stream => {
                         actions::stream::start_stream(bot, msg, state, config, safe_path).await?;
@@ -302,8 +287,7 @@ async fn dispatch_callback(
 
     // ── execbatch_{action} ─────────────────────────────────────────────────────
     if let Some(action_str) = data.strip_prefix("execbatch_") {
-        let action = ActionType::from_str(action_str)
-            .ok_or_else(|| AppError::invalid_argument(format!("Unknown action: {action_str}")))?;
+        let action = action_str.parse::<ActionType>()?;
 
         let selected_files: Vec<PathBuf> = {
             let s = state.read().await;

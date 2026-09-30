@@ -228,32 +228,35 @@ async fn do_upload(
         let mut last_percent = -1.0_f64;
 
         while let Some(percent) = progress_rx.recv().await {
+            // 节流：进度回调可能每个读块触发一次（每秒成百上千次），
+            // 因此全局状态写入与 Telegram 刷新都必须限制在同一节流窗口内。
+            let should_emit = (percent - last_percent >= PROGRESS_UPDATE_THRESHOLD
+                && last_update.elapsed() >= PROGRESS_UPDATE_INTERVAL)
+                || percent >= 100.0;
+            if !should_emit {
+                continue;
+            }
+
             // 更新全局状态（使 /uploads 指令可见）
             update_task_status(&state_bg, &task_id_bg, "上传中", Some(percent)).await;
 
-            // 节流刷新 Telegram 界面消息
-            if (percent - last_percent >= PROGRESS_UPDATE_THRESHOLD
-                && last_update.elapsed() >= PROGRESS_UPDATE_INTERVAL)
-                || percent >= 100.0
-            {
-                let bar = progress_bar.render(percent);
-                let text = format!(
-                    "📤 <b>YouTube 上传中</b>:\n<code>{}</code>\n\n<code>{}</code>\n\n发送 /stop 取消任务",
-                    escape_html(&filename_bg),
-                    bar
-                );
-                let _ = bot_bg
-                    .edit_message_text(chat_id, msg_id, text)
-                    .parse_mode(ParseMode::Html)
-                    .await;
-                last_update = Instant::now();
-                last_percent = percent.floor();
-            }
+            let bar = progress_bar.render(percent);
+            let text = format!(
+                "📤 <b>YouTube 上传中</b>:\n<code>{}</code>\n\n<code>{}</code>\n\n发送 /stop 取消任务",
+                escape_html(&filename_bg),
+                bar
+            );
+            let _ = bot_bg
+                .edit_message_text(chat_id, msg_id, text)
+                .parse_mode(ParseMode::Html)
+                .await;
+            last_update = Instant::now();
+            last_percent = percent.floor();
         }
     });
 
     // 执行上传并传入进度回调与取消检测闭包
-    let uploader = YoutubeUploader::new(config.token_file.clone(), config.youtube_chunk_bytes());
+    let uploader = YoutubeUploader::new(config.token_file.clone());
     update_task_status(&state, &task_id, "上传中", Some(0.0)).await;
 
     // 💡 显式 clone 供闭包与 select! 使用，保留原 cancel_rx 在后续使用

@@ -22,11 +22,21 @@ use tracing::warn;
 /// 格式化后的大小字符串，如 `"123.45MB"` 或 `"1.23GB"`。
 #[must_use]
 pub fn format_file_size(path: &Path) -> String {
-    let size_bytes = match std::fs::metadata(path) {
-        Ok(m) => m.len(),
-        Err(_) => return "0.00MB".to_string(),
-    };
+    match std::fs::metadata(path) {
+        Ok(m) => format_file_size_bytes(m.len()),
+        Err(_) => "0.00MB".to_string(),
+    }
+}
 
+/// 格式化字节数为人类可读字符串（小于 1GB 显示 MB，否则显示 GB）。
+///
+/// 目录扫描结果已携带文件大小，使用本函数可避免重复的 `metadata` 系统调用。
+///
+/// # Arguments
+///
+/// * `size_bytes` - 文件大小（字节）
+#[must_use]
+pub fn format_file_size_bytes(size_bytes: u64) -> String {
     let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
     if size_mb >= 1024.0 {
         let size_gb = size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -94,6 +104,13 @@ mod tests {
     fn test_format_file_size_nonexistent() {
         let size = format_file_size(Path::new("/nonexistent/file.mp4"));
         assert_eq!(size, "0.00MB");
+    }
+
+    #[test]
+    fn test_format_file_size_bytes() {
+        assert_eq!(format_file_size_bytes(0), "0.00MB");
+        assert_eq!(format_file_size_bytes(1024 * 1024), "1.00MB");
+        assert_eq!(format_file_size_bytes(1024 * 1024 * 1024), "1.00GB");
     }
 
     #[test]
