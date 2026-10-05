@@ -3,6 +3,9 @@
 # ==============================================================================
 # 脚本名称: sshkey_manager.sh
 # 描述: 具备保姆级引导、防重复添加、智能端口修改与防火墙联动的 SSH 密钥管理脚本
+# 改进: 修复 $NF 大小写 Bug、sshd 配置预校验与回滚、安全临时文件、公钥格式校验、
+#       禁密码前检查公钥、SELinux 端口放行、云安全组提示、删除公钥功能、
+#       sshd_config 自动备份、curl 超时与备用 IP 查询源、新密钥覆盖保护
 # ==============================================================================
 
 # 定义全局色彩变量
@@ -12,7 +15,11 @@ gl_bai='\033[0m'
 gl_kjlan='\033[96m'
 gl_hong='\033[31m'
 
-# 初始化环境函数
+# ==============================================================================
+# 工具函数
+# ==============================================================================
+
+# 初始化 ~/.ssh 目录与 authorized_keys 文件
 init_env() {
     mkdir -p "${HOME}/.ssh"
     chmod 700 "${HOME}/.ssh"
@@ -20,15 +27,18 @@ init_env() {
     chmod 600 "${HOME}/.ssh/authorized_keys"
 }
 
-# 获取系统 IP 地址函数
+# 获取系统公网 IP（带超时与备用源）
 ip_address() {
-    ipv4_address=$(curl -s https://ipinfo.io/ip && echo)
+    ipv4_address=$(curl -s --connect-timeout 3 -m 8 https://ipinfo.io/ip 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$ipv4_address" ]; then
+        ipv4_address=$(curl -s --connect-timeout 3 -m 8 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+    fi
     if [ -z "$ipv4_address" ]; then
         ipv4_address=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K[^ ]+' || hostname -I | awk '{print $1}')
     fi
 }
 
-# 辅助函数：操作完成暂停提示
+# 操作完成后暂停提示
 break_end() {
     echo ""
     echo -e "${gl_lv}操作完成${gl_bai}"
@@ -38,52 +48,148 @@ break_end() {
     clear
 }
 
-# 智能去重添加公钥的核心函数
+# 重启 SSH 服务（自动兼容 systemctl / service）
+restart_sshd() {
+    if command -v systemctl &>/dev/null; then
+        sudo systemctl restart ssh 2>/dev/null || sudo systemctl restart sshd
+    else
+        sudo service ssh restart 2>/dev/null || sudo service sshd restart
+    fi
+}
+
+# 对 sshd_config 进行预校验，失败则自动回滚
+# 用法: safe_reload_sshd <backup_file>
+safe_reload_sshd() {
+    local backup_file="$1"
+    echo "正在校验 sshd 配置文件语法..."
+    if ! sudo sshd -t 2>/dev/null; then
+        echo -e "${gl_hong}[错误] sshd 配置语法检测失败！正在自动回滚...${gl_bai}"
+        sudo cp "$backup_file" /etc/ssh/sshd_config
+        echo -e "${gl_lv}[恢复] 已回滚至原始配置，SSH 服务未被重启，当前连接安全。${gl_bai}"
+        return 1
+    fi
+    restart_sshd
+    return 0
+}
+
+# 备份 sshd_config，返回备份文件路径
+backup_sshd_config() {
+    local bak="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
+    sudo cp /etc/ssh/sshd_config "$bak"
+    echo "$bak"
+}
+
+# ==============================================================================
+# 公钥核心功能
+# ==============================================================================
+
+# 智能去重添加公钥（使用 ssh-keygen -l 进行合法性校验）
 safe_add_keys() {
     local key_source_file="$1"
     local added_count=0
-    
-    # 自动备份
-    cp "${HOME}/.ssh/authorized_keys" "${HOME}/.ssh/authorized_keys.bak"
-    echo -e "\n${gl_lv}[提示] 已备份原有 authorized_keys 文件至 authorized_keys.bak${gl_bai}"
+    local invalid_count=0
 
-    # 逐行读取下载下来的临时公钥，防止重复追加
+    # 自动备份原有 authorized_keys
+    local auth_bak="${HOME}/.ssh/authorized_keys.bak.$(date +%Y%m%d%H%M%S)"
+    cp "${HOME}/.ssh/authorized_keys" "$auth_bak"
+    echo -e "\n${gl_lv}[提示] 已备份原有 authorized_keys 至 $(basename "$auth_bak")${gl_bai}"
+
+    # 逐行读取，防止重复追加
     while IFS= read -r line || [ -n "$line" ]; do
         # 跳过空行或注释行
         [[ -z "${line// }" || "$line" =~ ^# ]] && continue
-        
-        # 提取公钥的关键特征部分进行比对
-        local key_fingerprint=$(echo "$line" | awk '{print $2}')
+
+        # 使用安全临时文件校验单条公钥格式
+        local tmp_check
+        tmp_check=$(mktemp)
+        echo "$line" > "$tmp_check"
+        if ! ssh-keygen -l -f "$tmp_check" &>/dev/null; then
+            echo -e "${gl_huang}[跳过] 非法公钥格式，已忽略: ${line:0:40}...${gl_bai}"
+            rm -f "$tmp_check"
+            invalid_count=$((invalid_count + 1))
+            continue
+        fi
+        rm -f "$tmp_check"
+
+        # 提取 Base64 公钥体作为去重指纹（兼容带 options 前缀的公钥格式）
+        # ssh-ed25519/ecdsa/rsa 的 Base64 体是最长的字段，匹配 AAAA 开头特征
+        local key_fingerprint
+        key_fingerprint=$(echo "$line" | grep -oP 'AAAA[A-Za-z0-9+/=]+')
         if [ -z "$key_fingerprint" ]; then
             key_fingerprint="$line"
         fi
 
-        if grep -q "$key_fingerprint" "${HOME}/.ssh/authorized_keys"; then
+        if grep -qF "$key_fingerprint" "${HOME}/.ssh/authorized_keys"; then
+            echo -e "${gl_huang}[跳过] 公钥已存在，不重复添加。${gl_bai}"
             continue
-        else
-            echo "$line" >> "${HOME}/.ssh/authorized_keys"
-            added_count=$((added_count + 1))
         fi
+
+        echo "$line" >> "${HOME}/.ssh/authorized_keys"
+        added_count=$((added_count + 1))
     done < "$key_source_file"
 
+    chmod 600 "${HOME}/.ssh/authorized_keys"
+
     if [ "$added_count" -gt 0 ]; then
-        chmod 600 "${HOME}/.ssh/authorized_keys"
-        echo -e "${gl_lv}成功添加了 $added_count 个新的公钥！${gl_bai}"
+        echo -e "${gl_lv}成功添加了 $added_count 个新公钥！${gl_bai}"
     else
         echo -e "${gl_huang}没有新的公钥需要添加（可能已全部存在）${gl_bai}"
     fi
+    [ "$invalid_count" -gt 0 ] && echo -e "${gl_huang}共跳过 $invalid_count 条非法格式的公钥。${gl_bai}"
 }
 
-# 密钥管理核心功能菜单
+# 删除指定公钥（交互式编号选择）
+delete_key() {
+    local auth_file="${HOME}/.ssh/authorized_keys"
+    if [ ! -s "$auth_file" ]; then
+        echo -e "${gl_huang}当前没有任何授权公钥，无需删除。${gl_bai}"
+        return
+    fi
+
+    echo -e "=== ${gl_kjlan}当前已授信公钥列表${gl_bai} ==="
+    local idx=0
+    local keys=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ -z "${line// }" || "$line" =~ ^# ]] && continue
+        idx=$((idx + 1))
+        keys+=("$line")
+        # 截断显示，避免终端折行
+        local display="${line:0:80}"
+        echo -e "  ${gl_huang}[$idx]${gl_bai} ${display}..."
+    done < "$auth_file"
+
+    echo ""
+    read -e -p "请输入要删除的公钥编号 (输入 0 取消): " del_idx
+
+    if [[ "$del_idx" =~ ^[0-9]+$ ]] && [ "$del_idx" -ge 1 ] && [ "$del_idx" -le "${#keys[@]}" ]; then
+        local target_key="${keys[$((del_idx - 1))]}"
+        # 先备份
+        local bak="${auth_file}.bak.$(date +%Y%m%d%H%M%S)"
+        cp "$auth_file" "$bak"
+        # 用 grep -vF 精确删除目标行
+        grep -vF "$target_key" "$auth_file" > "${auth_file}.tmp" && mv "${auth_file}.tmp" "$auth_file"
+        chmod 600 "$auth_file"
+        echo -e "${gl_lv}已成功删除第 $del_idx 条公钥，原文件已备份至 $(basename "$bak")。${gl_bai}"
+    elif [ "$del_idx" = "0" ]; then
+        echo "取消操作。"
+    else
+        echo -e "${gl_hong}无效编号，操作已取消。${gl_bai}"
+    fi
+}
+
+# ==============================================================================
+# 密钥管理主菜单
+# ==============================================================================
 sshkey_panel() {
     while true; do
         clear
         echo -e "=== ${gl_kjlan}SSH Key 密钥管理面板${gl_bai} ==="
-        echo -e "${gl_huang}将会生成密钥对，更安全的方式SSH登录${gl_bai}"
+        echo -e "${gl_huang}将会生成密钥对，更安全的方式 SSH 登录${gl_bai}"
         echo "--------------------------------------------------------"
         echo -e "1. 生成新密钥对                     2. 手动输入已有公钥"
         echo -e "3. 从 GitHub 导入已有公钥           4. 从 URL 导入已有公钥"
-        echo -e "5. 编辑公钥文件 (authorized_keys)   6. 查看本机密钥"
+        echo -e "5. 编辑公钥文件 (authorized_keys)   6. 查看已授信公钥"
+        echo -e "d. ${gl_hong}删除指定公钥${gl_bai}"
         echo "--------------------------------------------------------"
         echo -e "7. ${gl_hong}关闭 SSH 密码登录 (仅限密钥)${gl_bai}     8. 开启 SSH 密码登录"
         echo -e "9. ${gl_lv}修改 SSH 登录端口${gl_bai}"
@@ -92,40 +198,67 @@ sshkey_panel() {
         echo "--------------------------------------------------------"
         read -e -p "请输入你的选择: " choice
         case $choice in
+
+            # ------------------------------------------------------------------
+            # 1. 生成新密钥对
+            # ------------------------------------------------------------------
             1)
                 clear
                 init_env
+                local key_file="${HOME}/.ssh/sshkey"
+
+                # 检测是否已存在，防止无声覆盖
+                if [ -f "$key_file" ]; then
+                    echo -e "${gl_huang}[警告] 已存在密钥文件: $key_file${gl_bai}"
+                    read -e -p "是否覆盖原有密钥？覆盖后旧私钥将无法恢复！(y/n): " overwrite_confirm
+                    if [ "$overwrite_confirm" != "y" ] && [ "$overwrite_confirm" != "Y" ]; then
+                        echo "已取消，保留原有密钥。"
+                        break_end
+                        continue
+                    fi
+                    rm -f "$key_file" "${key_file}.pub"
+                fi
+
                 echo "正在生成高安全性 Ed25519 密钥对..."
-                ssh-keygen -t ed25519 -C "sshkey_manager@local" -f "${HOME}/.ssh/sshkey" -N ""
-                cat "${HOME}/.ssh/sshkey.pub" >> "${HOME}/.ssh/authorized_keys"
-                chmod 600 "${HOME}/.ssh/authorized_keys"
+                ssh-keygen -t ed25519 -C "sshkey_manager@local" -f "$key_file" -N ""
+
+                # 将新生成的公钥加入 authorized_keys（走去重逻辑）
+                safe_add_keys "${key_file}.pub"
+
                 ip_address
                 echo ""
                 echo -e "🎉 ${gl_lv}私钥信息已成功生成！${gl_bai}"
                 echo -e "务必在下方复制出全部内容并保存，可本地新建文件命名为: ${gl_huang}${ipv4_address}_ssh.key${gl_bai}"
                 echo "此文件将作为今后 SSH 登录此服务器的唯一凭证。"
                 echo "------------------------------------------------------------------------"
-                cat "${HOME}/.ssh/sshkey"
+                cat "$key_file"
                 echo "------------------------------------------------------------------------"
                 break_end
                 ;;
-                
+
+            # ------------------------------------------------------------------
+            # 2. 手动输入公钥
+            # ------------------------------------------------------------------
             2)
                 clear
                 init_env
                 echo "请输入您已有的 SSH 公钥 (以 ssh-rsa 或 ssh-ed25519 等开头):"
                 read -e -p "> " custom_pubkey
                 if [ -n "$custom_pubkey" ]; then
-                    # 写入临时文件，走安全去重逻辑
-                    echo "$custom_pubkey" > /tmp/custom_key.tmp
-                    safe_add_keys /tmp/custom_key.tmp
-                    rm -f /tmp/custom_key.tmp
+                    local tmp_custom
+                    tmp_custom=$(mktemp)
+                    trap 'rm -f "$tmp_custom"' RETURN
+                    echo "$custom_pubkey" > "$tmp_custom"
+                    safe_add_keys "$tmp_custom"
                 else
                     echo -e "${gl_hong}输入为空，取消操作。${gl_bai}"
                 fi
                 break_end
                 ;;
-                
+
+            # ------------------------------------------------------------------
+            # 3. 从 GitHub 导入公钥
+            # ------------------------------------------------------------------
             3)
                 clear
                 init_env
@@ -140,25 +273,30 @@ sshkey_panel() {
                 echo "  https://github.com/您的用户名.keys"
                 echo "------------------------------------------------------------------------"
                 read -e -p "请输入您的 GitHub 用户名（username，不含 @）: " github_user
-                
+
                 if [ -n "$github_user" ]; then
                     echo -e "\n此脚本将从远程 URL 拉取 SSH 公钥，并添加到 ${HOME}/.ssh/authorized_keys"
                     echo -e "远程公钥地址：\n  ${gl_kjlan}https://github.com/${github_user}.keys${gl_bai}"
-                    
-                    # 获取远程密钥到临时文件
-                    curl -sSf "https://github.com/${github_user}.keys" > /tmp/gh_keys.tmp 2>/dev/null
-                    if [ $? -eq 0 ] && [ -s /tmp/gh_keys.tmp ]; then
-                        safe_add_keys /tmp/gh_keys.tmp
+
+                    local tmp_gh
+                    tmp_gh=$(mktemp)
+                    trap 'rm -f "$tmp_gh"' RETURN
+                    curl -sSf --connect-timeout 5 -m 15 \
+                        "https://github.com/${github_user}.keys" > "$tmp_gh" 2>/dev/null
+                    if [ $? -eq 0 ] && [ -s "$tmp_gh" ]; then
+                        safe_add_keys "$tmp_gh"
                     else
                         echo -e "${gl_hong}获取公钥失败！请检查用户名是否正确，或该 GitHub 账户内是否未添加任何公钥。${gl_bai}"
                     fi
-                    rm -f /tmp/gh_keys.tmp
                 else
                     echo -e "${gl_hong}用户名不能为空。${gl_bai}"
                 fi
                 break_end
                 ;;
 
+            # ------------------------------------------------------------------
+            # 4. 从 URL 导入公钥
+            # ------------------------------------------------------------------
             4)
                 clear
                 init_env
@@ -166,25 +304,30 @@ sshkey_panel() {
                 if [ -n "$pubkey_url" ]; then
                     echo -e "\n此脚本将从远程 URL 拉取 SSH 公钥，并添加到 ${HOME}/.ssh/authorized_keys"
                     echo -e "远程公钥地址：\n  ${gl_kjlan}${pubkey_url}${gl_bai}"
-                    
-                    curl -sSf "$pubkey_url" > /tmp/url_keys.tmp 2>/dev/null
-                    if [ $? -eq 0 ] && [ -s /tmp/url_keys.tmp ]; then
-                        safe_add_keys /tmp/url_keys.tmp
+
+                    local tmp_url
+                    tmp_url=$(mktemp)
+                    trap 'rm -f "$tmp_url"' RETURN
+                    curl -sSf --connect-timeout 5 -m 15 "$pubkey_url" > "$tmp_url" 2>/dev/null
+                    if [ $? -eq 0 ] && [ -s "$tmp_url" ]; then
+                        safe_add_keys "$tmp_url"
                     else
                         echo -e "${gl_hong}下载失败，请检查 URL 是否有效。${gl_bai}"
                     fi
-                    rm -f /tmp/url_keys.tmp
                 else
                     echo -e "${gl_hong}URL 不能为空。${gl_bai}"
                 fi
                 break_end
                 ;;
 
+            # ------------------------------------------------------------------
+            # 5. 编辑 authorized_keys
+            # ------------------------------------------------------------------
             5)
                 clear
                 init_env
-                echo "即将打开 nano 编辑器编辑 authorized_keys 文件..."
-                echo "提示：编辑完成后按 Ctrl+O 保存，按 Ctrl+X 退出。"
+                echo "即将打开编辑器编辑 authorized_keys 文件..."
+                echo "提示：编辑完成后按 Ctrl+O 保存，按 Ctrl+X 退出（nano）。"
                 sleep 2
                 if command -v nano &>/dev/null; then
                     nano "${HOME}/.ssh/authorized_keys"
@@ -194,6 +337,9 @@ sshkey_panel() {
                 break_end
                 ;;
 
+            # ------------------------------------------------------------------
+            # 6. 查看已授信公钥
+            # ------------------------------------------------------------------
             6)
                 clear
                 echo -e "=== ${gl_kjlan}当前服务器已授信的公钥列表 (.ssh/authorized_keys)${gl_bai} ==="
@@ -206,80 +352,145 @@ sshkey_panel() {
                 echo "------------------------------------------------------------------------"
                 break_end
                 ;;
-                
+
+            # ------------------------------------------------------------------
+            # d. 删除指定公钥
+            # ------------------------------------------------------------------
+            d|D)
+                clear
+                init_env
+                delete_key
+                break_end
+                ;;
+
+            # ------------------------------------------------------------------
+            # 7. 关闭 SSH 密码登录
+            # ------------------------------------------------------------------
             7)
                 clear
                 echo -e "${gl_huang}警告：在关闭密码登录之前，请确保你已经成功配置并测试过密钥登录！${gl_bai}"
+
+                # 安全检查：确保 authorized_keys 中存在有效公钥
+                if [ ! -s "${HOME}/.ssh/authorized_keys" ]; then
+                    echo -e "${gl_hong}[中止] 检测到 authorized_keys 为空！${gl_bai}"
+                    echo "请先通过选项 1-4 添加至少一个公钥，再执行此操作，否则将被锁在服务器外！"
+                    break_end
+                    continue
+                fi
+
                 read -e -p "你确定要禁用密码登录，切换为纯密钥登录吗？(y/n): " confirm
                 if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
                     if [ -f /etc/ssh/sshd_config ]; then
+                        local bak7
+                        bak7=$(backup_sshd_config)
+                        echo -e "${gl_lv}[备份] sshd_config 已备份至 $bak7${gl_bai}"
+
                         sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
                         sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
                         if [ -d /etc/ssh/sshd_config.d ]; then
-                            sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config.d/* 2>/dev/null
+                            sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' \
+                                /etc/ssh/sshd_config.d/*.conf 2>/dev/null
                         fi
-                        if command -v systemctl &>/dev/null; then
-                            sudo systemctl restart ssh || sudo systemctl restart sshd
-                        else
-                            sudo service ssh restart || sudo service sshd restart
+
+                        if safe_reload_sshd "$bak7"; then
+                            echo -e "${gl_lv}SSH 密码登录已禁用，现已仅允许密钥验证。${gl_bai}"
                         fi
-                        echo -e "${gl_lv}SSH 密码登录已禁用，现已仅允许密钥验证。${gl_bai}"
                     else
                         echo "未找到 /etc/ssh/sshd_config 配置文件。"
                     fi
                 fi
                 break_end
                 ;;
-                
+
+            # ------------------------------------------------------------------
+            # 8. 开启 SSH 密码登录
+            # ------------------------------------------------------------------
             8)
                 clear
                 if [ -f /etc/ssh/sshd_config ]; then
+                    local bak8
+                    bak8=$(backup_sshd_config)
+                    echo -e "${gl_lv}[备份] sshd_config 已备份至 $bak8${gl_bai}"
+
                     sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
                     if [ -d /etc/ssh/sshd_config.d ]; then
-                        sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config.d/* 2>/dev/null
+                        sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' \
+                            /etc/ssh/sshd_config.d/*.conf 2>/dev/null
                     fi
-                    if command -v systemctl &>/dev/null; then
-                        sudo systemctl restart ssh || sudo systemctl restart sshd
-                    else
-                        sudo service ssh restart || sudo service sshd restart
+
+                    if safe_reload_sshd "$bak8"; then
+                        echo -e "${gl_lv}SSH 密码登录已重新开启。${gl_bai}"
                     fi
-                    echo -e "${gl_lv}SSH 密码登录已重新开启。${gl_bai}"
                 else
                     echo "未找到 /etc/ssh/sshd_config 配置文件。"
                 fi
                 break_end
                 ;;
 
+            # ------------------------------------------------------------------
+            # 9. 修改 SSH 端口
+            # ------------------------------------------------------------------
             9)
                 clear
-                current_port=$(ss -tlnp | grep -E 'sshd|ssh' | awk '{print $4}' | awk -F':' '{print $nf}' | sed 's/ //g' | tr '\n' ' ' | awk '{print $1}')
-                [ -z "$current_port" ] && current_port=$(grep -E "^Port " /etc/ssh/sshd_config | awk '{print $2}')
+                # 修复原 Bug：$NF 必须大写，否则 awk 输出整行
+                local current_port
+                current_port=$(ss -tlnp | grep -E 'sshd|ssh' \
+                    | awk '{print $4}' | awk -F':' '{print $NF}' \
+                    | tr -d ' ' | head -n1)
+                [ -z "$current_port" ] && \
+                    current_port=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
                 [ -z "$current_port" ] && current_port="22"
 
                 echo -e "当前 SSH 服务的运行端口为: ${gl_huang}${current_port}${gl_bai}"
                 read -e -p "请输入你想要设置的新 SSH 端口 (建议范围 1024-65535): " new_port
-                
+
                 if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
                     echo "正在尝试将端口修改为 $new_port ..."
-                    
+
+                    # 防火墙放行：ufw
                     if command -v ufw &>/dev/null && sudo ufw status | grep -q "Status: active"; then
                         echo "检测到 UFW 防火墙处于激活状态，正在放行端口 $new_port/tcp ..."
                         sudo ufw allow "$new_port"/tcp
-                    elif command -v firewall-cmd &>/dev/null && sudo firewall-cmd --state &>/dev/null; then
+                    fi
+
+                    # 防火墙放行：firewalld
+                    if command -v firewall-cmd &>/dev/null && sudo firewall-cmd --state &>/dev/null; then
                         echo "检测到 Firewalld 防火墙处于激活状态，正在放行端口 $new_port/tcp ..."
                         sudo firewall-cmd --permanent --add-port="$new_port"/tcp
                         sudo firewall-cmd --reload
                     fi
 
-                    if [ -f /etc/ssh/sshd_config ]; then
-                        sudo sed -i 's/^#\?Port.*/Port '"$new_port"'/' /etc/ssh/sshd_config
-                        if command -v systemctl &>/dev/null; then
-                            sudo systemctl restart ssh || sudo systemctl restart sshd
+                    # SELinux 端口放行（CentOS/Rocky/RHEL）
+                    if command -v getenforce &>/dev/null && [ "$(getenforce)" = "Enforcing" ]; then
+                        echo "检测到 SELinux 处于 Enforcing 模式，正在为 SSH 放行端口 $new_port ..."
+                        if command -v semanage &>/dev/null; then
+                            sudo semanage port -a -t ssh_port_t -p tcp "$new_port" 2>/dev/null \
+                                || sudo semanage port -m -t ssh_port_t -p tcp "$new_port" 2>/dev/null
                         else
-                            sudo service ssh restart || sudo service sshd restart
+                            echo -e "${gl_huang}[提示] 未找到 semanage，请手动执行：${gl_bai}"
+                            echo "  sudo semanage port -a -t ssh_port_t -p tcp $new_port"
                         fi
-                        echo -e "${gl_lv}SSH 端口已成功修改为 $new_port ！${gl_bai}"
-                        echo -e "${gl_huang}请注意：为了防止连接中断，请开一个新终端测试新端口连接，确定成功前千万别关闭当前窗口！${gl_bai}"
+                    fi
+
+                    if [ -f /etc/ssh/sshd_config ]; then
+                        local bak9
+                        bak9=$(backup_sshd_config)
+                        echo -e "${gl_lv}[备份] sshd_config 已备份至 $bak9${gl_bai}"
+
+                        sudo sed -i "s/^#\?Port.*/Port $new_port/" /etc/ssh/sshd_config
+                        # 同步更新 drop-in 目录中的 Port 声明（现代 Debian/Ubuntu 兼容）
+                        if [ -d /etc/ssh/sshd_config.d ]; then
+                            sudo sed -i "s/^Port .*/Port $new_port/" \
+                                /etc/ssh/sshd_config.d/*.conf 2>/dev/null
+                        fi
+
+                        if safe_reload_sshd "$bak9"; then
+                            echo -e "${gl_lv}SSH 端口已成功修改为 $new_port！${gl_bai}"
+                            echo ""
+                            echo -e "${gl_huang}⚠️  重要提示：${gl_bai}"
+                            echo -e "  1. 请在新终端中使用 ssh -p $new_port user@<IP> 测试连接，确认成功后再关闭当前窗口！"
+                            echo -e "  2. ${gl_hong}如使用阿里云、腾讯云、AWS、甲骨文等云平台，必须前往控制台「安全组」放行 TCP $new_port 端口，否则仍无法连接！${gl_bai}"
+                        fi
                     else
                         echo "未找到 /etc/ssh/sshd_config 配置文件。"
                     fi
@@ -288,13 +499,16 @@ sshkey_panel() {
                 fi
                 break_end
                 ;;
-                
+
+            # ------------------------------------------------------------------
+            # 0. 退出
+            # ------------------------------------------------------------------
             0)
                 clear
                 echo "感谢使用！"
                 exit 0
                 ;;
-                
+
             *)
                 echo "无效的选择，请重新输入。"
                 sleep 1
