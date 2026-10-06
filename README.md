@@ -84,23 +84,24 @@ vps/
 │       ├── 多台vps日志推送.md          # 基于 rsyslog UDP 的多节点集中日志上报方案
 │       └── README.md                   # 功能特性说明
 └── 常用VPS .sh文件/                    # 🐚 常用 Shell 运维与视频脚本集
-    ├── sh-files/
+    ├── system/                         # 🛡️ 系统安全与运维审计
+    │   ├── sshkey_manager.sh           # 企业级 SSH 密钥与端口安全配置（带配置校验与防火墙联动）
+    │   ├── lscolorsetup.sh             # 终端 ls 配色高亮与别名一键配置 (支持 Bash/Zsh)
+    │   ├── linuxcheck.sh               # Linux 服务器安全基线检查与应急响应脚本
+    │   └── monitor_xrayr.sh            # XrayR 访问日志实时监控与 Telegram 批量告警
+    ├── media/                          # 🎬 视频与多媒体自动化处理
     │   ├── viedo_master.sh             # Video Master v8.0: 交互式视频合并/转码/智能命名大师
+    │   ├── stream_videos_with_interval.sh # 交互式/循环 RTMP 直播推流工具（支持元数据缓存与翻页）
     │   ├── convert_flv_copy_mp4.sh     # 高并发极速流复制无损 FLV 封装转 MP4
     │   ├── convert_flv_to_mp4.sh       # 多任务并发重编码 FLV -> MP4
-    │   ├── stream_videos_with_interval.sh # 交互式/循环 RTMP 直播推流工具（支持元数据缓存与翻页）
     │   ├── download_video.sh           # yt-dlp 交互式下载器（带历史目录记忆与画质选择）
-    │   ├── delete_old_files.sh         # 多目录定时批量清理过期文件
-    │   ├── sshkey_manager.sh           # 企业级 SSH 密钥与端口安全配置（带配置校验与防火墙联动）
-    │   ├── linuxcheck.sh               # Linux 服务器安全基线检查与应急响应脚本
-    │   ├── monitor_xrayr.sh            # XrayR 访问日志实时监控与 Telegram 批量告警
+    │   └── delete_old_files.sh         # 多目录定时批量清理过期文件
+    ├── network/                        # 📲 Telegram 数据与网络代理工具
     │   ├── tdl_commands.sh             # Telegram TDL 消息历史/媒体按时段批量导出
     │   ├── tdl_forward_commands.sh     # Telegram TDL 批量自动化转发
-    │   ├── v2bx/
-    │   │   └── install.sh              # V2bX 多协议节点服务一键安装
-    │   └── 使用方法.md                 # 脚本使用速查表
-    └── vps-sh/
-        └── lscolorsetup.sh             # 终端 ls 配色高亮与别名一键配置 (支持 Bash/Zsh)
+    │   └── v2bx/
+    │       └── install.sh              # V2bX 多协议节点服务一键安装
+    └── 说明.md                         # 常用 VPS 脚本说明文档与使用指南
 ```
 
 ---
@@ -177,12 +178,12 @@ vps/
 
 | 脚本文件 | 说明 | 核心亮点 |
 | :--- | :--- | :--- |
-| [`viedo_master.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/viedo_master.sh) | **Video Master Tool v8.0** | 交互式终端菜单，支持多段视频拼接、日期+标题智能命名提取、格式转换与时间戳修复。 |
-| [`stream_videos_with_interval.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/stream_videos_with_interval.sh) | **RTMP 轮播推流工具** | 分页选择视频、元数据本地缓存加速、支持自定义间隔等待与无人值守循环直播推流。 |
-| [`convert_flv_copy_mp4.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/convert_flv_copy_mp4.sh) | **FLV 极速流复制转 MP4** | 采用 `-c copy` 极速封装，支持设置最大并发任务数 `MAX_JOBS`，不消耗 CPU 算力。 |
-| [`convert_flv_to_mp4.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/convert_flv_to_mp4.sh) | **FLV 重编码转 MP4** | 全量重编码转码方案，带任务日志记录与并发队列控制。 |
-| [`download_video.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/download_video.sh) | **yt-dlp 增强下载器** | 交互式命令行，自动持久化记录上次下载路径，支持画质选择与播放列表解析。 |
-| [`delete_old_files.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/delete_old_files.sh) | **过期录播与文件清理** | 遍历多个目标路径，自动检索并批量清除超过指定天数的文件，释放磁盘空间。 |
+| [`viedo_master.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/media/viedo_master.sh) | **Video Master Tool v8.0** | 交互式终端菜单，支持多段视频拼接、日期+标题智能命名提取、格式转换与时间戳修复。 |
+| [`stream_videos_with_interval.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/media/stream_videos_with_interval.sh) | **RTMP 轮播推流工具** | 分页选择视频、元数据本地缓存加速、支持自定义间隔等待与无人值守循环直播推流。 |
+| [`convert_flv_copy_mp4.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/media/convert_flv_copy_mp4.sh) | **FLV 极速流复制转 MP4** | 采用 `-c copy` 极速封装，支持设置最大并发任务数 `MAX_JOBS`，不消耗 CPU 算力。 |
+| [`convert_flv_to_mp4.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/media/convert_flv_to_mp4.sh) | **FLV 重编码转 MP4** | 全量重编码转码方案，带任务日志记录与并发队列控制。 |
+| [`download_video.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/media/download_video.sh) | **yt-dlp 增强下载器** | 交互式命令行，自动持久化记录上次下载路径，支持画质选择与播放列表解析。 |
+| [`delete_old_files.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/media/delete_old_files.sh) | **过期录播与文件清理** | 遍历多个目标路径，自动检索并批量清除超过指定天数的文件，释放磁盘空间。 |
 
 ---
 
@@ -190,10 +191,10 @@ vps/
 
 | 脚本文件 | 说明 | 核心亮点 |
 | :--- | :--- | :--- |
-| [`sshkey_manager.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/sshkey_manager.sh) | **企业级 SSH 密钥与端口管理器** | 支持 Ed25519/RSA 密钥生成与防重复导入；修改端口前执行 `sshd -t` 语法校验，失败自动回滚；自动联动 UFW/Firewalld/iptables 防火墙并更新 SELinux 标签。 |
-| [`linuxcheck.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/linuxcheck.sh) | **Linux 安全基线与应急排查** | 检测常用系统命令是否被篡改、查看异常网络连接、对外开放端口、高危端口监听、系统启动项与计划任务排查。 |
-| [`monitor_xrayr.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/monitor_xrayr.sh) | **XrayR 实时日志审计告警** | 实时监听访问日志，通过时间窗口（如 10 秒）聚合告警并推送到 Telegram，防止频繁告警风暴。 |
-| [`lscolorsetup.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/vps-sh/lscolorsetup.sh) | **终端 ls 配色高亮与常用别名** | 自动识别 Bash / Zsh 环境，安全配置高对比彩色目录及 `ll`/`la` 别名，带配置备份与一键卸载功能。 |
+| [`sshkey_manager.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/system/sshkey_manager.sh) | **企业级 SSH 密钥与端口管理器** | 支持 Ed25519/RSA 密钥生成与防重复导入；修改端口前执行 `sshd -t` 语法校验，失败自动回滚；自动联动 UFW/Firewalld/iptables 防火墙并更新 SELinux 标签。 |
+| [`linuxcheck.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/system/linuxcheck.sh) | **Linux 安全基线与应急排查** | 检测常用系统命令是否被篡改、查看异常网络连接、对外开放端口、高危端口监听、系统启动项与计划任务排查。 |
+| [`monitor_xrayr.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/system/monitor_xrayr.sh) | **XrayR 实时日志审计告警** | 实时监听访问日志，通过时间窗口（如 10 秒）聚合告警并推送到 Telegram，防止频繁告警风暴。 |
+| [`lscolorsetup.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/system/lscolorsetup.sh) | **终端 ls 配色高亮与常用别名** | 自动识别 Bash / Zsh 环境，安全配置高对比彩色目录及 `ll`/`la` 别名，带配置备份与一键卸载功能。 |
 
 ---
 
@@ -201,9 +202,9 @@ vps/
 
 | 脚本文件 | 说明 | 核心亮点 |
 | :--- | :--- | :--- |
-| [`tdl_commands.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/tdl_commands.sh) | **TDL 电报数据导出工具** | 基于 TDL 命令行，支持指定时间范围过滤导出群组/频道中的聊天记录与多媒体文件。 |
-| [`tdl_forward_commands.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/tdl_forward_commands.sh) | **TDL 批量消息转发工具** | 将导出的本地消息记录自动化批量转发至自己的会话或指定频道，带成功与失败日志。 |
-| [`v2bx/install.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/v2bx/install.sh) | **V2bX 节点安装维护脚本** | 快速拉取并部署 V2bX 多协议代理核心。 |
+| [`tdl_commands.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/network/tdl_commands.sh) | **TDL 电报数据导出工具** | 基于 TDL 命令行，支持指定时间范围过滤导出群组/频道中的聊天记录与多媒体文件。 |
+| [`tdl_forward_commands.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/network/tdl_forward_commands.sh) | **TDL 批量消息转发工具** | 将导出的本地消息记录自动化批量转发至自己的会话或指定频道，带成功与失败日志。 |
+| [`v2bx/install.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/network/v2bx/install.sh) | **V2bX 节点安装维护脚本** | 快速拉取并部署 V2bX 多协议代理核心。 |
 
 ---
 
@@ -229,7 +230,7 @@ vps/
 2. **路径安全**：
    - 机器人所有文件操作均受到 `BASE_DIR` 目录越界检查（Canonicalize Path 约束），请合理设置根目录，避免设置为系统根目录 `/`。
 3. **SSH 运维安全**：
-   - 使用 [`sshkey_manager.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/sh-files/sshkey_manager.sh) 更换端口或禁用密码登录时，脚本会自动执行严格的预检；请务必保留至少一个活跃终端连接，测试新连接成功后再退出。
+   - 使用 [`sshkey_manager.sh`](file:///E:/Github%20project/vps/%E5%B8%B8%E7%94%A8VPS%20.sh%E6%96%87%E4%BB%B6/system/sshkey_manager.sh) 更换端口或禁用密码登录时，脚本会自动执行严格的预检；请务必保留至少一个活跃终端连接，测试新连接成功后再退出。
 
 ---
 
