@@ -58,20 +58,21 @@ vps/
 │   │       ├── utils/                  # 格式化、日志 tracing、时间工具
 │   │       └── youtube/                # YouTube Data API v3 OAuth2 批量上传
 │   ├── vpsupload_bot/                  # 【Python / Rust 版】多媒体文件管理机器人
-│   │   ├── bot_main.py                 # Python 版机器人主入口
 │   │   ├── install_bot.sh              # 一键交互式部署脚本 (Debian/Ubuntu/CentOS)
 │   │   ├── videobot.service            # Systemd 后台常驻守护进程配置
-│   │   ├── get josn.py                 # YouTube OAuth2 授权 token.json 提取辅助脚本
 │   │   ├── README.md                   # 详细使用与配置说明文档
-│   │   ├── video_bot_mod/              # Python 模块化拆分源码
-│   │   │   ├── actions.py              # 文件操作与 FFmpeg 核心执行
-│   │   │   ├── auth.py                 # 管理员鉴权
-│   │   │   ├── config.py               # .env 读取与校验
-│   │   │   ├── handlers.py             # 命令与消息处理器
-│   │   │   ├── media_utils.py          # 媒体探针、进度条与合并校验
-│   │   │   ├── task_manager.py         # 独占任务与 YouTube 任务池管理
-│   │   │   ├── ui.py                   # 键盘与界面渲染
-│   │   │   └── youtube_upload.py       # YouTube 上传管道
+│   │   ├── python/                     # Python 实现源码目录
+│   │   │   ├── bot_main.py             # Python 版机器人主入口
+│   │   │   ├── get josn.py             # YouTube OAuth2 授权 token.json 提取辅助脚本
+│   │   │   └── video_bot_mod/          # Python 模块化拆分源码
+│   │   │       ├── actions.py          # 文件操作与 FFmpeg 核心执行
+│   │   │       ├── auth.py             # 管理员鉴权
+│   │   │       ├── config.py           # .env 读取与校验
+│   │   │       ├── handlers.py         # 命令与消息处理器
+│   │   │       ├── media_utils.py      # 媒体探针、进度条与合并校验
+│   │   │       ├── task_manager.py     # 独占任务与 YouTube 任务池管理
+│   │   │       ├── ui.py               # 键盘与界面渲染
+│   │   │       └── youtube_upload.py   # YouTube 上传管道
 │   │   └── RUST/                       # 早期 Rust 实现版本
 │   │       ├── Cargo.toml
 │   │       └── src/
@@ -144,10 +145,9 @@ vps/
   chmod +x install_bot.sh && sudo ./install_bot.sh
   ```
 - **核心组件**：
-  - `bot_main.py`：程序入口与 Handler 挂载。
-  - `video_bot_mod/`：分层实现鉴权、UI 分页、FFmpeg 操作、任务队列与 YouTube 上传。
+  - `python/`：Python 完整源码目录（含主入口 `bot_main.py`、模块化目录 `video_bot_mod/` 与 `get josn.py`）。
+  - `install_bot.sh`：一键自动化交互部署脚本。
   - `videobot.service`：注册为 Systemd 服务守护运行。
-  - `get josn.py`：配合 Google Cloud Console 快速生成 `token.json`。
   - `RUST/`：内含 Rust 移植版本源码。
 
 ---

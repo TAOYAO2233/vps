@@ -79,13 +79,14 @@ source yt/bin/activate
 pip install --upgrade pip
 pip install 'python-telegram-bot>=21,<23' 'google-api-python-client>=2,<3' 'google-auth-oauthlib>=1,<2' 'google-auth>=2,<3'
 
-# 5. 准备源码文件：优先使用安装脚本同目录下的优化版，缺失时再从 GitHub 拉取
+# 5. 准备源码文件：优先使用本地 python/ 目录下的源码，缺失时再从 GitHub 拉取
 echo -e "${GREEN}[4/6] 正在准备脚本源码...${NC}"
-BOT_MAIN_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/bot_main.py"
-GET_JSON_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/get%20josn.py"
+BOT_MAIN_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/python/bot_main.py"
+GET_JSON_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/python/get%20josn.py"
 
-if [ -s "${SCRIPT_DIR}/bot_main.py" ]; then
-    cp "${SCRIPT_DIR}/bot_main.py" bot_main.py
+if [ -s "${SCRIPT_DIR}/python/bot_main.py" ]; then
+    echo -e "${GREEN}检测到本地源码，正在从 ${SCRIPT_DIR}/python 复制 bot_main.py...${NC}"
+    cp "${SCRIPT_DIR}/python/bot_main.py" bot_main.py
 elif [ -s "${SCRIPT_DIR}/bot_main.py" ]; then
     cp "${SCRIPT_DIR}/bot_main.py" bot_main.py
 else
@@ -93,8 +94,14 @@ else
     curl -fSL -o bot_main.py "${BOT_MAIN_URL}"
 fi
 
-if [ -s "${SCRIPT_DIR}/get_json.py" ]; then
+if [ -s "${SCRIPT_DIR}/python/get_json.py" ]; then
+    cp "${SCRIPT_DIR}/python/get_json.py" get_json.py
+elif [ -s "${SCRIPT_DIR}/python/get josn.py" ]; then
+    cp "${SCRIPT_DIR}/python/get josn.py" get_json.py
+elif [ -s "${SCRIPT_DIR}/get_json.py" ]; then
     cp "${SCRIPT_DIR}/get_json.py" get_json.py
+elif [ -s "${SCRIPT_DIR}/get josn.py" ]; then
+    cp "${SCRIPT_DIR}/get josn.py" get_json.py
 else
     curl -fSL -o get_json.py "${GET_JSON_URL}"
 fi

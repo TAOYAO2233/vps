@@ -81,26 +81,48 @@ pip install 'python-telegram-bot>=21,<23' 'google-api-python-client>=2,<3' 'goog
 
 # 5. 准备源码文件：支持 GitHub 模块化目录 video_bot_mod/
 echo -e "${GREEN}[4/6] 正在准备脚本源码...${NC}"
-BOT_MAIN_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/bot_main.py"
-GET_JSON_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/get%20josn.py"
-MODULE_URL_BASE="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/video_bot_mod"
+BOT_MAIN_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/python/bot_main.py"
+GET_JSON_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/python/get%20josn.py"
+MODULE_URL_BASE="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/python/video_bot_mod"
 
-# 始终从 GitHub 拉取 bot_main.py，确保入口文件与模块版本一致
-echo -e "${YELLOW}正在从 GitHub 下载 bot_main.py...${NC}"
-curl -fSL -o bot_main.py "${BOT_MAIN_URL}"
+# 准备 bot_main.py：优先使用本地 python/ 目录下的源码，缺失时从 GitHub 下载
+if [ -s "${SCRIPT_DIR}/python/bot_main.py" ]; then
+    echo -e "${GREEN}检测到本地源码，正在从 ${SCRIPT_DIR}/python 复制 bot_main.py...${NC}"
+    cp "${SCRIPT_DIR}/python/bot_main.py" bot_main.py
+elif [ -s "${SCRIPT_DIR}/bot_main.py" ]; then
+    echo -e "${GREEN}检测到本地源码，正在复制 bot_main.py...${NC}"
+    cp "${SCRIPT_DIR}/bot_main.py" bot_main.py
+else
+    echo -e "${YELLOW}正在从 GitHub 下载 bot_main.py...${NC}"
+    curl -fSL -o bot_main.py "${BOT_MAIN_URL}"
+fi
 
-# 始终从 GitHub 拉取模块化目录 video_bot_mod/，不依赖安装脚本本地目录
+# 准备模块化目录 video_bot_mod/：优先从本地 python/video_bot_mod 复制，缺失时从 GitHub 下载
 BOT_CORE_DIR="${BOT_DIR}/video_bot_mod"
 rm -rf "${BOT_CORE_DIR}"
-mkdir -p "${BOT_CORE_DIR}"
-echo -e "${YELLOW}正在从 GitHub 下载模块化源码 video_bot_mod/...${NC}"
-for file in __init__.py actions.py auth.py config.py handlers.py media_utils.py task_manager.py ui.py youtube_upload.py; do
-    curl -fSL -o "${BOT_CORE_DIR}/${file}" "${MODULE_URL_BASE}/${file}"
-done
+if [ -d "${SCRIPT_DIR}/python/video_bot_mod" ]; then
+    echo -e "${GREEN}检测到本地模块目录，正在从 ${SCRIPT_DIR}/python 复制 video_bot_mod/...${NC}"
+    cp -r "${SCRIPT_DIR}/python/video_bot_mod" "${BOT_DIR}/"
+elif [ -d "${SCRIPT_DIR}/video_bot_mod" ]; then
+    echo -e "${GREEN}检测到本地模块目录，正在复制 video_bot_mod/...${NC}"
+    cp -r "${SCRIPT_DIR}/video_bot_mod" "${BOT_DIR}/"
+else
+    mkdir -p "${BOT_CORE_DIR}"
+    echo -e "${YELLOW}正在从 GitHub 下载模块化源码 video_bot_mod/...${NC}"
+    for file in __init__.py actions.py auth.py config.py handlers.py media_utils.py task_manager.py ui.py youtube_upload.py; do
+        curl -fSL -o "${BOT_CORE_DIR}/${file}" "${MODULE_URL_BASE}/${file}"
+    done
+fi
 
-# 拉取 get_json.py
-if [ -s "${SCRIPT_DIR}/get_json.py" ]; then
+# 准备 get_json.py
+if [ -s "${SCRIPT_DIR}/python/get_json.py" ]; then
+    cp "${SCRIPT_DIR}/python/get_json.py" get_json.py
+elif [ -s "${SCRIPT_DIR}/python/get josn.py" ]; then
+    cp "${SCRIPT_DIR}/python/get josn.py" get_json.py
+elif [ -s "${SCRIPT_DIR}/get_json.py" ]; then
     cp "${SCRIPT_DIR}/get_json.py" get_json.py
+elif [ -s "${SCRIPT_DIR}/get josn.py" ]; then
+    cp "${SCRIPT_DIR}/get josn.py" get_json.py
 else
     curl -fSL -o get_json.py "${GET_JSON_URL}"
 fi

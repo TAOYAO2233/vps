@@ -25,20 +25,23 @@
 
 ```text
 vpsupload_bot/
-├── bot_main.py                 # 入口文件：启动机器人并注册 handler
 ├── install_bot.sh              # 一键部署脚本
-├── get_json.py                 # YouTube OAuth token.json 生成辅助脚本
+├── videobot.service            # Systemd 服务单元文件
 ├── README.md                   # 项目说明
-└── video_bot_mod/              # 模块化核心代码
-    ├── __init__.py             # 版本信息
-    ├── actions.py              # 浏览、推流、合并、转码、删除动作
-    ├── auth.py                 # 管理员权限校验
-    ├── config.py               # .env 配置读取与运行前校验
-    ├── handlers.py             # Telegram 命令与 CallbackQuery 路由
-    ├── media_utils.py          # 路径安全、ffprobe、进度条、合并校验等工具
-    ├── task_manager.py         # 独占任务与 YouTube 上传池管理
-    ├── ui.py                   # 主菜单、文件选择器、分页、删除确认
-    └── youtube_upload.py       # YouTube 上传命令与上传任务实现
+├── python/                     # Python 源码目录
+│   ├── bot_main.py             # 入口文件：启动机器人并注册 handler
+│   ├── get josn.py             # YouTube OAuth token.json 生成辅助脚本
+│   └── video_bot_mod/          # 模块化核心代码
+│       ├── __init__.py         # 版本信息
+│       ├── actions.py          # 浏览、推流、合并、转码、删除动作
+│       ├── auth.py             # 管理员权限校验
+│       ├── config.py           # .env 配置读取与运行前校验
+│       ├── handlers.py         # Telegram 命令与 CallbackQuery 路由
+│       ├── media_utils.py      # 路径安全、ffprobe、进度条、合并校验等工具
+│       ├── task_manager.py     # 独占任务与 YouTube 上传池管理
+│       ├── ui.py               # 主菜单、文件选择器、分页、删除确认
+│       └── youtube_upload.py   # YouTube 上传命令与上传任务实现
+└── RUST/                       # Rust 源码目录
 ```
 
 > 说明：如果仓库中历史文件名仍为 `get josn.py`，安装脚本会将它下载并保存为 `get_json.py`。
@@ -317,9 +320,9 @@ cd /root/video_bot
 ### 2. 拉取源码
 
 ```bash
-BOT_MAIN_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/bot_main.py"
-MODULE_URL_BASE="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/video_bot_mod"
-GET_JSON_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/get%20josn.py"
+BOT_MAIN_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/python/bot_main.py"
+MODULE_URL_BASE="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/python/video_bot_mod"
+GET_JSON_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/python/get%20josn.py"
 
 curl -fSL -o bot_main.py "$BOT_MAIN_URL"
 curl -fSL -o get_json.py "$GET_JSON_URL"
@@ -377,8 +380,8 @@ python3 -m py_compile bot_main.py video_bot_mod/*.py
 ```bash
 cd /root/video_bot
 
-BOT_MAIN_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/bot_main.py"
-MODULE_URL_BASE="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/video_bot_mod"
+BOT_MAIN_URL="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/python/bot_main.py"
+MODULE_URL_BASE="https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/vpsupload_bot/python/video_bot_mod"
 
 curl -fSL -o bot_main.py "$BOT_MAIN_URL"
 mkdir -p video_bot_mod
