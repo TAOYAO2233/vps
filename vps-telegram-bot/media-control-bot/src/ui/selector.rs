@@ -1,8 +1,8 @@
 //! 文件选择器 UI 渲染。
 //!
-//! 负责渲染文件浏览/选择界面，对应 Python 版本的 `render_file_selector` 函数。
+//! 每次渲染均在后台线程扫描目录、分配或校验 [`MenuSnapshot`] 快照令牌 `snap_id`，
+//! 并在多选（尤其是视频合并）模式下直观展示用户选择的严格先后顺序。
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,147 +10,170 @@ use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 
-use crate::bot::keyboard::file_selector_keyboard;
+use crate::bot::keyboard::{back_to_main_keyboard, file_selector_keyboard};
 use crate::config::Config;
-use crate::core::state::{ActionType, SharedState};
+use crate::core::state::{ActionType, SharedState, SnapshotEntry};
 use crate::storage::filesystem::format_file_size_bytes;
 use crate::storage::path::PathGuard;
 use crate::storage::scanner::scan_directory;
 use crate::ui::pagination::Paginator;
 use crate::utils::format::escape_html;
+use crate::utils::redact::sanitize_user_error;
 
-/// 渲染文件选择器界面并编辑现有消息。
-///
-/// # Arguments
-///
-/// * `bot` - Teloxide Bot 实例
-/// * `msg` - 要编辑的消息
-/// * `state` - 全局共享状态
-/// * `config` - 应用配置
-/// * `action` - 当前操作类型
-/// * `page` - 请求的页码（0-indexed）
+/// 渲染文件选择器界面并更新当前消息与菜单快照。
 pub async fn render_file_selector(
     bot: &Bot,
     msg: &Message,
     state: &SharedState,
-    config: &Arc<Config>,
+    config: &Config,
     action: &ActionType,
     page: usize,
 ) -> Result<()> {
     let path_guard = PathGuard::new(config.base_dir.clone());
 
-    // 获取并校验当前目录
+    let canonical_base = match path_guard.canonical_base() {
+        Ok(b) => b,
+        Err(e) => {
+            bot.edit_message_text(
+                msg.chat.id,
+                msg.id,
+                format!(
+                    "❌ <b>媒体根目录当前不可访问</b>\n{}",
+                    escape_html(&sanitize_user_error(&e))
+                ),
+            )
+            .parse_mode(ParseMode::Html)
+            .reply_markup(back_to_main_keyboard())
+            .await?;
+            return Ok(());
+        }
+    };
+
     let current_dir = {
         let s = state.read().await;
-        let dir = s.current_dir.clone();
-        match path_guard.assert_inside(&dir) {
-            Ok(_) => dir,
-            Err(_) => {
-                drop(s);
+        let candidate = s.current_dir.clone();
+        drop(s);
+        match path_guard.assert_inside(&candidate) {
+            Ok(valid) => {
                 let mut s = state.write().await;
-                s.current_dir = config.base_dir.clone();
-                config.base_dir.clone()
+                s.current_dir = valid.clone();
+                valid
+            }
+            Err(_) => {
+                let mut s = state.write().await;
+                s.current_dir = canonical_base.clone();
+                canonical_base.clone()
             }
         }
     };
 
-    if !current_dir.is_dir() {
-        bot.edit_message_text(msg.chat.id, msg.id, "❌ 目录不存在！")
-            .await?;
-        return Ok(());
-    }
-
-    // 扫描目录：同步文件系统调用放入阻塞线程池，避免卡住异步运行时
     let scan_dir = current_dir.clone();
-    let listing = match tokio::task::spawn_blocking(move || scan_directory(&scan_dir)).await {
+    let mut listing = match tokio::task::spawn_blocking(move || scan_directory(&scan_dir)).await {
         Ok(Ok(listing)) => listing,
         Ok(Err(e)) => {
             bot.edit_message_text(
                 msg.chat.id,
                 msg.id,
-                format!("❌ 无法读取目录: {}", escape_html(&e.to_string())),
+                format!("❌ 无法读取目录: {}", escape_html(&sanitize_user_error(&e))),
             )
+            .parse_mode(ParseMode::Html)
+            .reply_markup(back_to_main_keyboard())
             .await?;
             return Ok(());
         }
         Err(e) => {
+            let err = anyhow::anyhow!("目录扫描线程异常: {e}");
             bot.edit_message_text(
                 msg.chat.id,
                 msg.id,
-                format!("❌ 目录扫描失败: {}", escape_html(&e.to_string())),
+                format!("❌ {}", escape_html(&sanitize_user_error(&err))),
             )
+            .parse_mode(ParseMode::Html)
+            .reply_markup(back_to_main_keyboard())
             .await?;
             return Ok(());
         }
     };
 
-    // 更新状态中的文件列表缓存
-    {
-        let mut s = state.write().await;
-        s.current_files = listing.all_items();
+    let search_query = {
+        let s = state.read().await;
+        s.search_query.to_lowercase()
+    };
+    if !search_query.is_empty() {
+        listing.items.retain(|item| item.name.to_lowercase().contains(&search_query));
     }
 
-    // 分页计算
-    let paginator = Paginator::new(listing.total(), config.items_per_page, page);
-    let page_items = &listing.items[paginator.range()];
+    let snapshot_entries: Vec<SnapshotEntry> = listing.items.iter().map(SnapshotEntry::from).collect();
 
-    // 获取当前选中集合
-    let selected_paths: HashSet<PathBuf> = {
-        let s = state.read().await;
-        s.selections_ref(action).cloned().unwrap_or_default()
+    let (snapshot, ordered_selections): (_, Vec<PathBuf>) = {
+        let mut s = state.write().await;
+        let snap = s.update_menu_snapshot(action.clone(), current_dir.clone(), snapshot_entries);
+        let sel = s.selections_slice(action).to_vec();
+        (snap, sel)
     };
 
+    let snap_id = &snapshot.snap_id;
+    let action_str = action.as_str();
+    let paginator = Paginator::new(listing.total(), config.items_per_page, page);
+    let page_items = &listing.items[paginator.range()];
     let is_multi_select = action.is_multi_select();
 
-    // 构建按钮数据
-    let mut button_items: Vec<(String, String)> = Vec::new();
+    let mut button_items: Vec<(String, String)> = Vec::with_capacity(page_items.len());
     for (i, item) in page_items.iter().enumerate() {
         let real_idx = paginator.start_index() + i;
-        let item_path = current_dir.join(&item.name);
+        let joined_path = current_dir.join(&item.name);
+        let lookup_path = joined_path
+            .canonicalize()
+            .unwrap_or_else(|_| joined_path.clone());
 
         if item.is_dir {
             button_items.push((
                 format!("📁 {}", item.name),
-                format!("enterdir_{}_{real_idx}", action.as_str()),
+                format!("enterdir_{action_str}_{snap_id}_{real_idx}"),
             ));
         } else {
             let size_str = format_file_size_bytes(item.size);
             if is_multi_select {
-                let is_selected = selected_paths.contains(&item_path);
-                let checkbox = if is_selected { "✅ " } else { "⬜️ " };
+                let order_opt = ordered_selections
+                    .iter()
+                    .position(|p| p == &lookup_path)
+                    .map(|pos| pos + 1);
+                let checkbox = match (action, order_opt) {
+                    (ActionType::Concat, Some(ord)) => format!("✅#{ord} "),
+                    (_, Some(_)) => "✅ ".to_string(),
+                    (_, None) => "⬜️ ".to_string(),
+                };
                 button_items.push((
                     format!("{checkbox}[{size_str}] {}", item.name),
                     format!(
-                        "toggle_{}_{}_{}",
-                        action.as_str(),
-                        real_idx,
+                        "toggle_{action_str}_{snap_id}_{real_idx}_{}",
                         paginator.current_page
                     ),
                 ));
             } else {
                 button_items.push((
                     format!("[{size_str}] {}", item.name),
-                    format!("execsingle_{}_{real_idx}", action.as_str()),
+                    format!("execsingle_{action_str}_{snap_id}_{real_idx}"),
                 ));
             }
         }
     }
 
-    let is_at_base = current_dir == config.base_dir;
-    let selected_count = selected_paths.len();
+    let is_at_base = current_dir == canonical_base;
+    let selected_count = ordered_selections.len();
 
     let keyboard = file_selector_keyboard(
         &button_items,
         paginator.current_page,
         paginator.total_pages(),
-        action.as_str(),
+        action_str,
+        snap_id,
         is_at_base,
         if is_multi_select { selected_count } else { 0 },
     );
 
-    // 构建标题文本
     let rel_path = current_dir
-        .strip_prefix(&config.base_dir)
+        .strip_prefix(&canonical_base)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| current_dir.to_string_lossy().to_string());
     let display_path = if rel_path.is_empty() || rel_path == "." {
@@ -167,8 +190,25 @@ pub async fn render_file_selector(
         paginator.current_page + 1,
         paginator.total_pages()
     );
+    if !search_query.is_empty() {
+        header.push_str(&format!("\n🔎 筛选: <code>{}</code>（/clearfilter 清除）", escape_html(&search_query)));
+    }
 
-    // 追加任务状态信息
+    // 合并模式下展示严格按用户点击顺序排列的分段预览
+    if action == &ActionType::Concat && !ordered_selections.is_empty() {
+        header.push_str("\n📋 <b>已选拼接顺序（严格按点击先后）</b>:");
+        for (ord, p) in ordered_selections.iter().take(6).enumerate() {
+            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+            header.push_str(&format!("\n  {}. <code>{}</code>", ord + 1, escape_html(fname)));
+        }
+        if ordered_selections.len() > 6 {
+            header.push_str(&format!(
+                "\n  ... 共 {} 个分段",
+                ordered_selections.len()
+            ));
+        }
+    }
+
     {
         let mut s = state.write().await;
         s.cleanup_active_task();
@@ -183,7 +223,7 @@ pub async fn render_file_selector(
     }
 
     if listing.is_empty() {
-        header.push_str("\n\n⚠️ 当前目录下既无子文件夹也无视频文件。");
+        header.push_str("\n\n⚠️ 当前目录下既无子文件夹也无支持的视频文件。");
     }
 
     bot.edit_message_text(msg.chat.id, msg.id, header)

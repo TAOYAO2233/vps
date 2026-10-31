@@ -30,15 +30,7 @@ static BRACKET_DATE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\[\d[^\]]*\]
 
 /// 将秒数格式化为 `HH:MM:SS` 字符串。
 ///
-/// 对应 Python 版本的 `format_duration` 函数。
-///
-/// # Arguments
-///
-/// * `seconds` - 时长（秒）
-///
-/// # Returns
-///
-/// 格式化后的时长字符串，如 `"01:23:45"`，若时长 <= 0 则返回 `"未知"`。
+/// 若时长 `<= 0` 则返回 `"未知"`。
 #[must_use]
 pub fn format_duration(seconds: f64) -> String {
     if seconds <= 0.0 {
@@ -51,15 +43,7 @@ pub fn format_duration(seconds: f64) -> String {
     format!("{h:02}:{m:02}:{s:02}")
 }
 
-/// 将秒数格式化为紧凑的经过时间字符串。
-///
-/// 对应 Python 版本的 `format_elapsed` 函数。
-///
-/// # Examples
-///
-/// - `65` → `"1m05s"`
-/// - `3661` → `"1h01m01s"`
-/// - `45` → `"45s"`
+/// 将秒数格式化为紧凑的经过时间字符串（如 `1m05s`、`1h01m01s`、`45s`）。
 #[must_use]
 pub fn format_elapsed(seconds: f64) -> String {
     let total = seconds.max(0.0) as u64;
@@ -84,16 +68,7 @@ pub fn format_elapsed_instant(instant: &Instant) -> String {
 
 /// 根据第一个文件名智能生成合并输出文件名。
 ///
-/// 对应 Python 版本的 `smart_rename` 函数。
 /// 尝试从文件名中提取日期时间信息，生成有意义的输出文件名。
-///
-/// # Arguments
-///
-/// * `first_file` - 第一个输入文件的路径
-///
-/// # Returns
-///
-/// 建议的输出文件名（含扩展名）。
 #[must_use]
 pub fn smart_rename(first_file: &Path) -> String {
     let base_name = first_file
@@ -131,26 +106,30 @@ pub fn smart_rename(first_file: &Path) -> String {
 
     output_name.replace("__", "_")
 }
+
 /// 格式化 YouTube 上传任务列表为 Telegram 消息文本。
 ///
-/// 对应 Python 版本的 `cmd_uploads` 中的格式化逻辑。
+/// 明确区分“本地读取/发送进度”与“服务端已确认接收（`308 Range`）进度”。
 #[must_use]
 pub fn format_upload_list(uploads: &HashMap<String, UploadTask>) -> String {
-    let mut lines = vec![format!("📤 <b>YouTube 上传任务</b> ({} 个)\n", uploads.len())];
+    let mut tasks: Vec<&UploadTask> = uploads.values().collect();
+    tasks.sort_by_key(|t| t.created_at);
 
-    for (idx, task) in uploads.values().enumerate() {
-        let progress_text = format!(" {:.1}%", task.progress);
+    let mut lines = vec![format!("📤 <b>YouTube 上传任务</b> ({} 个)\n", tasks.len())];
+
+    for (idx, task) in tasks.iter().enumerate() {
         lines.push(format!(
-            "{}. <code>{}</code>\n   状态: {}{}\n   已运行: <code>{}</code>",
+            "{}. <code>{}</code>\n   状态: {}\n   进度: 本地发送 <code>{:.1}%</code> | 服务端确认 <code>{:.1}%</code>\n   已运行: <code>{}</code>",
             idx + 1,
             escape_html(&task.filename),
             escape_html(&task.status),
-            progress_text,
+            task.local_sent_percent,
+            task.server_confirmed_percent,
             format_elapsed(task.elapsed_secs()),
         ));
     }
 
-    lines.push("\n发送 /stop 可停止当前所有任务。".to_string());
+    lines.push("\n发送 /stop 可立即停止所有运行中及排队中的上传任务。".to_string());
     lines.join("\n")
 }
 
@@ -189,7 +168,7 @@ mod tests {
         let result = smart_rename(path);
         assert!(result.contains("Merged_") || result.contains("random"));
     }
-    
+
     #[test]
     fn test_escape_html() {
         assert_eq!(escape_html("a & b < c > d"), "a &amp; b &lt; c &gt; d");

@@ -85,6 +85,11 @@ pub fn scan_directory(dir: &Path) -> Result<DirListing> {
             None => continue,
         };
 
+        // 跳过隐藏文件与本程序创建的临时工作目录（如 .mcb_tmp_*）
+        if name.starts_with('.') {
+            continue;
+        }
+
         // Linux/Windows 上 `file_type()` 通常直接来自目录项，无需额外系统调用；
         // 符号链接回退到 `metadata()`（跟随目标），保持「可进入符号链接目录」的既有行为。
         let file_type = match entry.file_type() {

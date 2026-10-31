@@ -1,75 +1,83 @@
 # VPS Media Control Bot (Rust Edition)
 
-基于 Rust 2021 Edition + Tokio + Teloxide 重构的企业级 Telegram 媒体控制机器人。
-用于在 VPS 上远程管理视频文件，支持合并、转码、RTMP 推流、YouTube 批量上传等操作。
+基于 Rust 2021 Edition + Tokio + Teloxide 构建的 VPS 远程媒体控制 Telegram 机器人。
+用于在 Linux VPS 上安全浏览与管理录播视频文件，提供**严格零重编码（`-c copy`）**的视频无损合并、MP4 无损重封装、RTMP 直播推流、YouTube 自管可恢复分块上传，以及 `/storage512` 挂载核验与三级磁盘容量告警。
 
 ## 🌟 核心特性
 
-- **🚀 极致性能**: 全异步 Tokio 架构，内存占用极低，无 Python GIL 限制。
-- **🛡️ 类型安全**: 强类型检查，杜绝运行时 AttributeError，状态管理基于 `Arc<RwLock<AppState>>`。
-- **📝 结构化日志**: 采用 `tracing`，支持控制台高亮输出与 JSON 生产级日志。
-- **🗂️ 模块化架构**: 约 40 个源码文件，清晰的四层架构（Presentation / Service / Domain / Infrastructure）。
-- **🔒 安全加护**: 内置路径越界防护（Path Traversal 防御），二次确认删除机制。
-- **☁️ 并发上传**: YouTube 批量上传支持通过 `Semaphore` 控制并发数，自动排队与限流。
-- **🎥 智能容错**: 视频合并提供「极速直连」与「TS 无损封装」两阶段容错机制。
+- **🎞️ 严格零重编码红线**: 视频合并、MP4 转封装与 RTMP 推流全流程仅允许 `-c copy` 流复制与容器重封装，绝不调用任何音视频编码器，保护低配 VPS CPU 与原始画质。
+- **🧩 多阶段无损合并**: 严格保留用户点击选择顺序（`Vec<PathBuf>`），合并前执行编码参数一致性与 `/storage512` 剩余空间预检；依次执行「Stage 1 极速直连 (`-f concat -c copy`) → Stage 2A 标准 TS 无损重封装 → Stage 2B 容错时间戳修复 TS 重封装 → Stage 2C 有界片尾截除探测（保守默认不自动丢内容）」，临时目录全程位于 `/storage512` 内并由 RAII 自动清理，输出采用硬链接原子发布防覆盖。
+- **💽 `/storage512` 实时监控与三级告警**: 通过 `/proc/self/mountinfo` 核验真实挂载点（拒绝退化到根分区 `/` 或 `tmpfs`），在 `/start`、每次点击「返回主菜单」、启动自检及后台定时巡检时实时调用 `statvfs` 读取容量；严格按 `>90%`（一级）、`>95%`（二级）、`>98%`（三级）触发主动报警，支持越级单条合并通知、发送成功后置位、滞后回落复位与跨重启去重。
+- **🔐 双层敏感信息脱敏**: 源码层移除明文 `rtmp_url` 打印并为 `Config` 手写白名单 `Debug`；输出流层通过 `RedactingMakeWriter` 统一拦截 `pretty` / `json` 日志及跨分块写入，自动将 Telegram Bot Token、RTMP 推流密钥、OAuth 凭据与 YouTube 会话签名参数替换为 `[REDACTED]`。
+- **🛡️ 路径、菜单快照与删除身份防护**: `PathGuard` 强制 `canonicalize` 边界校验（失败绝不退化放行）；文件选择器绑定 `MenuSnapshot`（含 `snap_id` 与目录内容摘要 `listing_hash`）防止旧菜单或目录变动引发错选；批量删除绑定一次性确认令牌与文件身份快照（`size`、`modified`、Unix `(dev, ino)`），执行前逐项复核。
+- **📡 可观测 RTMP 无损推流**: 显式流映射 `-map 0:v:0` + 可选音频流、`-rw_timeout` 网络超时保护、`-progress pipe:1` 结构化进度解析 + 独立后台 `stderr` 排空防管道死锁 + 本地进度停滞看门狗；支持未知时长媒体展示已推流时长与实时速率。
+- **☁️ 自管 YouTube Resumable Upload**: 基于 `yup-oauth2` + `hyper` 自管 HTTP 可恢复分块上传，`YOUTUBE_UPLOAD_CHUNK_MB` 真正控制单次 `PUT` 分块大小（恒为 `256 KiB` 整数倍，`64 KiB` 流式缓冲低内存读取）；区分「本地已发送」与「服务端 `308 Range` 已确认」双进度，仅在收到 `200/201` 且解析出有效 `video_id` 时判定成功；网络中断重试前先查询服务端已接收偏移防止重复成片；排队上限受 `YOUTUBE_MAX_QUEUE_SIZE` 约束且排队任务可被 `/stop` 立即取消。
+- **🧰 任务与文件管理**: `/tasks` 查看并单独停止任务，`/history` 查看本次运行的最近结果，`/pending` 核实待确认的 YouTube 会话（需启用 `requeue` 或 `resume` 持久化）；`/find` 按文件名筛选并支持选择本页文件。删除先移入同盘回收站，可通过 `/trash` 恢复，超过 `TRASH_RETENTION_DAYS` 后清理。
+- **⏱️ 录播稳定性检查**: 上传、推流、合并和转封装前要求源文件在 `FILE_STABLE_SECONDS` 内未修改，并在短暂观察后再次核对大小与修改时间。
 
 ## 🛠️ 技术栈
 
-- **语言**: Rust 2021 Edition
-- **异步运行时**: `tokio`
-- **Telegram 框架**: `teloxide`
+- **语言**: Rust 2021 Edition (`rust-version = "1.75"`, `unsafe_code = "forbid"`)
+- **异步运行时**: `tokio`（含 `SIGINT` + Unix `SIGTERM` 优雅停机）
+- **Telegram 框架**: `teloxide` (`rustls` + `throttle`)
 - **错误处理**: `anyhow` + `thiserror`
-- **日志系统**: `tracing` + `tracing-subscriber`
-- **配置管理**: `dotenvy` + `serde`
-- **Google API**: `google-youtube3` + `yup-oauth2`
+- **日志与脱敏**: `tracing` + `tracing-subscriber` + 自定义 `RedactingMakeWriter`
+- **配置与序列化**: `dotenvy` + `serde` + `serde_json` + `url`
+- **系统存储统计**: `rustix` (`statvfs`，Unix 平台安全封装)
+- **YouTube 上传与鉴权**: `yup-oauth2` + `hyper` + `hyper-rustls` + `bytes`
 
 ## ⚙️ 快速开始
 
 ### 1. 环境准备
 
-- 安装 Rust 工具链 (`rustup default stable`)
-- 安装 FFmpeg (`sudo apt install ffmpeg`)
-- 获取 Telegram Bot Token (通过 [@BotFather](https://t.me/BotFather))
-- (可选) 准备 YouTube OAuth2 `token.json`
+- Linux VPS（推荐 Debian / Ubuntu），已安装 `ffmpeg` 与 `ffprobe` 且位于 `PATH`
+- Rust 工具链（`>= 1.75`）
+- Telegram Bot Token（若旧 Token 曾出现在历史日志中，请先通过 [@BotFather](https://t.me/BotFather) 执行 `/revoke` 轮换）
+- **单实例部署检查**：启动前确认旧版 Python 服务（如 `videobot.service`）或其他使用同一 Token 的进程已停止并禁用，避免触发 Telegram `409 Conflict: terminated by other getUpdates request`
 
 ### 2. 配置文件
-
-复制示例配置并修改：
 
 ```bash
 cp .env.example .env
 vim .env
+chmod 600 .env
+# 如需使用 YouTube 上传：
+chmod 600 token.json
 ```
 
-### 3. 编译运行
+### 3. 编译与检查
 
 ```bash
-# 格式化与静态检查
-cargo fmt
+cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-
-# 编译运行
-cargo run --release
+cargo test
+cargo build --release
 ```
+
+更多运维细节、systemd 配置、待确认参数说明与故障排查请参阅 [使用指南.md](./使用指南.md) 与 [ARCHITECTURE.md](./ARCHITECTURE.md)。
 
 ## 📂 目录结构
 
 ```text
 media-control-bot/
-├── Cargo.toml          # 项目依赖与元数据
-├── .env.example        # 环境变量示例
-├── src/
-│   ├── main.rs         # 入口文件
-│   ├── config/         # 配置解析层 (serde)
-│   ├── core/           # 核心领域层 (状态管理、任务调度、权限)
-│   ├── bot/            # 表示层 (Teloxide 路由、命令、回调)
-│   ├── actions/        # 业务逻辑层 (合并、转码、上传等)
-│   ├── media/          # 基础设施层 (FFmpeg/FFprobe 封装)
-│   ├── youtube/        # 基础设施层 (OAuth2 & YouTube API)
-│   ├── storage/        # 基础设施层 (文件系统、路径安全)
-│   ├── ui/             # 表示层组件 (分页、菜单、键盘)
-│   ├── utils/          # 通用工具 (格式化、日志、时间)
-│   └── errors/         # 错误定义 (thiserror)
+├── Cargo.toml                  # 项目依赖、MSRV 与 Lint 约束
+├── .env.example                # 环境变量配置模板（仅含安全占位符）
+├── README.md                   # 项目概览
+├── ARCHITECTURE.md             # 架构与核心状态设计文档
+├── 使用指南.md                  # 部署、配置、命令与排障指南
+└── src/
+    ├── main.rs                 # 入口：脱敏日志 → 配置校验 → 状态与磁盘巡检 → 路由 → SIGINT/SIGTERM 停机
+    ├── config/                 # 强类型配置解析、合法性校验与白名单 Debug
+    ├── core/                   # AppState、MenuSnapshot、删除令牌、独占任务与上传池并发协调
+    ├── bot/                    # Telegram 命令、回调分发、InlineKeyboard 构建
+    ├── actions/                # 业务逻辑层（browse / stream / youtube / concat / convert / delete）
+    ├── media/                  # FFprobe 媒体流探测、FFmpeg 无损执行器、多阶段无损合并校验
+    ├── rtmp/                   # RTMP 推流会话封装（-progress pipe:1 + stderr 排空 + 看门狗）
+    ├── youtube/                # OAuth2 鉴权、自管 Resumable Upload 状态机、可选队列持久化
+    ├── storage/                # PathGuard 边界守卫、目录扫描、同盘回收站、/storage512 挂载与告警监控
+    ├── ui/                     # 主控面板（含实时磁盘状态）、分页计算、快照选择器渲染
+    ├── utils/                  # 全局流式脱敏器 (redact)、日志初始化、格式化与时间工具
+    └── errors/                 # 领域错误定义 (AppError)
 ```
 
 ## 📜 许可证

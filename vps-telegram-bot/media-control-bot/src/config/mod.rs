@@ -5,4 +5,4 @@
 
 mod settings;
 
-pub use settings::{Config, VideoExtensions};
+pub use settings::{Config, VideoExtensions, YoutubeRecoveryMode};

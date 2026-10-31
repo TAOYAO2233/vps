@@ -5,3 +5,4 @@
 pub mod datetime;
 pub mod format;
 pub mod logger;
+pub mod redact;

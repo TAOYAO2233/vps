@@ -1,8 +1,6 @@
-//! 文件浏览与详情查看。
+//! 文件浏览与详情查看操作。
 //!
-//! 对应 Python 版本的 `action_browse` 函数。
-//! 通过 `ffprobe` 获取视频时长，并以 Telegram alert 弹窗形式展示文件详情；
-//! 详情超过 Telegram callback 文本上限时改为编辑原消息展示。
+//! 二次核验路径位于 `BASE_DIR` 内后，调用带超时的 `probe_media` 展示文件体积、时长、音视频编码与修改时间。
 
 use std::path::PathBuf;
 
@@ -13,34 +11,27 @@ use teloxide::types::ParseMode;
 use tracing::warn;
 
 use crate::bot::keyboard::back_to_main_keyboard;
-use crate::media::ffprobe::get_video_duration;
+use crate::config::Config;
+use crate::media::ffprobe::probe_media;
 use crate::storage::filesystem::format_file_size;
+use crate::storage::path::PathGuard;
 use crate::utils::format::{escape_html, format_duration};
+use crate::utils::redact::redact_secrets;
 
-/// Telegram `answerCallbackQuery` 的文本上限为 200 字符，留出余量后取 190。
-const ALERT_TEXT_LIMIT: usize = 190;
+/// Telegram `answerCallbackQuery` 的弹窗文本上限为 200 字符，留余量取 185。
+const ALERT_TEXT_LIMIT: usize = 185;
 
-/// 展示单个文件的详情信息。
-///
-/// 文本较短时通过 CallbackQuery alert 弹窗展示；超过 [`ALERT_TEXT_LIMIT`] 时
-/// 改为编辑原消息（HTML 模式）并附上「返回主菜单」按钮，避免 Telegram 拒绝请求。
-///
-/// # Arguments
-///
-/// * `bot` - Teloxide Bot 实例
-/// * `q` - 触发此操作的 CallbackQuery
-/// * `msg` - 触发此操作的消息（超长详情时用于编辑）
-/// * `file_path` - 目标文件路径（已通过路径安全校验）
-///
-/// # Errors
-///
-/// Telegram API 调用失败时返回错误。
+/// 展示单个视频文件的详情信息（短文本走弹窗提示，超长自动切换为编辑面板展示）。
 pub async fn action_browse(
     bot: &Bot,
     q: &CallbackQuery,
     msg: &Message,
-    file_path: PathBuf,
+    config: &Config,
+    raw_file_path: PathBuf,
 ) -> Result<()> {
+    let guard = PathGuard::new(config.base_dir.clone());
+    let file_path = guard.assert_regular_file_no_symlink(&raw_file_path)?;
+
     let filename = file_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -48,11 +39,27 @@ pub async fn action_browse(
 
     let size_str = format_file_size(&file_path);
 
-    let duration = get_video_duration(&file_path).await.unwrap_or(0.0);
-    let dur_str = if duration > 0.0 {
-        format_duration(duration)
-    } else {
-        "未知或无损流".to_string()
+    let (dur_str, stream_summary) = match probe_media(&file_path, config.ffprobe_timeout_secs).await
+    {
+        Ok(probe) => {
+            let d = if probe.duration_secs > 0.0 {
+                format_duration(probe.duration_secs)
+            } else {
+                "未知（容器未记录）".to_string()
+            };
+            let v_desc = probe
+                .video_streams
+                .first()
+                .map(|v| format!("{} {}x{}", v.codec_name, v.width, v.height))
+                .unwrap_or_else(|| "无视频轨".to_string());
+            let a_desc = probe
+                .audio_streams
+                .first()
+                .map(|a| a.codec_name.clone())
+                .unwrap_or_else(|| "无音频轨".to_string());
+            (d, format!("{v_desc} / {a_desc}"))
+        }
+        Err(_) => ("探测超时或未知".to_string(), "未知".to_string()),
     };
 
     let mtime_str = std::fs::metadata(&file_path)
@@ -68,7 +75,8 @@ pub async fn action_browse(
          ━━━━━━━━━━━━\n\
          📏 大小: {size_str}\n\
          ⏱️ 时长: {dur_str}\n\
-         🕒 修改时间: {mtime_str}"
+         🎞️ 编码: {stream_summary}\n\
+         🕒 修改: {mtime_str}"
     );
 
     if info_text.chars().count() <= ALERT_TEXT_LIMIT {
@@ -77,23 +85,24 @@ pub async fn action_browse(
             .show_alert(true)
             .await
             .map_err(|e| {
-                warn!(error = %e, "Failed to answer browse callback");
+                warn!(error = %redact_secrets(&e.to_string()), "Failed to answer browse callback");
                 e
             })?;
         return Ok(());
     }
 
-    // 超长文本无法放进 alert（Telegram 上限 200 字符），改为编辑当前消息
     let html_text = format!(
         "📄 <b>文件详情</b>\n\
          ━━━━━━━━━━━━\n\
          📁 <code>{}</code>\n\
          📏 大小: <code>{}</code>\n\
          ⏱️ 时长: <code>{}</code>\n\
+         🎞️ 编码参数: <code>{}</code>\n\
          🕒 修改时间: <code>{}</code>",
         escape_html(filename),
         escape_html(&size_str),
         escape_html(&dur_str),
+        escape_html(&stream_summary),
         escape_html(&mtime_str)
     );
 

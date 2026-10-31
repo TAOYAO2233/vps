@@ -1,11 +1,4 @@
-//! YouTube API 客户端构建。
-//!
-//! 提供构建 `google_youtube3::YouTube` Hub 实例的工厂函数。
-//!
-//! ## 版本说明
-//!
-//! 使用 `hyper v0.14` 和 `yup-oauth2 v9`，与 `google-youtube3 v5` 兼容；
-//! `hyper-rustls` 固定为 `v0.25`（`yup-oauth2 v9` 内部使用的版本），避免两套 rustls 栈。
+//! YouTube API Hub 辅助工厂（兼容 `google-youtube3 v5`）。
 
 use std::path::Path;
 
@@ -16,21 +9,13 @@ use hyper_rustls::HttpsConnector;
 
 use super::oauth::load_authenticator;
 
-/// 构建 YouTube API Hub 实例。
-///
-/// # Arguments
-///
-/// * `token_file` - OAuth2 token.json 文件路径
-///
-/// # Errors
-///
-/// 若认证失败，返回错误。
+/// 构建 `google_youtube3::YouTube` Hub 实例（供元数据扩展接口备用）。
+#[allow(dead_code)]
 pub async fn build_youtube_hub(
     token_file: &Path,
 ) -> Result<YouTube<HttpsConnector<HttpConnector>>> {
     let auth = load_authenticator(token_file).await?;
 
-    // hyper v0.14 的 HTTPS 连接器
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_only()

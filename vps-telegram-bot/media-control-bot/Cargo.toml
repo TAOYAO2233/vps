@@ -32,7 +32,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # ── Configuration / environment ────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 dotenvy = "0.15"
+url = "2"
 
 # ── Regex ──────────────────────────────────────────────────────────────────────
 regex = "1"
@@ -41,13 +43,18 @@ once_cell = "1"
 # ── Time ───────────────────────────────────────────────────────────────────────
 chrono = { version = "0.4", features = ["serde"] }
 
-# ── YouTube API ────────────────────────────────────────────────────────────────
+# ── HTTP / YouTube API ─────────────────────────────────────────────────────────
 # google-youtube3 v5 依赖 yup-oauth2 v9 + hyper v0.14（不是 v1）；
 # yup-oauth2 v9 内部使用 hyper-rustls v0.25，这里保持同版本，避免引入两套 rustls 栈。
+bytes = "1"
 google-youtube3 = { version = "5", features = ["yup-oauth2"] }
 yup-oauth2 = "9"
 hyper = { version = "0.14", features = ["full"] }
 hyper-rustls = { version = "0.25", features = ["webpki-roots"] }
+
+[target.'cfg(unix)'.dependencies]
+# 安全封装 POSIX statvfs 文件系统统计接口（兼容 unsafe_code = "forbid"）
+rustix = { version = "1", features = ["std", "fs"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
