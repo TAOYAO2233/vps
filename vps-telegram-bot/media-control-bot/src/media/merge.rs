@@ -79,8 +79,6 @@ pub struct MergeCheckDetails {
     pub duration_ratio: f64,
     /// 输出大小占输入总大小比例（辅助参考）
     pub size_ratio: f64,
-    /// FFprobe 是否成功解析输出容器与完整音视频流且 `output_duration > 0`
-    pub probe_streams_ok: bool,
     /// 保留时长与截除上限校验是否通过
     pub duration_ok: bool,
     /// 辅助体积比指标是否达到参考线（仅提示，不单独否决）
@@ -179,7 +177,6 @@ pub fn evaluate_merge_strict(
         output_size,
         duration_ratio,
         size_ratio,
-        probe_streams_ok,
         duration_ok,
         size_ok,
         failure_reason,

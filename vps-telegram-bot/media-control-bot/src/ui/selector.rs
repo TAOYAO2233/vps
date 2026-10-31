@@ -4,7 +4,6 @@
 //! 并在多选（尤其是视频合并）模式下直观展示用户选择的严格先后顺序。
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Result;
 use teloxide::prelude::*;

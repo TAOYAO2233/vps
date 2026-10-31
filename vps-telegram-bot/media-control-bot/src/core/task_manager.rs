@@ -25,6 +25,7 @@ pub struct StopTicket {
 }
 
 /// 发起 `/stop` 时的第一阶段判定结果。
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub enum StopInitiation {
     /// 当前没有任何运行中或排队中的任务
@@ -339,6 +340,7 @@ impl TaskManager {
     }
 
     /// 第一阶段：原子检查并向当前活跃任务发送取消信号（幂等保护连续 `/stop`）。
+    #[cfg(test)]
     pub async fn initiate_stop(&self) -> StopInitiation {
         let mut state = self.state.write().await;
         state.cleanup_active_task();

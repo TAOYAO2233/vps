@@ -773,6 +773,7 @@ impl AppState {
     }
 
     /// 取消当前所有正在运行或排队中的任务（向当前独占任务和所有 YouTube 上传任务发送各自作用域的取消信号）。
+    #[cfg(test)]
     pub fn cancel_all(&mut self) {
         if let Some(active) = &self.active_task {
             if !active.handle.is_finished() {

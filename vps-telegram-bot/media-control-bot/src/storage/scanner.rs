@@ -33,6 +33,7 @@ pub struct DirListing {
 
 impl DirListing {
     /// 返回所有条目名（目录在前，文件在后）。
+    #[cfg(test)]
     #[must_use]
     pub fn all_items(&self) -> Vec<String> {
         self.items.iter().map(|item| item.name.clone()).collect()

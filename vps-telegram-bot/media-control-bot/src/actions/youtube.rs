@@ -439,7 +439,10 @@ async fn do_upload(
     // 关键改进：等待 Semaphore 期间同时监听取消信号，收到 /stop 立即中断无需等待前序大文件传完
     let mut cancel_while_queued = cancel_rx.clone();
     if *cancel_while_queued.borrow() {
-        queue_store.remove(&task_id).await;
+        if let Err(e) = queue_store.remove(&task_id).await {
+            warn!(task_id = %task_id, error = %redact_secrets(&e.to_string()),
+                "Cancelled upload may remain in recovery queue");
+        }
         update_task_status(&state, &task_id, "已取消", Some((0.0, 0.0))).await;
         let _ = bot
             .edit_message_text(
@@ -460,7 +463,10 @@ async fn do_upload(
             permit_res.map_err(|e| anyhow::anyhow!("Semaphore closed: {e}"))?
         }
         _ = cancel_while_queued.changed() => {
-            queue_store.remove(&task_id).await;
+            if let Err(e) = queue_store.remove(&task_id).await {
+                warn!(task_id = %task_id, error = %redact_secrets(&e.to_string()),
+                    "Cancelled upload may remain in recovery queue");
+            }
             update_task_status(&state, &task_id, "已取消", Some((0.0, 0.0))).await;
             let _ = bot
                 .edit_message_text(
@@ -488,7 +494,10 @@ async fn do_upload(
     let verified_path = match guard.assert_regular_file_no_symlink(&file_path) {
         Ok(p) => p,
         Err(e) => {
-            queue_store.remove(&task_id).await;
+            if let Err(remove_err) = queue_store.remove(&task_id).await {
+                warn!(task_id = %task_id, error = %redact_secrets(&remove_err.to_string()),
+                    "Invalid upload source may remain in recovery queue");
+            }
             let _ = bot
                 .edit_message_text(
                     progress_msg.chat.id,
@@ -507,7 +516,10 @@ async fn do_upload(
 
     if let Err(e) = ensure_stable_files(&[verified_path.clone()], config.file_stable_seconds).await {
         if !preserve_on_error {
-            let _ = queue_store.remove(&task_id).await;
+            if let Err(remove_err) = queue_store.remove(&task_id).await {
+                warn!(task_id = %task_id, error = %redact_secrets(&remove_err.to_string()),
+                    "Unstable upload source may remain in recovery queue");
+            }
         }
         update_task_status(&state, &task_id, "源文件未稳定", None).await;
         let _ = bot.edit_message_text(
