@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{debug, info, warn};
 
 use super::oauth::{fetch_access_token, load_authenticator};
-use crate::config::YoutubeRecoveryMode;
+use crate::config::{VideoExtensions, YoutubeRecoveryMode};
 use crate::errors::AppError;
 use crate::utils::redact::{
     redact_secrets, redact_youtube_session_uri, register_youtube_session_uri,
@@ -395,7 +395,17 @@ where
     let total_bytes = source_id.size;
     let chunk_size = align_chunk_size(opts.chunk_size_bytes);
 
-    let title_truncated: String = title.chars().take(95).collect();
+    // Keep the local filename intact, but omit its video extension in YouTube metadata.
+    let upload_title = if VideoExtensions::is_video(title) {
+        title
+            .rsplit_once('.')
+            .map(|(stem, _)| stem)
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or(title)
+    } else {
+        title
+    };
+    let title_truncated: String = upload_title.chars().take(95).collect();
     let mut access_token = token_provider(false).await?;
     let mut refreshed_after_401 = false;
     let mut session_restarts: u32 = 0;
