@@ -52,7 +52,7 @@ pub fn build_dispatcher(
                                 BotCommand::Tasks => cmd_tasks(bot, msg, state, config).await,
                                 BotCommand::History => cmd_history(bot, msg, state, config).await,
                                 BotCommand::Pending => cmd_pending(bot, msg, state, config).await,
-                                BotCommand::Trash => cmd_trash(bot, msg, config).await,
+                                BotCommand::Trash => cmd_trash(bot, msg, state, config).await,
                                 BotCommand::Find(query) => cmd_find(bot, msg, state, config, query).await,
                                 BotCommand::Clearfilter => cmd_clearfilter(bot, msg, state, config).await,
                             }

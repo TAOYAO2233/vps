@@ -12,7 +12,7 @@
 - **🛡️ 路径、菜单快照与删除身份防护**: `PathGuard` 强制 `canonicalize` 边界校验（失败绝不退化放行）；文件选择器绑定 `MenuSnapshot`（含 `snap_id` 与目录内容摘要 `listing_hash`）防止旧菜单或目录变动引发错选；批量删除绑定一次性确认令牌与文件身份快照（`size`、`modified`、Unix `(dev, ino)`），执行前逐项复核。
 - **📡 可观测 RTMP 无损推流**: 显式流映射 `-map 0:v:0` + 可选音频流、`-rw_timeout` 网络超时保护、`-progress pipe:1` 结构化进度解析 + 独立后台 `stderr` 排空防管道死锁 + 本地进度停滞看门狗；支持未知时长媒体展示已推流时长与实时速率。
 - **☁️ 自管 YouTube Resumable Upload**: 基于 `yup-oauth2` + `hyper` 自管 HTTP 可恢复分块上传，`YOUTUBE_UPLOAD_CHUNK_MB` 真正控制单次 `PUT` 分块大小（恒为 `256 KiB` 整数倍，`64 KiB` 流式缓冲低内存读取）；区分「本地已发送」与「服务端 `308 Range` 已确认」双进度，仅在收到 `200/201` 且解析出有效 `video_id` 时判定成功；网络中断重试前先查询服务端已接收偏移防止重复成片；排队上限受 `YOUTUBE_MAX_QUEUE_SIZE` 约束且排队任务可被 `/stop` 立即取消。
-- **🧰 任务与文件管理**: `/tasks` 查看并单独停止任务，`/history` 查看本次运行的最近结果，`/pending` 核实待确认的 YouTube 会话（需启用 `requeue` 或 `resume` 持久化）；`/find` 按文件名筛选并支持选择本页文件。删除先移入同盘回收站，可通过 `/trash` 恢复，超过 `TRASH_RETENTION_DAYS` 后清理。
+- **🧰 任务与文件管理**: `/tasks` 查看并单独停止任务，`/history` 查看本次运行的最近结果，`/pending` 核实待确认的 YouTube 会话（需启用 `requeue` 或 `resume` 持久化）；`/find` 按文件名筛选并支持选择本页文件。主菜单可直接打开同盘回收站，恢复文件或二次确认后清空；超过 `TRASH_RETENTION_DAYS` 的文件也会自动清理。
 - **⏱️ 录播稳定性检查**: 上传、推流、合并和转封装前要求源文件在 `FILE_STABLE_SECONDS` 内未修改，并在短暂观察后再次核对大小与修改时间。
 
 ## 🛠️ 技术栈

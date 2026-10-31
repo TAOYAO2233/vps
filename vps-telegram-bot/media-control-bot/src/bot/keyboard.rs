@@ -24,10 +24,10 @@ pub fn main_menu_keyboard() -> InlineKeyboardMarkup {
             "🔄 批量无损转 MP4",
             "init_convert",
         )],
-        vec![InlineKeyboardButton::callback(
-            "🗑️ 批量删除文件",
-            "init_delete",
-        )],
+        vec![
+            InlineKeyboardButton::callback("🗑️ 移入回收站", "init_delete"),
+            InlineKeyboardButton::callback("♻️ 查看回收站", "menu_trash"),
+        ],
     ])
 }
 
@@ -103,7 +103,7 @@ pub fn file_selector_keyboard(
 #[must_use]
 pub fn delete_confirmation_keyboard(token: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("✅ 确认永久删除", format!("confirm_del_{token}")),
+        InlineKeyboardButton::callback("✅ 确认移入回收站", format!("confirm_del_{token}")),
         InlineKeyboardButton::callback("取消", format!("cancel_del_{token}")),
     ]])
 }

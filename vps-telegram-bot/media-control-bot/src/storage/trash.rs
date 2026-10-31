@@ -1,6 +1,7 @@
 //! Reversible media deletion on the same mounted filesystem.
 
 use std::path::{Path, PathBuf};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,6 +19,13 @@ pub struct TrashEntry {
     pub original_path: PathBuf,
     pub size: u64,
     pub deleted_at_secs: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct TrashClearReport {
+    pub removed: usize,
+    pub freed_bytes: u64,
+    pub failed: usize,
 }
 
 pub struct TrashStore {
@@ -94,8 +102,55 @@ impl TrashStore {
             Self::checked_id(&entry.id)?;
             entries.push(entry);
         }
-        entries.sort_by(|a, b| b.deleted_at_secs.cmp(&a.deleted_at_secs));
+        entries.sort_by(|a, b| {
+            b.deleted_at_secs.cmp(&a.deleted_at_secs).then_with(|| a.id.cmp(&b.id))
+        });
         Ok(entries)
+    }
+
+    /// Binds a clear confirmation to the exact visible set of trash entries.
+    pub fn snapshot_token(entries: &[TrashEntry]) -> String {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for entry in entries {
+            entry.id.hash(&mut hash);
+            entry.size.hash(&mut hash);
+        }
+        format!("{:016x}", hash.finish())
+    }
+
+    pub fn clear_all(&self, expected_token: &str) -> Result<TrashClearReport> {
+        let entries = self.list()?;
+        if entries.is_empty() || Self::snapshot_token(&entries) != expected_token {
+            anyhow::bail!("回收站内容已变化，请重新打开并确认");
+        }
+        let dir = self.trash_dir()?;
+        let guard = PathGuard::new(self.base_dir.clone());
+        let mut report = TrashClearReport::default();
+        for entry in entries {
+            let media_path = dir.join(format!("{}.media", entry.id));
+            let record_path = dir.join(format!("{}.json", entry.id));
+            let media_result = if path_occupied(&media_path) {
+                guard.assert_regular_file_no_symlink(&media_path).and_then(|path| {
+                    let size = std::fs::metadata(&path)?.len();
+                    std::fs::remove_file(path)?;
+                    Ok(size)
+                })
+            } else {
+                Ok(0)
+            };
+            match media_result {
+                Ok(freed) => {
+                    report.freed_bytes = report.freed_bytes.saturating_add(freed);
+                    if std::fs::remove_file(record_path).is_ok() {
+                        report.removed += 1;
+                    } else {
+                        report.failed += 1;
+                    }
+                }
+                Err(_) => report.failed += 1,
+            }
+        }
+        Ok(report)
     }
 
     pub fn restore(&self, id: &str) -> Result<PathBuf> {

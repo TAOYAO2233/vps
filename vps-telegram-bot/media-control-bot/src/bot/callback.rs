@@ -5,6 +5,8 @@
 //! | 格式 | 说明 |
 //! |------|------|
 //! | `menu_main` | 返回主菜单（实时刷新 `/storage512` 容量） |
+//! | `menu_trash` | 打开回收站，支持恢复与二次确认清空 |
+//! | `trash_clear_ask` / `trash_clear_confirm_{token}` | 对当前回收站清单进行永久清空确认 |
 //! | `init_{action}` | 初始化指定模式的文件选择器 |
 //! | `page_{action}_{snap_id}_{page}` | 翻页（校验快照与目录变动） |
 //! | `enterdir_{action}_{snap_id}_{idx}` | 进入子目录（校验快照、目录类型与 `PathGuard`） |
@@ -31,9 +33,11 @@ use crate::core::state::{
 use crate::core::PermissionGuard;
 use crate::core::task_manager::TaskManager;
 use crate::storage::path::PathGuard;
+use crate::storage::filesystem::format_file_size_bytes;
 use crate::storage::trash::TrashStore;
 use crate::storage::scanner::scan_directory;
 use crate::ui::menu::render_main_menu;
+use crate::bot::commands::render_trash_panel;
 use crate::ui::pagination::Paginator;
 use crate::ui::selector::render_file_selector;
 use crate::utils::redact::{redact_secrets, sanitize_user_error};
@@ -152,6 +156,83 @@ async fn dispatch_callback(
         let store = TrashStore::new(config.base_dir.clone(), config.trash_retention_days);
         let restored = store.restore(id)?;
         bot.send_message(msg.chat.id, format!("✅ 已恢复：{}", restored.display())).await?;
+        render_trash_panel(bot, msg, &state, &config, true).await?;
+        return Ok(());
+    }
+
+    if data == "menu_trash" {
+        bot.answer_callback_query(&q.id).await?;
+        render_trash_panel(bot, msg, &state, &config, true).await?;
+        return Ok(());
+    }
+
+    if data == "trash_clear_ask" {
+        let monitor = { Arc::clone(&state.read().await.disk_monitor) };
+        monitor.ensure_space_available(0).await?;
+        let store = TrashStore::new(config.base_dir.clone(), config.trash_retention_days);
+        let entries = store.list()?;
+        if entries.is_empty() {
+            bot.answer_callback_query(&q.id).text("回收站已清空。").await?;
+            render_trash_panel(bot, msg, &state, &config, true).await?;
+            return Ok(());
+        }
+        let bytes = entries.iter().fold(0_u64, |sum, entry| sum.saturating_add(entry.size));
+        let token = TrashStore::snapshot_token(&entries);
+        bot.answer_callback_query(&q.id).await?;
+        bot.edit_message_text(msg.chat.id, msg.id, format!(
+            "⚠️ <b>确认永久清空回收站？</b>\n\n将删除 <b>{}</b> 个文件，约 <b>{}</b>。\n此操作无法恢复。",
+            entries.len(), format_file_size_bytes(bytes)
+        ))
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .reply_markup(InlineKeyboardMarkup::new(vec![
+                vec![InlineKeyboardButton::callback("确认永久清空", format!("trash_clear_confirm_{token}"))],
+                vec![InlineKeyboardButton::callback("取消，返回回收站", "menu_trash")],
+            ]))
+            .await?;
+        return Ok(());
+    }
+
+    if let Some(token) = data.strip_prefix("trash_clear_confirm_") {
+        let monitor = { Arc::clone(&state.read().await.disk_monitor) };
+        monitor.ensure_space_available(0).await?;
+        let store = TrashStore::new(config.base_dir.clone(), config.trash_retention_days);
+        let entries = store.list()?;
+        if entries.is_empty() || TrashStore::snapshot_token(&entries) != token {
+            bot.answer_callback_query(&q.id)
+                .text("回收站内容已变化，请重新确认。")
+                .show_alert(true).await?;
+            render_trash_panel(bot, msg, &state, &config, true).await?;
+            return Ok(());
+        }
+        bot.answer_callback_query(&q.id).text("正在清空回收站…").await?;
+        let expected = token.to_string();
+        let report = tokio::task::spawn_blocking(move || store.clear_all(&expected)).await;
+        match report {
+            Ok(Ok(report)) => {
+                let heading = if report.failed == 0 {
+                    "🧹 <b>回收站已清空</b>"
+                } else {
+                    "⚠️ <b>回收站部分清理失败</b>"
+                };
+                bot.edit_message_text(msg.chat.id, msg.id, format!(
+                    "{heading}\n已清理：{} 个\n释放空间：{}\n失败：{} 个",
+                    report.removed, format_file_size_bytes(report.freed_bytes), report.failed
+                ))
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                        InlineKeyboardButton::callback("返回回收站", "menu_trash"),
+                    ]]))
+                    .await?;
+            }
+            Ok(Err(e)) => {
+                bot.send_message(msg.chat.id, format!("清空失败：{}", sanitize_user_error(&e))).await?;
+                render_trash_panel(bot, msg, &state, &config, true).await?;
+            }
+            Err(e) => {
+                let err: anyhow::Error = e.into();
+                bot.send_message(msg.chat.id, format!("清空任务异常：{}", sanitize_user_error(&err))).await?;
+            }
+        }
         return Ok(());
     }
 

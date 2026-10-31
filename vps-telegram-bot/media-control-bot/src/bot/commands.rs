@@ -18,6 +18,7 @@ use crate::ui::menu::MainMenu;
 use crate::utils::format::format_upload_list;
 use crate::utils::format::escape_html;
 use crate::storage::trash::TrashStore;
+use crate::storage::filesystem::format_file_size_bytes;
 use crate::ui::selector::render_file_selector;
 
 /// 处理 `/start` 命令：实时探测 `/storage512` 容量并渲染主控面板。
@@ -192,16 +193,30 @@ pub async fn cmd_pending(bot: Bot, msg: Message, state: SharedState, config: Arc
 }
 
 /// Show recoverable deleted files.
-pub async fn cmd_trash(bot: Bot, msg: Message, config: Arc<Config>) -> ResponseResult<()> {
+pub async fn cmd_trash(bot: Bot, msg: Message, state: SharedState, config: Arc<Config>) -> ResponseResult<()> {
     if PermissionGuard::new(config.admin_id).check_message(&msg).is_err() { return Ok(()); }
-    let store = TrashStore::new(config.base_dir.clone(), config.trash_retention_days);
-    let entries = match store.list() {
-        Ok(entries) => entries,
-        Err(_) => {
-            bot.send_message(msg.chat.id, "无法读取回收站，请检查媒体盘挂载和服务端日志。").await?;
-            return Ok(());
-        }
+    if let Err(e) = render_trash_panel(&bot, &msg, &state, &config, false).await {
+        bot.send_message(msg.chat.id,
+            format!("无法打开回收站：{}", crate::utils::redact::sanitize_user_error(&e))).await?;
+    }
+    Ok(())
+}
+
+/// Render the same trash view for `/trash` and the main-menu button.
+pub async fn render_trash_panel(
+    bot: &Bot,
+    msg: &Message,
+    state: &SharedState,
+    config: &Config,
+    edit: bool,
+) -> anyhow::Result<()> {
+    let monitor = {
+        let s = state.read().await;
+        Arc::clone(&s.disk_monitor)
     };
+    monitor.ensure_space_available(0).await?;
+    let store = TrashStore::new(config.base_dir.clone(), config.trash_retention_days);
+    let entries = store.list()?;
     let mut lines = vec![format!("🗑️ <b>回收站</b>（保留 {} 天）", config.trash_retention_days)];
     let mut rows = Vec::new();
     for entry in entries.iter().take(10) {
@@ -213,10 +228,20 @@ pub async fn cmd_trash(bot: Bot, msg: Message, config: Arc<Config>) -> ResponseR
         )]);
     }
     if lines.len() == 1 { lines.push("回收站为空。".to_string()); }
-    bot.send_message(msg.chat.id, lines.join("\n"))
-        .parse_mode(ParseMode::Html)
-        .reply_markup(InlineKeyboardMarkup::new(rows))
-        .await?;
+    if !entries.is_empty() {
+        let total_bytes = entries.iter().fold(0_u64, |sum, entry| sum.saturating_add(entry.size));
+        lines.push(format!("\n共 {} 个文件，约 {}。", entries.len(), format_file_size_bytes(total_bytes)));
+        rows.push(vec![InlineKeyboardButton::callback("🧹 清空回收站", "trash_clear_ask")]);
+    }
+    rows.push(vec![InlineKeyboardButton::callback("🔙 返回主菜单", "menu_main")]);
+    let keyboard = InlineKeyboardMarkup::new(rows);
+    if edit {
+        bot.edit_message_text(msg.chat.id, msg.id, lines.join("\n"))
+            .parse_mode(ParseMode::Html).reply_markup(keyboard).await?;
+    } else {
+        bot.send_message(msg.chat.id, lines.join("\n"))
+            .parse_mode(ParseMode::Html).reply_markup(keyboard).await?;
+    }
     Ok(())
 }
 
