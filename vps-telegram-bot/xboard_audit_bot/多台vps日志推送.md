@@ -1,225 +1,31 @@
-## 🛑 第一阶段：准备公共放行目录
+# 多台 VPS 向主控机转发 xboard-node 日志
 
-> 由于默认的 /root/ 目录存在严格的系统降权和隔离限制  
-> 我们统一使用系统公共的 /home/xboard_log/ 目录来做数据交互
->
-> #### 在 VPS-A（主控机）上分别输入以下命令：
->
-> ```bash
-> # 创建新的日志公共存放目录
-> mkdir -p /home/xboard_log/
-> # 创建 VPS-B 的接收日志文件
-> touch /home/xboard_log/xboard_vps_b.log
-> 赋予完全读写权限，彻底根除权限阻挡
-> chmod 777 /home/xboard_log/
-> chmod 666 /home/xboard_log/xboard_vps_b.log
-> ```
->
-> ### 在 VPS-B（客户端）上执行:
->
-> ```bash
-> # 同样创建公共目录
-> mkdir -p /home/xboard_log/
-> chmod 777 /home/xboard_log/
-> ```
->
-> ### 💡【核心添加】将本地 xboard-node 服务的日志实时、不断流地灌入公共目录：
->
-> ```bash
-> nohup journalctl -u xboard-node -f --no-pager > /home/xboard_log/xboard.log 2>&1 &
-> ```
+下述链路与 [`xboard_audit.sh`](xboard_audit.sh) 使用的方式一致：客户端从本地 `journalctl -u xboard-node` 生成日志，rsyslog 把它发往主控机 514/UDP；主控机按节点标识写入 `/home/xboard_log/`，Python 审计程序逐个读取文件。UDP 不保证送达，也不提供传输加密；跨公网使用时至少在防火墙只允许已知客户端 IP，敏感环境宜使用受保护的网络。
 
-## 📡 第二阶段：配置客户端（VPS-B）日志外发
+## 主控机
 
-> 登录到 VPS-B（客户端），配置系统自带的 rsyslog 将日志实时打包发给主控机
->
-> #### 1.写入推送规则
->
-> ```bash
-> nano /etc/rsyslog.d/xboard-forward.conf
-> ```
->
-> 粘贴以下内容（注意：请将 主控机VPS-A的公网IP 替换为 VPS-A 的真实公网 IP）：
+先使用[使用向导](使用向导.md)配置主控机。脚本会启用 rsyslog 的 `imudp` 输入并创建 `/etc/rsyslog.d/xboard-recv.conf`，将匹配节点标识的消息写入对应日志文件。确认服务和端口：
 
-> ```bash
-> module(load="imfile")
->
-> input(type="imfile"
-> File="/home/xboard_log/xboard.log"
-> Tag="xboard-node-b"
-> Severity="info"
-> Facility="local7")
->
-> # 使用 UDP 将日志打给主控机
->
-> local7.* @主控机VPS-A的公网IP:514
-> ```
->
-> #### 2.解除 rsyslog 降权并重启
->
-> 为了让 rsyslog 能顺利跨目录读取文件，在 VPS-B 上运行：
->
-> ```bash
-> # 修改主配置文件，注释掉降权运行行
-> sed -i 's/^\$PrivDropToUser/# \$PrivDropToUser/g' /etc/rsyslog.conf
-> sed -i 's/^\$PrivDropToGroup/# \$PrivDropToGroup/g' /etc/rsyslog.conf
->
-> # 重启服务
-> systemctl restart rsyslog
-> ```
+```bash
+sudo systemctl status rsyslog xboard-audit xboard-tunnel
+sudo ss -lun | grep ':514'
+sudo tail -f /home/xboard_log/xboard_vps_b.log
+```
 
-## 📥 第三阶段：配置主控机（VPS-A）日志接收与分流
+为每台新增客户端分配不同标识与日志文件，并把 `{"path": "…", "node_name": "…"}` 加入审计程序的 `LOG_TASKS`。避免多个节点共用标识，否则记录会混在一起。调整 rsyslog 规则后先执行 `sudo rsyslogd -N1`，再重启 rsyslog；调整 Python 列表后重启 `xboard-audit`。
 
-> 登录到 VPS-A（主控机 RN2H2G）。
->
-> #### 1.开启 rsyslog 的 UDP 接收功能
->
-> ```bash
-> nano /etc/rsyslog.conf
-> ```
->
-> 找到以下两行（通常在第 15-20 行左右），取消它们前面的 # 号注释：
->
-> ```bash
-> module(load="imudp")
-> input(type="imudp" port="514")
-> ```
->
-> #### 2.写入接收并独立保存规则
->
-> ```bash
-> nano /etc/rsyslog.d/xboard-recv.conf
-> ```
->
-> 粘贴以下内容：
->
-> ```bash
-> # 创建空白的目标接收文件并赋予权限
-> if $msg contains 'xboard-node-b' or $rawmsg contains 'xboard-node-b' then {
->    action(type="omfile" file="/home/xboard_log/xboard_vps_b.log")
->    stop
-> }
-> ```
->
-> 或者以下内容：
->
-> ```bash
-> # 如果日志来自 VPS-B，则写入独立日志文件，并停止后续规则处理
-> if $fromhost-ip == 'VPS-B的公网IP' then {
->    action(type="omfile" file="/home/xboard_log/xboard_vps_b.log")
->    stop
-> }
->
-> ```
->
-> #### 3.重启主控机服务
->
-> ```bash
-> systemctl restart rsyslog
-> ```
->
-> 💡 测试节点链路：  
-> 此时让 VPS-B 产生点流量，在主控机执行
->
-> ```bash
-> tail -f /home/xboard_log/xboard_vps_b.log
-> ```
->
-> 只要屏幕上刷刷输出数据，说明日志同步彻底打通！
->
-> ### 检查主控机（VPS-A）是否真的收到了数据
->
-> 1.在 VPS-A 上安装抓包工具：
->
-> ```bash
-> apt-get install tcpdump -y  # Debian/Ubuntu
-> # 或 yum install tcpdump -y  # CentOS
-> ```
->
-> 2.运行抓包命令，看看有没有来自 VPS-B 的 514 端口数据：
->
-> ```bash
-> tcpdump -i any udp port 514 -n -vv
-> ```
->
-> 保持抓包运行，去让你的 Xboard 节点产生一点流量（或者在 VPS-B 上随便重启一下某个服务产生系统日志）。  
-> 3.观察 VPS-A 的屏幕：
->
-> - 如果屏幕毫无动静：说明数据被 VPS-A 的防火墙（如 ufw/iptables）阻挡了，或者安全组（如阿里云/腾讯云/甲骨文的后台面板） 没有开放 UDP 514 端口。
-> - 如果屏幕刷刷显示有数据包进来：说明网络通了，问题出在 VPS-A 的 rsyslog 规则配置上。
+## 客户端
 
-## 🤖 第四阶段：部署主控机（VPS-A）Python 集中审计服务
+在每台客户端运行安装脚本并选择客户端配置，填写主控 IP 和本机标识。脚本负责创建 `xboard-tunnel` 与 rsyslog 转发规则。检查：
 
-> #### 依旧在 VPS-A（主控机 ） 上操作。
->
-> #### 1.部署完美兼容 Python 3.8 的核心脚本:
->
-> ```bash
-> nano /root/xboard_log/xboard_monitor.py
-> ```
->
-> 清空里面的旧内容，将以下完整代码粘贴进去：  
-> [xboard_audit.py](https://raw.githubusercontent.com/TAOYAO2233/vps/refs/heads/main/vps-telegram-bot/xboard_audit_bot/xboard_audit.py)  
-> 请务必在脚本上方填好你的 TG_BOT_TOKEN 后保存退出。
->
-> #### 2.重建 Python 3.8 纯净虚拟环境
->
-> ```bash
-> cd /root/xboard_log
-> rm -rf xboard_env
->
-> # 使用系统自带的 python3 构建
-> python3 -m venv xboard_env
-> ./xboard_env/bin/pip install --upgrade pip
-> ./xboard_env/bin/pip install python-telegram-bot
-> ```
->
-> #### 3.配置 Systemd 守护进程守护
->
-> ```bash
-> nano /etc/systemd/system/xboard-audit.service
-> ```
->
-> 整盘覆写为以下完美对齐名称与工作路径的配置：
->
-> ```bash
-> [Unit]
-> Description=Xboard Log全量网络审计Telegram机器人(集中管理版)
-> After=network.target
->
-> [Service]
-> Type=simple
-> User=root
-> WorkingDirectory=/root/xboard_log
-> ExecStart=/root/xboard_log/xboard_env/bin/python3 /root/xboard_log/xboard_monitor.py
-> Restart=always
-> RestartSec=5
->
->
-> [Install]
-> WantedBy=multi-user.target
-> ```
+```bash
+sudo systemctl status xboard-tunnel rsyslog
+sudo journalctl -u xboard-tunnel -e
+sudo rsyslogd -N1
+```
 
-## 🏁 第五阶段：全面拉起与验证
+确认本机 `/home/xboard_log/xboard.log` 有新内容，主控机的对应节点文件也在增长。没有数据时依次检查 xboard-node 日志级别、客户端导流服务、514/UDP 防火墙、主控机 rsyslog 规则及审计服务日志。
 
-> 在 主控机（VPS-A） 上执行最后的启动总攻命令：
->
-> ```bash
-> # 刷新服务引擎
-> systemctl daemon-reload
->
-> # 启动并允许开机自启
-> systemctl enable --now xboard-audit
->
-> # 强制重启服务
-> systemctl restart xboard-audit
->
-> # 检查状态是否成功变绿
-> systemctl status xboard-audit
-> ```
+## 日志权限
 
-## 📊 实时监控：
-
-> 大功告成！现在直接输入 `bash
-journalctl -u xboard-audit -f`
-> 你就能看到两路日志流被主控机完美捕捉，Telegram 机器人也开始安稳、高效地为你全天候播报两个节点的聚合审计动态了。
+安装脚本会为 `/home/xboard_log` 设置宽松权限，便于 rsyslog 写入。部署完成后应按实际运行用户收紧目录和文件权限。Token、来源 IP、UUID 和访问目标均应视为敏感信息，不要将这些日志加入公开仓库。

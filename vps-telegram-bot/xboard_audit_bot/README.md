@@ -1,87 +1,20 @@
-# 📁 Xboard 审计监控机器人 (xboard_audit_bot)
+# xboard-node 日志审计通知
 
-这是一个基于 Python 异步架构开发的 Telegram 运维审计监控机器人。它专门用于对 Xboard 系统或节点环境进行实时健康检查、策略审计与自动故障修复。当发现异常或触发审计规则时，机器人会通过 Telegram 管道向管理员发送即时告警，并配合 Systemd 守护进程实现服务的常驻与自愈。
+本项目从 xboard-node 日志中提取连接来源 IP、目标地址、协议及耗时，将短时间内的记录按节点汇总后发送到 Telegram。它依赖现有日志格式中的 `inbound connection from` / `inbound connection to` 行；格式变化时需要调整正则。
 
-## 🚀 核心特性
+## 文件
 
-- **自动策略审计**：对目标节点进行连续、自动化的状态审计与合规性检查。
-- **故障自愈机制**：当检测到核心依赖或特定服务状态异常时，可触发自动拉起或重启修复。
-- **原生 Systemd 守护**：自带标准的 `.service` 配置文件，完美融入 Linux 系统服务管理，支持开机自启和进程死掉后自动拉起。
-- **异步非阻塞**：基于 Python 异步事件循环，确保监控轮询与 Telegram 消息推送高效并发，不占用过多 VPS 系统资源。
+| 文件 | 用途 |
+| --- | --- |
+| [`xboard_audit.py`](xboard_audit.py) | Python 3.9+ 审计程序。 |
+| [`xboard_audit3.8.py`](xboard_audit3.8.py) | Python 3.8 兼容版。 |
+| [`xboard_audit.sh`](xboard_audit.sh) | 交互配置主控机、客户端和新增节点的安装脚本。 |
+| [`xboard-audit.service`](xboard-audit.service) | 手动部署时可参考的 systemd 服务文件；路径应与实际部署一致。 |
 
----
+程序默认监看 `/home/xboard_log/xboard.log` 与 `/home/xboard_log/xboard_vps_b.log`，按 `PUSH_INTERVAL` 汇总并发送给 `TG_CHAT_IDS`。这些值定义在 Python 源码顶部。安装脚本会创建本机日志导流服务 `xboard-tunnel`，配置 rsyslog 的 514/UDP 收发，并将审计程序部署到 `/root/xboard_log`。安装后需手动核对接收者 ID，详见[使用向导](使用向导.md)。
 
-## 📂 文件结构
+## 使用
 
-```txet
-xboard_audit_bot
-├── xboard_audit.py # 监控与审计核心逻辑脚本
-├── xboard-audit.service # Systemd 系统服务配置文件
-├── systemctl守护进程.md # 系统服务命令及运维操作指南
-├── xboard_audit.sh # 一键运行脚本
-└── README.md # 说明
-```
+推荐按[使用向导](使用向导.md)先配置主控机，再在客户端配置转发。多机 rsyslog 的线路与排错见[多台 VPS 日志推送](多台vps日志推送.md)。安装前阅读脚本：它会改动 `/etc/rsyslog.conf`、`/etc/rsyslog.d/`、`/etc/systemd/system/` 和可能存在的 `/etc/xboard-node/config.yml`，并重启相关服务。
 
----
-
-## ⚙️ 部署与使用指南
-
-> ### 1. 环境准备
->
-> 确保您的 VPS 上已安装 Python 3.8+ 环境：
->
-> ```bash
-> # Ubuntu/Debian 系统示例
-> sudo apt update
-> sudo apt install python3 python3-pip -y
-> ```
->
-> ### 2. 安装依赖
->
-> 请在 VPS 上安装机器人所需的依赖库：
->
-> ```bash
-> pip3 install python-telegram-bot
-> ```
->
-> ### 3. 修改核心配置
->
-> 在配置守护进程前，请先打开 xboard_audit.py，根据代码顶部的变量定义，
-> 修改您的 Telegram Bot Token、管理员 Chat ID 以及需要审计的节点/系统路径等核心参数。
->
-> ### 4. 配置 Systemd 守护进程 (实现开机自启与常驻)
->
-> 为了让脚本在后台稳定运行，请按照以下步骤将其注册为 Linux 系统服务：
->
-> ```bash
-> # 1. 将服务文件移动到系统服务目录下
-> sudo cp xboard-audit.service /etc/systemd/system/
-> # 2. 重新加载 Systemd 配置以识别新服务
-> sudo systemctl daemon-reload
-> # 3. 启用开机自启并立即启动该监控服务
-> sudosystemctl enable --now xboard-audit
-> # 4. 检查服务运行状态，确保显示 active (running)
-> sudo systemctl status xboard-audit
-> ```
-
----
-
-## 📊 运维常用命令
-
-> 查看实时运行日志与告警记录：
->
-> ```bash
-> journalctl -u xboard-audit -f
-> ```
->
-> 重启审计机器人：
->
-> ```bash
-> sudo systemctl restart xboard-audit
-> ```
->
-> 停止审计监控：
->
-> ```bash
-> sudo systemctl stop xboard-audit
-> ```
+此工具报告匹配到的日志事件，不会自动修复 xboard-node 故障，也不等同于完整的安全审计。日志包含来源 IP、UUID 片段和目标地址；请控制日志文件、Telegram 接收者和传输链路的访问权限。

@@ -1,67 +1,35 @@
-# 📁 Bilibili 直播状态监测机器人 (bilive_bot)
+# Bililive-go Telegram 管理机器人
 
-这是一个基于 Python 异步架构开发的轻量级 Telegram 机器人。它通过定期轮询 Bilibili 开放接口，实时监控指定 Bilibili 主播的直播间状态。当主播开播或下播时，机器人会自动向指定的 Telegram 频道或群组推送美化后的实时通知。
+本目录有两个独立实现，都通过 Bililive-go 的 HTTP API 管理直播录制任务：`Python/bl_bot.py` 和 `RUST/src/main.rs`。不要用同一个 Telegram Bot Token 同时运行两版，否则轮询更新会互相冲突。
 
----
+## 功能与文件
 
-## 🚀 核心特性
+- 查看 Bililive-go 的直播任务和状态，通过 Telegram 按钮添加、删除、启动或停止任务。
+- `Python/bl_bot.py`：Python 版，直接在源码顶部填写 API 地址、Token、管理员 ID 列表与轮询间隔。
+- `RUST/`：Rust 版，从 `.env` 读取设置；`deploy.sh` 为它克隆源码、编译并创建 `bilive_bot.service`。
 
-- **实时开播通知**：主播触发开播状态时，自动抓取直播间标题、分区信息及直播间链接，第一时间向 Telegram 发送通知。  
-- **状态自适应轮询**：采用异步高并发轮询机制，支持配置多长时间检查一次直播间状态，对 VPS 性能消耗极低。  
-- **日志追踪**：本地记录完整的开播与下播时间线日志，方便后续数据统计或运维排查。  
+## Rust 版部署
 
----
-
-## 📂 文件结构
-```text
-bilive_bot/
-└── bl_bot.py # 机器人主程序（包含 Bilibili API 状态解析、电报通知推送与轮询逻辑）
-└── bl_bot.py 
-```
-
----
-
-## ⚙️ 部署与使用指南
-
-### 1. 环境准备
-确保 VPS 上已安装 Python 3.8+：
+先确认 Bililive-go 的 API 可以从部署机器访问，安装 `git`、`curl`、Rust/Cargo 和 systemd。建议在**空目录**中运行 `deploy.sh`：脚本会创建 `bilive_bot` 子目录，若该目录已存在且你选择覆盖，它会删除整个目录。
 
 ```bash
-# Ubuntu/Debian 系统示例
-sudo apt update
-sudo apt install python3 python3-pip -y
+cd vps-telegram-bot/bilive_bot
+sudo bash deploy.sh
 ```
-### 2. 安装依赖
-该机器人基于 python-telegram-bot 异步版本，同时需要 requests 或 aiohttp 来请求 Bilibili 接口：
-```bash
-pip3 install python-telegram-bot requests
-```
-### 3. 机器人参数配置
-启动前，请编辑 bl_bot.py，根据代码顶部的配置区域修改以下参数：
 
-BOT_TOKEN：从 @BotFather 获取的 Telegram 机器人 Token。
+脚本会交互收集 `API_BASE_URL`（默认 `http://127.0.0.1:9000/api`）、`TELOXIDE_TOKEN`、逗号分隔的 `ADMIN_IDS`、`POLLING_INTERVAL`（默认 30 秒）和 `RUST_LOG`，在新目录写入 `.env`，并构建 `RUST` 项目。脚本创建服务文件的重定向需要 root 权限；运行后检查：
 
-CHANNEL_ID / CHAT_ID：接收直播通知的 Telegram 频道 ID 或群组 ID（公开频道需确保机器人已加入并具备发送消息权限）。
+```bash
+sudo systemctl status bilive_bot
+sudo journalctl -u bilive_bot -f
+```
 
-BILI_ROOM_ID：需要监控的 Bilibili 直播间房间号或主播 UID（根据源码变量注释填写）。
+手动运行 Rust 版时，在 `RUST/` 下创建相同配置的 `.env`，执行 `cargo run --release`。程序入口使用 `dotenvy` 加载它。
 
-CHECK_INTERVAL：轮询检查间隔（秒），建议 30~60 秒，避免请求过于频繁被 B 站风控。
-### 4. 后台常驻启动
-使用 nohup 命令让机器人在 VPS 后台持久运行，即使断开 SSH 连接也不会中断
-```bash
-nohup python3 bl_bot.py > bilive.log 2>&1 &
-```
-## 📊 运维与日常查看
-### 查看实时运行日志 / 开播记录：
-```bash
-tail -f bilive.log
-```
-### 停止监控进程：
-1.查找进程 ID（PID）:
-```bash
-ps ef | grep bl_bot.py
-```
-2.杀死对应进程
-```bash
-kill -9 <PID>
-```
+## Python 版
+
+安装 `python-telegram-bot` 与 `httpx`，编辑 [`Python/bl_bot.py`](Python/bl_bot.py) 顶部的 `API_BASE_URL`、`TELEGRAM_TOKEN`、`ADMIN_IDS`、`POLLING_INTERVAL`，再执行 `python3 Python/bl_bot.py`。Python 版没有从 Rust 部署脚本的 `.env` 读取配置。
+
+## 运行注意
+
+管理员操作会修改 Bililive-go 任务配置。先用测试任务验证 API 地址及权限。Token 应只保存在部署机器上；Python 版的源码配置方式容易误提交真实 Token，修改后检查 Git 状态。`deploy.sh` 会用 systemd 启动服务，重部署前先检查旧服务和目录。
