@@ -223,7 +223,7 @@ pub async fn render_trash_panel(
         let name = entry.original_path.file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
         lines.push(format!("• {}", escape_html(name)));
         rows.push(vec![InlineKeyboardButton::callback(
-            format!("恢复 {}", name.chars().take(20).collect::<String>()),
+            format!("恢复 {name}"),
             format!("restore_{}", entry.id),
         )]);
     }
