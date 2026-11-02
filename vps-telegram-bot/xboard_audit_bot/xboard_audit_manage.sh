@@ -502,6 +502,7 @@ install_client() {
     [[ ! -f $ENV_FILE ]] || die "当前机器已配置为主机，不能安装客户端"
     systemctl is-active --quiet xboard-node.service || die "xboard-node.service 未运行"
     local bundle=${1:-} master_ip=${2:-} node backup_dir had_marker=0 had_queue=0
+    local rsyslog_pid rsyslog_uid rsyslog_gid
     [[ -n $bundle && -d $bundle ]] || die "用法：install-client <证书包目录> <主机公网 IP>"
     valid_ip "$master_ip" || die "主机公网 IP 格式错误"
     [[ -f $bundle/node-id && -f $bundle/client.key && -f $bundle/client.crt && -f $bundle/ca.crt ]] || die "证书包不完整"
@@ -512,6 +513,10 @@ install_client() {
     fi
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y rsyslog rsyslog-gnutls ca-certificates
+    rsyslog_pid=$(systemctl show --property=MainPID --value rsyslog.service)
+    [[ $rsyslog_pid =~ ^[1-9][0-9]*$ ]] || die "rsyslog 未运行，无法确定发送队列所属用户"
+    read -r rsyslog_uid rsyslog_gid < <(ps -o uid=,gid= -p "$rsyslog_pid") || die "无法读取 rsyslog 运行身份"
+    valid_integer "${rsyslog_uid:-}" && valid_integer "${rsyslog_gid:-}" || die "rsyslog 运行身份无效"
     backup_dir=$(mktemp -d /tmp/xboard-audit-client.XXXXXX)
     [[ -f $ETC/.managed-by-xboard-audit ]] && had_marker=1
     [[ -d $CLIENT_QUEUE_DIR ]] && had_queue=1
@@ -519,12 +524,12 @@ install_client() {
     if [[ -d $CERT_DIR ]]; then cp -a "$CERT_DIR" "$backup_dir/certs"; fi
     if [[ -f $ETC/install-role ]]; then cp -p "$ETC/install-role" "$backup_dir/install-role"; fi
     if [[ -f $ETC/client-node-id ]]; then cp -p "$ETC/client-node-id" "$backup_dir/client-node-id"; fi
-    install -d -m 0700 -o root -g root "$CERT_DIR"
+    install -d -m 0750 -o root -g "$rsyslog_gid" "$CERT_DIR"
     : > "$ETC/.managed-by-xboard-audit"
     printf 'client\n' > "$ETC/install-role"
     printf '%s\n' "$node" > "$ETC/client-node-id"
-    install -d -m 0700 -o syslog -g syslog "$CLIENT_QUEUE_DIR"
-    install -m 0600 "$bundle/client.key" "$CERT_DIR/client.key"
+    install -d -m 0700 -o "$rsyslog_uid" -g "$rsyslog_gid" "$CLIENT_QUEUE_DIR"
+    install -m 0640 -o root -g "$rsyslog_gid" "$bundle/client.key" "$CERT_DIR/client.key"
     install -m 0644 "$bundle/client.crt" "$CERT_DIR/client.crt"
     install -m 0644 "$bundle/ca.crt" "$CERT_DIR/ca.crt"
     cat > "$CLIENT_RULE" <<EOF
@@ -544,7 +549,7 @@ if \$programname == 'xboard-node' then {
 }
 EOF
     # 队列存放在本工具专用目录，卸载时可完整清除。
-    if ! rsyslogd -N1 >/dev/null 2>&1 || ! systemctl restart rsyslog; then
+    if ! rsyslogd -N1 || ! systemctl restart rsyslog; then
         rollback_client_install "$backup_dir" "$had_marker" "$had_queue"
     fi
     install -m 0750 "$0" "$MANAGER"
@@ -720,10 +725,21 @@ uninstall_all() {
 }
 
 status() {
-    systemctl --no-pager --full status rsyslog xboard-audit xboard-audit-maintenance.timer || true
     if [[ -f $ENV_FILE ]]; then
+        systemctl --no-pager --full status rsyslog xboard-audit xboard-audit-maintenance.timer || true
         info "发送间隔：$(env_get PUSH_INTERVAL_SECONDS) 秒；日志保留：$(env_get LOG_RETENTION_HOURS) 小时"
         if [[ -x $BIN ]]; then "$BIN" --status || true; fi
+    else
+        systemctl --no-pager --full status rsyslog || true
+        if [[ -f $CLIENT_RULE ]]; then
+            if [[ -f $ETC/client-node-id ]]; then
+                info "客户端转发规则已安装：$(< "$ETC/client-node-id")"
+            else
+                info "客户端转发规则已安装；节点 ID 文件缺失，请检查配置"
+            fi
+        else
+            info "本机尚未安装客户端转发规则"
+        fi
     fi
     local certificate
     for certificate in "$CERT_DIR/server.crt" "$CERT_DIR/client.crt"; do
