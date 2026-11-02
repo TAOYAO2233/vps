@@ -383,6 +383,15 @@ install_master() {
     info "主机安装完成。请在防火墙中仅允许已授权 VPS 连接 TCP/6514。"
 }
 
+upgrade_master() {
+    require_master
+    download_binary
+    if [[ $(readlink -f -- "$0") != $(readlink -f -- "$MANAGER") ]]; then
+        install -m 0750 "$0" "$MANAGER"
+    fi
+    info "主机二进制和管理脚本已更新"
+}
+
 update_interval() {
     require_master
     local value=${1:-} backup
@@ -735,6 +744,7 @@ menu() {
 9) 查看状态          10) 卸载本机全部组件
 11) 续期主机证书      12) 生成客户端续期包
 13) 验证主机真实日志链路
+14) 更新主机二进制与管理脚本
 0) 退出
 EOF
         read -r -p '选择：' choice || return 0
@@ -752,6 +762,7 @@ EOF
             11) require_master; renew_server_cert ;;
             12) renew_node_cert ;;
             13) require_master; verify_real_source ;;
+            14) upgrade_master ;;
             0) return 0 ;;
             *) info "未知选项，请重新选择" ;;
         esac
@@ -764,7 +775,7 @@ case "${1:-menu}" in
     menu) menu ;;
     install-master) install_master ;;
     install-client) shift; install_client "$@" ;;
-    upgrade) require_master; download_binary ;;
+    upgrade) upgrade_master ;;
     interval) shift; update_interval "${1:-}" ;;
     retention) shift; update_retention "${1:-}" ;;
     telegram) update_telegram ;;
