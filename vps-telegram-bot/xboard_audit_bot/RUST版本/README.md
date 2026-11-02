@@ -1,12 +1,12 @@
 # Xboard 日志审计 Rust 版
 
-本目录是 Xboard 日志审计项目的 Rust 实现。VPS 上只部署这套 Rust 项目：主机运行 Rust 程序，客户端 VPS 只通过 rsyslog TLS 转发日志。主机与客户端共用 `manage.sh`；只有主机使用 `/etc/xboard-audit/.env`。
+本目录是 Xboard 日志审计项目的 Rust 实现。部署脚本位于上一级目录 `xboard_audit_bot/xboard_audit_manage.sh`，可单独修改网盘下载链接，无需重新构建 Rust 二进制。VPS 上只部署这套 Rust 项目：主机运行 Rust 程序，客户端 VPS 只通过 rsyslog TLS 转发日志。主机与客户端共用该脚本；只有主机使用 `/etc/xboard-audit/.env`。
 
 ## 当前交付边界
 
 - **没有在本地编译、运行或测试。**代码需在你的 GitHub Actions 中编译和验证。
 - 仓库原有的 `.github/workflows/build.yml` 保持不变，只构建 `media-control-bot`。将本地 `xboard_audit_bot/xboard-audit.yml` 新增到仓库根目录的 `.github/workflows/xboard-audit.yml`，它只构建本项目。
-- `manage.sh` 顶部四个二进制下载 URL/SHA-256 变量故意留空。从 Actions 下载构建产物并上传到自己的网盘后，填写可由 VPS 直接下载的固定 HTTPS 文件地址和对应 SHA-256。地址为空时安装/升级会明确报错，脚本不会现场编译。
+- `xboard_audit_manage.sh` 顶部四个二进制下载 URL/SHA-256 变量故意留空。从 Actions 下载构建产物并上传到自己的网盘后，填写可由 VPS 直接下载的固定 HTTPS 文件地址和对应 SHA-256。地址为空时安装/升级会明确报错，脚本不会现场编译。
 
 ## GitHub Actions 应执行的步骤
 
@@ -16,22 +16,22 @@
 
 ## 主机安装
 
-1. 在 `manage.sh` 顶部填写网盘上二进制文件的固定 HTTPS 直链与 SHA-256；不要填会变化的分享页地址或浮动文件地址。脚本用 `curl` 下载文件并校验哈希，链接若返回 HTML、要求网页登录或文件内容变化，安装会失败。
-2. 将脚本放到 Ubuntu 20.04+ 主机并以 root 运行 `bash manage.sh install-master`，或运行 `bash manage.sh` 使用菜单。
+1. 在 `xboard_audit_manage.sh` 顶部填写网盘上二进制文件的固定 HTTPS 直链与 SHA-256；不要填会变化的分享页地址或浮动文件地址。脚本用 `curl` 下载文件并校验哈希，链接若返回 HTML、要求网页登录或文件内容变化，安装会失败。
+2. 将脚本放到 Ubuntu 20.04+ 主机并以 root 运行 `bash xboard_audit_manage.sh install-master`，或运行 `bash xboard_audit_manage.sh` 使用菜单。
 3. 输入 Bot Token 和逗号分隔的 Chat ID。脚本创建 `.env`、证书、rsyslog 配置、节点日志目录、systemd 服务和每 24 小时清理一次的定时器。
 4. 在防火墙中只允许已授权 VPS 访问主机 TCP/6514。主机无需开放 UDP/514。
-5. 安装时脚本先用 `logger` 验证 rsyslog 规则，再要求在 60 秒内产生一次真实 xboard-node 连接，核对 journald 中的日志已写入主机节点文件。验证失败会明确报错，已写入的组件会保留供排障；修正后可运行 `bash manage.sh verify-source` 重试，也可运行 `uninstall` 清理部分安装。
-6. 使用 `bash manage.sh test-telegram` 发送测试消息，使用 `bash manage.sh status` 查看状态。
+5. 安装时脚本先用 `logger` 验证 rsyslog 规则，再要求在 60 秒内产生一次真实 xboard-node 连接，核对 journald 中的日志已写入主机节点文件。验证失败会明确报错，已写入的组件会保留供排障；修正后可运行 `bash xboard_audit_manage.sh verify-source` 重试，也可运行 `uninstall` 清理部分安装。
+6. 使用 `bash xboard_audit_manage.sh test-telegram` 发送测试消息，使用 `bash xboard_audit_manage.sh status` 查看状态。
 
 如主机 rsyslog 没有接收 `xboard-node` 的 journald 消息，先检查本机发行版的 rsyslog/journald 输入配置。脚本不会覆盖发行版的全局 rsyslog 配置。
 
 ## 添加客户端 VPS
 
-菜单流程：在主机运行 `bash manage.sh`，选 `6) 添加 VPS 节点`，依次登记 `HK`、`US-LOS`；菜单会在每次操作后重新显示。先将 `manage.sh` 放到各副机并运行，然后选 `2) 安装客户端`。脚本会创建 `/etc/xboard-audit/import` 并暂停等待；此时用另一个 SSH/SFTP 会话把主机生成的完整 `export-HK` 或 `export-US-LOS` 文件夹上传到对应副机的该目录。回到菜单按 Enter，脚本扫描证书包，再询问主机公网 IP，完成安装后清理上传副本。选择 `0` 退出菜单。菜单不能代替跨主机复制证书包。
+菜单流程：在主机运行 `bash xboard_audit_manage.sh`，选 `6) 添加 VPS 节点`，依次登记 `HK`、`US-LOS`；菜单会在每次操作后重新显示。先将 `xboard_audit_manage.sh` 放到各副机并运行，然后选 `2) 安装客户端`。脚本会创建 `/etc/xboard-audit/import` 并暂停等待；此时用另一个 SSH/SFTP 会话把主机生成的完整 `export-HK` 或 `export-US-LOS` 文件夹上传到对应副机的该目录。回到菜单按 Enter，脚本扫描证书包，再询问主机公网 IP，完成安装后清理上传副本。选择 `0` 退出菜单。菜单不能代替跨主机复制证书包。
 
-1. 主机运行 `bash manage.sh add-node <节点ID>`，例如 `vps-b`。节点 ID 以字母开头，只能含字母、数字、`_`、`-`。
+1. 主机运行 `bash xboard_audit_manage.sh add-node <节点ID>`，例如 `vps-b`。节点 ID 以字母开头，只能含字母、数字、`_`、`-`。
 2. 主机会生成 `/etc/xboard-audit/export-<节点ID>`。**此目录含客户端私钥**，只通过受保护的 SSH/SCP 连接复制到对应 VPS。
-3. 客户端菜单选 `2` 后创建接收目录，上传证书包、按 Enter 扫描，再输入主机公网 IP。若使用非交互命令，也可运行 `bash manage.sh install-client <证书包目录> <主机公网IP>`。客户端不创建 `.env`，不安装 Rust 程序。
+3. 客户端菜单选 `2` 后创建接收目录，上传证书包、按 Enter 扫描，再输入主机公网 IP。若使用非交互命令，也可运行 `bash xboard_audit_manage.sh install-client <证书包目录> <主机公网IP>`。客户端不创建 `.env`，不安装 Rust 程序。
 4. 客户端脚本会发送一条带节点标记的测试日志。检查主机 `/var/log/xboard-audit/nodes/<节点ID>.log` 收到该条日志和后续真实 xboard-node 日志后，从主机删除导出的证书包副本。
 
 所有 VPS 使用 SSH 密钥登录时，可从持有登录私钥的管理电脑执行以下示例（替换 IP、用户名和密钥路径）：
@@ -39,10 +39,10 @@
 ```bash
 # 主机登记节点后，先从主机取回该节点证书包和脚本
 scp -i ~/.ssh/vps_key -r root@主机IP:/etc/xboard-audit/export-vps-b ./export-vps-b
-scp -i ~/.ssh/vps_key root@主机IP:/usr/local/sbin/xboard-audit-manage ./manage.sh
+scp -i ~/.ssh/vps_key root@主机IP:/usr/local/sbin/xboard-audit-manage ./xboard_audit_manage.sh
 
 # 先将脚本放到副机，并在副机运行菜单选 2；脚本创建接收目录后再上传证书包
-scp -i ~/.ssh/vps_key ./manage.sh root@副机IP:/root/
+scp -i ~/.ssh/vps_key ./xboard_audit_manage.sh root@副机IP:/root/
 scp -i ~/.ssh/vps_key -r ./export-vps-b root@副机IP:/etc/xboard-audit/import/
 # 回到副机菜单按 Enter 扫描，然后输入主机公网 IP
 ```
@@ -55,23 +55,25 @@ scp -i ~/.ssh/vps_key -r ./export-vps-b root@副机IP:/etc/xboard-audit/import/
 
 | 命令 | 功能 |
 | --- | --- |
-| `bash manage.sh interval 60` | 修改主机消息汇总间隔，10–3600 秒。 |
-| `bash manage.sh retention 48` | 修改主机日志保留小时数，1–8760 小时。 |
-| `bash manage.sh telegram` | 修改 Token 或 Chat ID，Token 输入不回显。 |
-| `bash manage.sh add-node vps-c` | 添加客户端节点并生成 TLS 证书包。 |
-| `bash manage.sh remove-node vps-c` | 停止接收节点，保留历史日志。 |
-| `bash manage.sh upgrade` | 下载并校验已配置的发布二进制。 |
-| `bash manage.sh maintenance` | 手动执行日志轮转与过期清理。 |
-| `bash manage.sh uninstall` | 卸载本机由此脚本安装的全部组件。 |
-| `bash manage.sh verify-source` | 主机等待并核对真实 xboard-node 连接日志。 |
-| `bash manage.sh renew-server` | 续期主机 TLS 证书。 |
-| `bash manage.sh renew-node vps-c` | 为已登记节点生成客户端证书续期包。 |
+| `bash xboard_audit_manage.sh interval 60` | 修改主机消息汇总间隔，10–3600 秒。 |
+| `bash xboard_audit_manage.sh retention 48` | 修改主机日志保留小时数，1–8760 小时。 |
+| `bash xboard_audit_manage.sh telegram` | 修改 Token 或 Chat ID，Token 输入不回显。 |
+| `bash xboard_audit_manage.sh add-node vps-c` | 添加客户端节点并生成 TLS 证书包。 |
+| `bash xboard_audit_manage.sh remove-node vps-c` | 停止接收节点，保留历史日志。 |
+| 菜单 `14` 或 `bash xboard_audit_manage.sh upgrade` | 按新直链下载并校验二进制，同时更新主机安装的管理脚本副本。 |
+| `bash xboard_audit_manage.sh maintenance` | 手动执行日志轮转与过期清理。 |
+| `bash xboard_audit_manage.sh uninstall` | 卸载本机由此脚本安装的全部组件。 |
+| `bash xboard_audit_manage.sh verify-source` | 主机等待并核对真实 xboard-node 连接日志。 |
+| `bash xboard_audit_manage.sh renew-server` | 续期主机 TLS 证书。 |
+| `bash xboard_audit_manage.sh renew-node vps-c` | 为已登记节点生成客户端证书续期包。 |
 
 只有主机有 `.env`，默认 `PUSH_INTERVAL_SECONDS=60`、`LOG_RETENTION_HOURS=48`。配置修改后脚本重启 Rust 服务。维护定时器每天 UTC+8 00:00 触发一次；主机关机错过任务时，开机后会补做一次。维护按日志内层时间戳删除超过 48 小时的行，同一文件中较新的行会保留。无法解析时间戳的行以文件最后修改时间判断。清理期间 Telegram 发送会等待；若已有请求正在发送，维护任务先等该请求结束，清理完成后自动恢复发送。维护不会改写当前正在写入的 `.log`，也会跳过未读完、最近一小时内修改或仍被 rsyslog 打开的轮转文件，留待下次处理。因此磁盘上可能保留超过 48 小时的日志，尤其是在定时任务刚运行完后的 24 小时内。清理时通过临时文件原子替换，保留原文件权限和属主。
 
+修改仓库里的 `xboard_audit_manage.sh` 不会自动更新已经安装在 VPS 上的 `/usr/local/sbin/xboard-audit-manage`。请将修改后的脚本上传到主机并运行菜单 `14`；成功后主机会更新二进制与安装的管理脚本副本。只改脚本不会触发 Rust 的 GitHub Actions 构建。
+
 ## 卸载
 
-先在**每台客户端**运行 `bash manage.sh uninstall`，最后在主机运行同一命令；也可使用菜单的“卸载本机全部组件”。脚本会显示将删除的内容，并要求输入 `UNINSTALL`。主机卸载会停止并移除审计服务和清理定时器，删除本工具的 rsyslog 规则、二进制、`.env`、证书、节点日志、轮转日志与持久化状态；客户端卸载会移除转发规则、证书和专用发送队列。脚本会先验证移除规则后的 rsyslog 配置，再重启 rsyslog；验证或重启失败时恢复原规则。脚本只删除自身创建的专用目录，并要求存在安装标记。
+先在**每台客户端**运行 `bash xboard_audit_manage.sh uninstall`，最后在主机运行同一命令；也可使用菜单的“卸载本机全部组件”。脚本会显示将删除的内容，并要求输入 `UNINSTALL`。主机卸载会停止并移除审计服务和清理定时器，删除本工具的 rsyslog 规则、二进制、`.env`、证书、节点日志、轮转日志与持久化状态；客户端卸载会移除转发规则、证书和专用发送队列。脚本会先验证移除规则后的 rsyslog 配置，再重启 rsyslog；验证或重启失败时恢复原规则。脚本只删除自身创建的专用目录，并要求存在安装标记。
 
 卸载不会移除系统共用的 rsyslog、OpenSSL 等软件包，也不会改动其它 VPS。系统 journal 中已写入的历史服务日志、Telegram 已发送消息和你自行保存的脚本/证书包副本无法由本机卸载脚本单独清除；如需清除副本，应在其保存位置另行处理。
 
@@ -79,7 +81,7 @@ scp -i ~/.ssh/vps_key -r ./export-vps-b root@副机IP:/etc/xboard-audit/import/
 
 程序按节点及事务 ID 配对 `inbound connection from` 和带 UUID 的 `inbound connection to`；`outbound/direct` 不计入。重复目标逐条保留。Telegram 摘要按节点、UUID、来源 IP 和协议分组，时间统一为固定 UTC+8。消息采用纯文本，避免目标地址触发 Markdown 解析；超长摘要按完整访问行拆分。
 
-读取位置、未完成事务、待汇总访问和待发送消息保存在 `/var/lib/xboard-audit/state.json`。重启后按文件轮转顺序补读；发送中断后的历史摘要会标记“延迟补发”，只保留配置时长内的数据。Telegram 返回限流时按 `retry_after` 重试；单个 Chat ID 的临时失败不会阻塞其它接收者。永久拒绝的消息保存在状态文件的失败队列中，直到超过日志保留期；修正 Chat ID 后不会自动改投到新 ID。`bash manage.sh status` 可查看待汇总、待发送和失败数量。发送成功与保存确认之间若发生进程崩溃，可能重复发送一条消息；这是无法由 Telegram `sendMessage` 提供事务确认而消除的窗口。
+读取位置、未完成事务、待汇总访问和待发送消息保存在 `/var/lib/xboard-audit/state.json`。重启后按文件轮转顺序补读；发送中断后的历史摘要会标记“延迟补发”，只保留配置时长内的数据。Telegram 返回限流时按 `retry_after` 重试；单个 Chat ID 的临时失败不会阻塞其它接收者。永久拒绝的消息保存在状态文件的失败队列中，直到超过日志保留期；修正 Chat ID 后不会自动改投到新 ID。`bash xboard_audit_manage.sh status` 可查看待汇总、待发送和失败数量。发送成功与保存确认之间若发生进程崩溃，可能重复发送一条消息；这是无法由 Telegram `sendMessage` 提供事务确认而消除的窗口。
 
 主机和客户端证书签发后有效期为 825 天。`status` 会提示 30 天内到期的证书；主机可执行 `renew-server`，已登记客户端可通过 `renew-node` 生成新包，再在客户端运行 `install-client` 更新。CA 证书到期前 180 天会提示；CA 轮换需重新分发信任证书及客户端证书，目前不做自动轮换。请先在测试 VPS 验证续期流程。读取队列达到上限时 Rust 会暂停继续读取并在服务日志提示，需尽快排查 Telegram 失败、磁盘和流量峰值。
 

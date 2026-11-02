@@ -137,7 +137,7 @@ fn persist_if_changed(path: &Path, state: &State, previous: &mut Vec<u8>) -> Res
     Ok(())
 }
 
-struct Parser { from: Regex, to: Regex }
+struct Parser { colors: Regex, from: Regex, to: Regex }
 struct From { tx: String, src: String }
 struct To { tx: String, event: Event }
 
@@ -145,6 +145,7 @@ impl Parser {
     fn new() -> Self {
         let head = r"(?P<tz>[+-]\d{4})\s+(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+INFO\s+\[(?P<tx>\d+)\s+\d+ms\]\s+inbound/(?P<protocol>[A-Za-z0-9_-]+)\[[^\]]*\]:\s+";
         Self {
+            colors: Regex::new(r"(?:\x1b|#033)\[[0-9;]*m").expect("color regex"),
             from: Regex::new(&(head.to_owned() + r"inbound connection from\s+(?P<src>\[[^\]]+\]|[^:\s]+):\d+")).expect("from regex"),
             to: Regex::new(&(head.to_owned() + r"\[(?P<uuid>[A-Fa-f0-9-]+)\]\s+inbound connection to\s+(?P<target>\S+)" )).expect("to regex"),
         }
@@ -233,9 +234,10 @@ fn replay_rotations(node: &str, dir: &Path, parser: &Parser, state: &mut State, 
 
 fn process_line(node: &str, line: &str, parser: &Parser, state: &mut State, retention: i64) {
     let now = Utc::now().timestamp();
-    if let Some(from) = parser.parse_from(line) {
+    let line = parser.colors.replace_all(line, "");
+    if let Some(from) = parser.parse_from(&line) {
         state.transactions.insert(format!("{node}:{}", from.tx), TxEntry { src: from.src, seen: now });
-    } else if let Some(mut to) = parser.parse_to(node, line) {
+    } else if let Some(mut to) = parser.parse_to(node, &line) {
         if let Some(found) = state.transactions.remove(&format!("{node}:{}", to.tx)) {
             if to.event.epoch >= now - retention * 3600 {
                 to.event.src = found.src;
@@ -632,6 +634,19 @@ mod tests {
         assert_eq!(state.events.len(), 1);
         assert_eq!(state.events[0].src, "203.198.248.150");
         assert!(render("vps-main-A", &state.events)[0].contains("assets.msn.cn:443"));
+    }
+
+    #[test]
+    fn syslog_escaped_colors_preserve_connection_pairs() {
+        let parser = Parser::new();
+        let mut state = State::default();
+        let from = "Nov  2 21:47:17 RN2H2G xboard-node[3383]: +0800 2026-11-02 21:47:17 #033[36mINFO#033[0m [#033[38;5;114m1540287586#033[0m 0ms] inbound/shadowsocks[shadowsocks-in]: inbound connection from 203.198.248.150:38266";
+        let to = "Nov  2 21:47:17 RN2H2G xboard-node[3383]: +0800 2026-11-02 21:47:17 #033[36mINFO#033[0m [#033[38;5;114m1540287586#033[0m 2ms] inbound/shadowsocks[shadowsocks-in]: [d161d620-2754-4db6-8ad5-4e95bdd0480c] inbound connection to chatgpt.com:443";
+        process_line("vps-main-A", from, &parser, &mut state, 100_000);
+        process_line("vps-main-A", to, &parser, &mut state, 100_000);
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.events[0].src, "203.198.248.150");
+        assert_eq!(state.events[0].target, "chatgpt.com:443");
     }
 
     #[test]

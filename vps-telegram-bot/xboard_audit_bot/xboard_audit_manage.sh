@@ -312,14 +312,16 @@ verify_local_capture() {
 }
 
 verify_real_source() {
-    local since attempt line
+    local since attempt line stamp target
     systemctl is-active --quiet xboard-node.service || die "xboard-node.service 未运行，无法验证真实日志链路"
     since=$(date '+%Y-%m-%d %H:%M:%S')
     info "请在 60 秒内通过本机节点产生一次真实连接，正在核对 journald 与节点日志。"
     for ((attempt=0; attempt<60; attempt++)); do
         while IFS= read -r line; do
             [[ $line == *'inbound connection to'* ]] || continue
-            if grep -Fq -- "$line" "$LOG_DIR/vps-main-A.log" 2>/dev/null; then
+            stamp=${line:0:25}
+            target=${line##*inbound connection to }
+            if grep -F -- "$stamp" "$LOG_DIR/vps-main-A.log" 2>/dev/null | grep -F -- "inbound connection to $target" >/dev/null; then
                 info "真实 xboard-node 日志已到达主机节点文件"
                 return 0
             fi
