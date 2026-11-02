@@ -138,12 +138,28 @@ EOF
     chmod 0600 "$CERT_DIR/ca.cnf"
 }
 
+configure_master_cert_access() {
+    local rsyslog_pid rsyslog_uid rsyslog_gid
+    [[ -d $ETC && ! -L $ETC && -d $CERT_DIR && ! -L $CERT_DIR && -f $CERT_DIR/server.key && ! -L $CERT_DIR/server.key ]] || die "主机证书目录或私钥不安全"
+    rsyslog_pid=$(systemctl show --property=MainPID --value rsyslog.service)
+    [[ $rsyslog_pid =~ ^[1-9][0-9]*$ ]] || die "rsyslog 未运行，无法确定证书访问权限"
+    read -r rsyslog_uid rsyslog_gid < <(ps -o uid=,gid= -p "$rsyslog_pid") || die "无法读取 rsyslog 运行身份"
+    valid_integer "${rsyslog_uid:-}" && valid_integer "${rsyslog_gid:-}" || die "rsyslog 运行身份无效"
+    chmod 0751 "$ETC"
+    chown root:"$rsyslog_gid" "$CERT_DIR" "$CERT_DIR/server.key"
+    chmod 0750 "$CERT_DIR"
+    chmod 0644 "$CERT_DIR/ca.crt" "$CERT_DIR/server.crt"
+    chmod 0640 "$CERT_DIR/server.key"
+    chmod 0600 "$CERT_DIR/ca.key"
+}
+
 make_ca_and_server() {
     if [[ -f $CERT_DIR/ca.key ]]; then
         [[ -f $CERT_DIR/ca.crt && -f $CERT_DIR/server.key && -f $CERT_DIR/server.ext ]] || die "主机证书文件不完整"
         if [[ ! -f $CERT_DIR/server.crt ]] || ! openssl x509 -in "$CERT_DIR/server.crt" -checkend 2592000 -noout >/dev/null 2>&1; then
             renew_server_cert
         fi
+        configure_master_cert_access
         return
     fi
     write_ca_config
@@ -163,16 +179,19 @@ EOF
         -CAcreateserial -out "$CERT_DIR/server.crt" -days 825 -sha256 -extfile "$CERT_DIR/server.ext" >/dev/null 2>&1 || die "签发主机证书失败"
     chmod 0600 "$CERT_DIR"/*.key
     chmod 0644 "$CERT_DIR"/*.crt
+    configure_master_cert_access
     info "已生成主机 CA 和服务器证书"
 }
 
 repair_ca_certificate() {
     require_master
     [[ -f $CERT_DIR/ca.key && -f $CERT_DIR/server.crt ]] || die "主机 CA 私钥或服务器证书缺失"
+    configure_master_cert_access
     local candidate backup constraints
     constraints=$(openssl x509 -in "$CERT_DIR/ca.crt" -noout -text | grep -c 'X509v3 Basic Constraints:' || true)
     if [[ $constraints == 1 ]]; then
-        info "主机 CA 证书没有重复的 Basic Constraints，无需修复"
+        systemctl restart rsyslog || die "已修正证书权限，但 rsyslog 重启失败"
+        info "主机 CA 无重复扩展，rsyslog 证书访问权限已修正"
         return 0
     fi
     candidate=$(mktemp "$CERT_DIR/ca-repair.XXXXXX.crt")
