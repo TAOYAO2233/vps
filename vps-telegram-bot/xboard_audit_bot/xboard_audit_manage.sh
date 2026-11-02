@@ -268,9 +268,9 @@ write_remote_rule() {
 global(DefaultNetstreamDriverCAFile="/etc/xboard-audit/certs/ca.crt"
        DefaultNetstreamDriverCertFile="/etc/xboard-audit/certs/server.crt"
        DefaultNetstreamDriverKeyFile="/etc/xboard-audit/certs/server.key")
-module(load="imtcp")
 EOF
     [[ -s $ETC/nodes.list ]] || return 0
+    printf 'module(load="imtcp")\n' >> "$MASTER_REMOTE"
     printf 'input(type="imtcp" port="6514" ruleset="xboard_remote"\n' >> "$MASTER_REMOTE"
     printf '      StreamDriver.Name="gtls" StreamDriver.Mode="1"\n' >> "$MASTER_REMOTE"
     printf '      StreamDriver.AuthMode="x509/name" PermittedPeer=[' >> "$MASTER_REMOTE"
@@ -298,7 +298,7 @@ write_node_rules() {
     } > "$NODE_RULES"
 }
 
-validate_rsyslog() { rsyslogd -N1 >/dev/null 2>&1 || die "rsyslog 配置验证失败，请检查 journalctl -u rsyslog"; }
+validate_rsyslog() { rsyslogd -N1 || die "rsyslog 配置验证失败；请根据上方输出检查配置"; }
 
 verify_local_capture() {
     local probe="xboard-audit-probe-$(date +%s)-$$" attempt
@@ -459,7 +459,7 @@ EOF
     printf '%s\n' "$node" >> "$ETC/nodes.list"
     write_node_rules
     write_remote_rule
-    if ! rsyslogd -N1 >/dev/null 2>&1; then
+    if ! rsyslogd -N1; then
         mv -f "$nodes_backup" "$ETC/nodes.list"
         write_node_rules
         write_remote_rule
