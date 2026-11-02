@@ -87,7 +87,7 @@ ensure_dirs() {
     ensure_lock_file
 }
 
-download_binary() {
+download_binary() (
     local arch url sha tmp backup
     ensure_lock_file
     arch=$(uname -m)
@@ -101,7 +101,7 @@ download_binary() {
     [[ $sha =~ ^[0-9a-fA-F]{64}$ ]] || die "SHA-256 格式错误"
     tmp=$(mktemp /tmp/xboard-audit.XXXXXX)
     backup=${BIN}.previous
-    trap 'rm -f "$tmp"' RETURN
+    trap 'rm -f -- "${tmp:-}"' EXIT
     curl --fail --location --silent --show-error --retry 3 --output "$tmp" "$url" || die "二进制下载失败"
     printf '%s  %s\n' "$sha" "$tmp" | sha256sum --check --status || die "二进制 SHA-256 校验失败"
     if [[ -f $BIN ]]; then cp -p "$BIN" "$backup"; fi
@@ -112,7 +112,7 @@ download_binary() {
         systemctl is-active --quiet xboard-audit || rollback_binary "$backup"
     fi
     info "二进制安装完成：$arch"
-}
+)
 
 rollback_binary() {
     local backup=$1
@@ -270,10 +270,8 @@ global(DefaultNetstreamDriverCAFile="/etc/xboard-audit/certs/ca.crt"
        DefaultNetstreamDriverKeyFile="/etc/xboard-audit/certs/server.key")
 EOF
     [[ -s $ETC/nodes.list ]] || return 0
-    printf 'module(load="imtcp")\n' >> "$MASTER_REMOTE"
-    printf 'input(type="imtcp" port="6514" ruleset="xboard_remote"\n' >> "$MASTER_REMOTE"
-    printf '      StreamDriver.Name="gtls" StreamDriver.Mode="1"\n' >> "$MASTER_REMOTE"
-    printf '      StreamDriver.AuthMode="x509/name" PermittedPeer=[' >> "$MASTER_REMOTE"
+    printf 'module(load="imtcp" StreamDriver.Name="gtls" StreamDriver.Mode="1"\n' >> "$MASTER_REMOTE"
+    printf '       StreamDriver.AuthMode="x509/name" PermittedPeer=[' >> "$MASTER_REMOTE"
     while IFS= read -r node; do
         [[ -n $node ]] || continue
         valid_node "$node" || die "节点登记文件中有非法节点名"
@@ -281,6 +279,7 @@ EOF
         printf '"xboard-%s"' "$node" >> "$MASTER_REMOTE"
     done < "$ETC/nodes.list"
     printf '])\n' >> "$MASTER_REMOTE"
+    printf 'input(type="imtcp" port="6514" ruleset="xboard_remote")\n' >> "$MASTER_REMOTE"
 }
 
 write_node_rules() {
@@ -465,6 +464,7 @@ EOF
         mv -f "$nodes_backup" "$ETC/nodes.list"
         write_node_rules
         write_remote_rule
+        rm -rf -- "$bundle"
         die "rsyslog 配置验证失败；已恢复节点登记"
     fi
     if ! systemctl restart rsyslog; then
@@ -472,6 +472,7 @@ EOF
         write_node_rules
         write_remote_rule
         systemctl restart rsyslog || true
+        rm -rf -- "$bundle"
         die "rsyslog 重启失败；节点登记已恢复"
     fi
     rm -f "$nodes_backup"
