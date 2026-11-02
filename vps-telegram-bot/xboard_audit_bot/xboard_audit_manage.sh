@@ -81,7 +81,7 @@ ensure_dirs() {
     (( created_user == 0 )) || : > "$ETC/.created-user"
     (( created_group == 0 )) || : > "$ETC/.created-group"
     install -d -m 0700 -o root -g root "$CERT_DIR"
-    install -d -m 0750 -o root -g xboard-audit "${LOG_DIR%/nodes}"
+    install -d -m 0755 -o root -g root "${LOG_DIR%/nodes}"
     install -d -m 2750 -o syslog -g xboard-audit "$LOG_DIR"
     install -d -m 0750 -o xboard-audit -g xboard-audit "$STATE_DIR"
     ensure_lock_file
