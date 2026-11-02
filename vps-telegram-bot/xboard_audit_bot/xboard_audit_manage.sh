@@ -123,6 +123,21 @@ rollback_binary() {
     die "新版本启动失败；已尝试恢复上一版本"
 }
 
+write_ca_config() {
+    cat > "$CERT_DIR/ca.cnf" <<'EOF'
+[req]
+distinguished_name=ca_subject
+prompt=no
+[ca_subject]
+CN=xboard-audit-ca
+[ca_extensions]
+basicConstraints=critical,CA:TRUE
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+EOF
+    chmod 0600 "$CERT_DIR/ca.cnf"
+}
+
 make_ca_and_server() {
     if [[ -f $CERT_DIR/ca.key ]]; then
         [[ -f $CERT_DIR/ca.crt && -f $CERT_DIR/server.key && -f $CERT_DIR/server.ext ]] || die "主机证书文件不完整"
@@ -131,9 +146,11 @@ make_ca_and_server() {
         fi
         return
     fi
-    openssl req -x509 -newkey rsa:3072 -nodes -days 3650 \
+    write_ca_config
+    openssl req -x509 -newkey rsa:3072 -nodes -days 3650 -sha256 \
         -keyout "$CERT_DIR/ca.key" -out "$CERT_DIR/ca.crt" \
-        -subj '/CN=xboard-audit-ca' -addext 'basicConstraints=critical,CA:TRUE' >/dev/null 2>&1 || die "生成 CA 失败"
+        -config "$CERT_DIR/ca.cnf" -extensions ca_extensions \
+        -subj '/CN=xboard-audit-ca' >/dev/null 2>&1 || die "生成 CA 失败"
     openssl req -newkey rsa:3072 -nodes -keyout "$CERT_DIR/server.key" \
         -out "$CERT_DIR/server.csr" -subj '/CN=xboard-audit-master' >/dev/null 2>&1 || die "生成主机证书请求失败"
     cat > "$CERT_DIR/server.ext" <<'EOF'
@@ -147,6 +164,41 @@ EOF
     chmod 0600 "$CERT_DIR"/*.key
     chmod 0644 "$CERT_DIR"/*.crt
     info "已生成主机 CA 和服务器证书"
+}
+
+repair_ca_certificate() {
+    require_master
+    [[ -f $CERT_DIR/ca.key && -f $CERT_DIR/server.crt ]] || die "主机 CA 私钥或服务器证书缺失"
+    local candidate backup constraints
+    constraints=$(openssl x509 -in "$CERT_DIR/ca.crt" -noout -text | grep -c 'X509v3 Basic Constraints:' || true)
+    if [[ $constraints == 1 ]]; then
+        info "主机 CA 证书没有重复的 Basic Constraints，无需修复"
+        return 0
+    fi
+    candidate=$(mktemp "$CERT_DIR/ca-repair.XXXXXX.crt")
+    backup=$(mktemp "$CERT_DIR/ca-backup.XXXXXX.crt")
+    write_ca_config
+    if ! openssl req -new -x509 -key "$CERT_DIR/ca.key" -out "$candidate" \
+        -days 3650 -sha256 -config "$CERT_DIR/ca.cnf" -extensions ca_extensions \
+        -subj '/CN=xboard-audit-ca' >/dev/null 2>&1; then
+        rm -f -- "$candidate" "$backup"
+        die "重新签发 CA 证书失败"
+    fi
+    constraints=$(openssl x509 -in "$candidate" -noout -text | grep -c 'X509v3 Basic Constraints:' || true)
+    if [[ $constraints != 1 ]] || ! openssl verify -CAfile "$candidate" "$CERT_DIR/server.crt" >/dev/null 2>&1; then
+        rm -f -- "$candidate" "$backup"
+        die "新 CA 证书未通过扩展或服务器证书验证"
+    fi
+    cp -p "$CERT_DIR/ca.crt" "$backup"
+    install -m 0644 "$candidate" "$CERT_DIR/ca.crt"
+    if ! rsyslogd -N1 || ! systemctl restart rsyslog; then
+        install -m 0644 "$backup" "$CERT_DIR/ca.crt"
+        systemctl restart rsyslog || true
+        rm -f -- "$candidate" "$backup"
+        die "主机 CA 更新失败；已恢复旧证书"
+    fi
+    rm -f -- "$candidate" "$backup"
+    info "主机 CA 证书已修复，CA 私钥未更换。请将 $CERT_DIR/ca.crt 上传到各客户端并选择更新客户端 CA。"
 }
 
 renew_server_cert() {
@@ -605,6 +657,34 @@ interactive_install_client() {
     done
 }
 
+update_client_ca() {
+    require_client
+    [[ ! -L $IMPORT_DIR ]] || die "证书接收目录不能是符号链接"
+    install -d -m 0700 -o root -g root "$IMPORT_DIR"
+    info "请将主机的 ca.crt 上传到 $IMPORT_DIR/ca.crt。"
+    local answer incoming backup constraints
+    read -r -p '上传完成后按 Enter 验证并更新；输入 0 返回菜单：' answer || return 0
+    [[ $answer == 0 ]] && return 0
+    incoming=$IMPORT_DIR/ca.crt
+    [[ -f $incoming && ! -L $incoming ]] || die "未找到新 CA 证书"
+    constraints=$(openssl x509 -in "$incoming" -noout -text | grep -c 'X509v3 Basic Constraints:' || true)
+    [[ $constraints == 1 ]] || die "新 CA 证书的 Basic Constraints 数量不正确"
+    openssl verify -CAfile "$incoming" "$CERT_DIR/client.crt" >/dev/null 2>&1 || die "新 CA 无法验证本机客户端证书"
+    backup=$(mktemp "$CERT_DIR/ca-backup.XXXXXX.crt")
+    cp -p "$CERT_DIR/ca.crt" "$backup"
+    install -m 0644 "$incoming" "$CERT_DIR/ca.crt"
+    if ! rsyslogd -N1 || ! systemctl restart rsyslog; then
+        install -m 0644 "$backup" "$CERT_DIR/ca.crt"
+        systemctl restart rsyslog || true
+        rm -f -- "$backup"
+        die "客户端 CA 更新失败；已恢复旧证书"
+    fi
+    rm -f -- "$backup" "$incoming"
+    rmdir "$IMPORT_DIR" 2>/dev/null || true
+    logger -t xboard-node -- "xboard-audit-ca-update-probe-$(date +%s)-$$" || true
+    info "客户端 CA 已更新；请在主机检查节点日志和 rsyslog 服务。"
+}
+
 remove_node() {
     require_master
     local node=${1:-} tmp nodes_backup
@@ -764,6 +844,7 @@ menu() {
 11) 续期主机证书      12) 生成客户端续期包
 13) 验证主机真实日志链路
 14) 更新主机二进制与管理脚本
+15) 修复主机 CA 证书   16) 更新客户端 CA 证书
 0) 退出
 EOF
         read -r -p '选择：' choice || return 0
@@ -782,6 +863,8 @@ EOF
             12) renew_node_cert ;;
             13) require_master; verify_real_source ;;
             14) upgrade_master ;;
+            15) repair_ca_certificate ;;
+            16) update_client_ca ;;
             0) return 0 ;;
             *) info "未知选项，请重新选择" ;;
         esac
@@ -805,6 +888,8 @@ case "${1:-menu}" in
     status) status ;;
     uninstall) uninstall_all ;;
     renew-server) require_master; renew_server_cert ;;
+    repair-ca) repair_ca_certificate ;;
+    update-client-ca) update_client_ca ;;
     renew-node) shift; renew_node_cert "${1:-}" ;;
     verify-source) require_master; verify_real_source ;;
     *) die "未知命令" ;;
