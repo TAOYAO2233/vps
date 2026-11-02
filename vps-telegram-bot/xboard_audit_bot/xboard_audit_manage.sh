@@ -4,8 +4,8 @@ umask 077
 
 # 从 GitHub Actions 下载产物并上传到网盘后，填写固定版本的二进制直链及其 SHA-256。
 # 未配置时安装/升级直接报错，绝不在 VPS 编译源码。
-BINARY_URL_X86_64=""
-BINARY_SHA256_X86_64=""
+BINARY_URL_X86_64="https://alist.866806.xyz/d/Bililive/xboard-audit-linux-x86_64-musl?sign=eJecIeaOC6Rk9-eqD-rV-UI_NoL6CL1Hngo9OMqlaH8=:0"
+BINARY_SHA256_X86_64="d42c46c981a7146ebbd69c492c5b1cebb2ca04a717e4d48ac4ed9d29463c6fa1"
 BINARY_URL_AARCH64=""
 BINARY_SHA256_AARCH64=""
 
