@@ -1,0 +1,84 @@
+name: Build xboard-audit (Musl Static)
+
+on:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - 'vps-telegram-bot/xboard_audit_bot/RUST版本/**'
+      - '.github/workflows/xboard-audit.yml'
+  pull_request:
+    branches: ["main", "master"]
+    paths:
+      - 'vps-telegram-bot/xboard_audit_bot/RUST版本/**'
+      - '.github/workflows/xboard-audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_xboard_audit:
+    name: Test and build xboard-audit x86_64-musl
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vps-telegram-bot/xboard_audit_bot/RUST版本
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Install musl toolchain
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools binutils
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-musl
+
+    - name: Cache Dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          vps-telegram-bot/xboard_audit_bot/RUST版本/target
+        key: ${{ runner.os }}-xboard-audit-musl-${{ hashFiles('vps-telegram-bot/xboard_audit_bot/RUST版本/Cargo.toml', 'vps-telegram-bot/xboard_audit_bot/RUST版本/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-xboard-audit-musl-
+
+    - name: Generate missing lockfile in CI
+      run: |
+        if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+
+    - name: Run tests
+      run: cargo test --locked
+
+    - name: Build static binary
+      env:
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      run: cargo build --locked --release --target x86_64-unknown-linux-musl
+
+    - name: Package binary and checksum
+      run: |
+        set -euo pipefail
+        mkdir -p dist
+        cp target/x86_64-unknown-linux-musl/release/xboard-audit dist/xboard-audit-linux-x86_64-musl
+        readelf -l dist/xboard-audit-linux-x86_64-musl > dist/.program-headers
+        if grep -q INTERP dist/.program-headers; then
+          echo 'Binary has a dynamic interpreter; static build failed' >&2
+          exit 1
+        fi
+        rm dist/.program-headers
+        (cd dist && sha256sum xboard-audit-linux-x86_64-musl > xboard-audit-linux-x86_64-musl.sha256)
+        cp Cargo.lock dist/Cargo.lock
+
+    - name: Upload xboard-audit build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: xboard-audit-linux-x86_64-musl
+        path: vps-telegram-bot/xboard_audit_bot/RUST版本/dist/*
+        if-no-files-found: error
+
