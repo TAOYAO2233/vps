@@ -1,89 +1,140 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# ============================================================
-# VPS ls 颜色高亮与常用别名一键配置脚本
-# 支持: Bash / Zsh，自动检测 Shell，防重复写入，带备份与卸载支持
-# ============================================================
+# 为当前用户的 Bash 或 Zsh 配置 GNU ls 颜色与常用别名。
+# 可用 bash lscolorsetup.sh 安装，也可通过管道交给 bash 执行。
 
-set -u
+if [[ -z ${BASH_VERSION:-} ]]; then
+    printf '请用 Bash 执行此脚本。\n' >&2
+    return 1 2>/dev/null || exit 1
+fi
+if [[ -n ${BASH_SOURCE[0]-} && ${BASH_SOURCE[0]} != "$0" ]]; then
+    printf '请用 Bash 执行此脚本，不要用 source 加载它。\n' >&2
+    return 1 2>/dev/null || exit 1
+fi
 
-# 1. 自动检测用户的目标 Shell 配置文件
-TARGET_FILES=()
+set -euo pipefail
 
-# 检查当前用户的登录 Shell
-CURRENT_SHELL="${SHELL:-/bin/bash}"
+START_MARKER='# ===== Custom LS Colors and Aliases ====='
+END_MARKER='# ========================================'
 
-case "$CURRENT_SHELL" in
-    */zsh)
-        TARGET_FILES+=("$HOME/.zshrc")
-        ;;
-    */bash)
-        TARGET_FILES+=("$HOME/.bashrc")
-        ;;
+case "${1:-}" in
+    '') ACTION=install ;;
+    -u|--uninstall) ACTION=uninstall ;;
     *)
-        TARGET_FILES+=("$HOME/.profile")
+        printf '用法：bash %s [--uninstall]\n' "$0" >&2
+        exit 2
         ;;
 esac
 
-# 如果是卸载模式
-if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
-    for conf in "${TARGET_FILES[@]}"; do
-        if [ -f "$conf" ] && grep -q "# ===== Custom LS Colors and Aliases =====" "$conf"; then
-            sed -i '/# ===== Custom LS Colors and Aliases =====/,/# ========================================/d' "$conf"
-            printf "\033[32m[+]\033[0m 已从 %s 中移除配置\n" "$conf"
+LOGIN_SHELL="${SHELL:-}"
+case "${LOGIN_SHELL##*/}" in
+    bash) CONF_FILE="$HOME/.bashrc" ;;
+    zsh) CONF_FILE="$HOME/.zshrc" ;;
+    *)
+        printf '仅支持 Bash 和 Zsh；当前登录 Shell：%s\n' "${LOGIN_SHELL:-未设置}" >&2
+        exit 1
+        ;;
+esac
+
+# 返回 0：完整区块；1：没有区块；2：标记缺失、重复或顺序错误。
+block_state() {
+    local line line_no=0 starts=0 ends=0 start_line=0 end_line=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        ((line_no += 1))
+        if [[ $line == "$START_MARKER" ]]; then
+            ((starts += 1))
+            start_line=$line_no
+        elif [[ $line == "$END_MARKER" ]]; then
+            ((ends += 1))
+            end_line=$line_no
         fi
-    done
+    done < "$CONF_FILE"
+    if (( starts == 0 && ends == 0 )); then return 1; fi
+    if (( starts == 1 && ends == 1 && start_line < end_line )); then return 0; fi
+    return 2
+}
+
+backup_config() {
+    BACKUP_FILE="${CONF_FILE}.bak.$(date +%Y%m%d%H%M%S).$$"
+    cp -p -- "$CONF_FILE" "$BACKUP_FILE"
+    printf '已备份：%s\n' "$BACKUP_FILE"
+}
+
+if [[ $ACTION == uninstall ]]; then
+    if [[ ! -f $CONF_FILE ]]; then
+        printf '配置文件不存在，无需卸载：%s\n' "$CONF_FILE"
+        exit 0
+    fi
+    if block_state; then
+        :
+    else
+        state=$?
+        if (( state == 1 )); then
+            printf '未找到本脚本的配置：%s\n' "$CONF_FILE"
+            exit 0
+        fi
+        printf '配置区块标记不完整，已停止卸载：%s\n' "$CONF_FILE" >&2
+        exit 1
+    fi
+
+    backup_config
+    temp_file=$(mktemp)
+    if {
+        skipping=0
+        while IFS= read -r line || [[ -n $line ]]; do
+            if [[ $line == "$START_MARKER" ]]; then
+                skipping=1
+                continue
+            fi
+            if [[ $line == "$END_MARKER" ]]; then
+                skipping=0
+                continue
+            fi
+            if (( ! skipping )); then printf '%s\n' "$line"; fi
+        done < "$CONF_FILE"
+    } > "$temp_file" && cat -- "$temp_file" > "$CONF_FILE"; then
+        rm -f -- "$temp_file"
+        printf '已从 %s 移除配置。重新打开终端后生效。\n' "$CONF_FILE"
+    else
+        rm -f -- "$temp_file"
+        printf '卸载失败；可用备份恢复：%s\n' "$BACKUP_FILE" >&2
+        exit 1
+    fi
     exit 0
 fi
 
-# 2. 遍历并配置目标文件
-for CONF_FILE in "${TARGET_FILES[@]}"; do
-    [ -f "$CONF_FILE" ] || touch "$CONF_FILE"
-
-    # 检查是否已存在配置
-    if grep -q "# ===== Custom LS Colors and Aliases =====" "$CONF_FILE"; then
-        printf "\033[33m[!]\033[0m 配置已存在于 %s，无需重复写入。\n" "$CONF_FILE"
-        continue
+if [[ ! -e $CONF_FILE ]]; then
+    touch -- "$CONF_FILE"
+fi
+if block_state; then
+    printf '配置已存在于 %s，无需重复写入。\n' "$CONF_FILE"
+    exit 0
+else
+    state=$?
+    if (( state != 1 )); then
+        printf '配置区块标记不完整，已停止安装：%s\n' "$CONF_FILE" >&2
+        exit 1
     fi
+fi
 
-    # 首次写入前先备份
-    cp "$CONF_FILE" "${CONF_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-
-    # 3. 写入核心配置
-    # 说明：
-    # - di=01;34 (目录: 高亮蓝)
-    # - ex=01;32 (可执行文件: 高亮绿)
-    # - 不硬编码普通文件为白色，避免白底/浅色主题看不清
-    # - --group-directories-first: 目录排在文件前面
-    # - -h: 文件大小人性化显示 (K/M/G)
-    cat << 'EOF' >> "$CONF_FILE"
+backup_config
+if cat <<'EOF' >> "$CONF_FILE"; then
 
 # ===== Custom LS Colors and Aliases =====
-export LS_COLORS="di=01;34:ex=01;32:${LS_COLORS:-}"
+# 放在现有 LS_COLORS 后面，使目录和可执行文件颜色优先生效；重复加载不追加。
+case ":${LS_COLORS-}" in
+    *":di=01;34:ex=01;32") ;;
+    *) export LS_COLORS="${LS_COLORS:+${LS_COLORS%:}:}di=01;34:ex=01;32" ;;
+esac
 
-# 常用别名定义
 alias ls='ls --color=auto -F --group-directories-first'
 alias ll='ls -lh --color=auto -F --group-directories-first'
 alias la='ls -A --color=auto -F --group-directories-first'
 alias lla='ls -lah --color=auto -F --group-directories-first'
 # ========================================
 EOF
-
-    printf "\033[32m[+]\033[0m 配置已成功写入 %s\n" "$CONF_FILE"
-done
-
-# 4. 生效提示
-printf "\n\033[32m[✓] 终端高亮配置完成！\033[0m\n"
-if [ "${BASH_SOURCE[0]}" != "$0" ]; then
-    # 如果是用 source 执行的当前脚本，则当前终端直接生效
-    for CONF_FILE in "${TARGET_FILES[@]}"; do
-        source "$CONF_FILE" 2>/dev/null || true
-    done
-    printf "\033[36m[*] 当前会话已自动生效。\033[0m\n"
+    printf '已写入 %s。重新打开终端后生效。\n' "$CONF_FILE"
 else
-    # 直接执行脚本时，子进程无法影响父进程，给出准确提示
-    printf "\033[33m[*] 请执行以下命令使其立即生效，或重新连接终端：\033[0m\n"
-    for CONF_FILE in "${TARGET_FILES[@]}"; do
-        printf "    source %s\n" "$CONF_FILE"
-    done
+    printf '写入失败；可用备份恢复：%s\n' "$BACKUP_FILE" >&2
+    exit 1
 fi
