@@ -23,25 +23,33 @@ fail() { say "[错误] $*" >&2; return 1; }
 pause() { read -r -p '按 Enter 返回菜单...' _ || :; }
 confirm() { local answer; read -r -p "$1 (输入 YES 确认): " answer && [[ $answer == YES ]]; }
 log_event() {
-    local event=$1 result=$2 detail=${3:-}
+    local event=$1 result=$2 detail=${3:-} log_dir
     if [[ $EUID -eq 0 ]]; then
-        install -d -m 700 "${LOG_FILE%/*}" 2>/dev/null || return 0
+        log_dir=$(dirname -- "$LOG_FILE") || return 0
+        mkdir -p -- "$log_dir" 2>/dev/null || return 0
+        [[ ! -L $LOG_FILE && ( ! -e $LOG_FILE || -f $LOG_FILE ) ]] || return 0
         printf '%s\tevent=%s\tuser=%s\tresult=%s\ttx=%s\t%s\n' \
-            "$(date -u +%FT%TZ)" "$event" "$(id -un)" "$result" "${TX_DIR##*/}" "$detail" >> "$LOG_FILE" 2>/dev/null || :
+            "$(date -u +%FT%TZ)" "$event" "$(id -un)" "$result" "${TX_DIR##*/}" "$detail" 2>/dev/null >> "$LOG_FILE" || return 0
         chmod 600 "$LOG_FILE" 2>/dev/null || :
     fi
 }
+cleanup_temp_files() {
+    local file
+    for file in "${TMP_FILES[@]}"; do
+        rm -f -- "$file"
+    done
+    TMP_FILES=()
+}
 cleanup() {
-    local t
     if (( KEY_TX_ACTIVE )); then
         rollback_generated_key || say '[严重] 密钥恢复失败；请检查密钥备份目录。' >&2
     fi
     cleanup_key_temp
-    for t in "${TMP_FILES[@]}"; do [[ -n $t ]] && rm -f -- "$t"; done
     if (( TX_ACTIVE )); then
         say '[警告] 操作中断，正在恢复 SSH 配置。' >&2
         rollback || say '[严重] 自动恢复失败；请使用控制台和备份目录手工恢复。' >&2
     fi
+    cleanup_temp_files
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -50,6 +58,7 @@ trap 'exit 143' TERM
 require_root() { (( EUID == 0 )) || fail '此操作必须以 root 身份运行（sudo bash 脚本路径）。'; }
 init_env() {
     [[ ! -L $HOME/.ssh && ! -L $AUTH_FILE ]] || { fail '拒绝操作符号链接形式的 SSH 目录或授权文件。'; return 1; }
+    [[ ! -e $AUTH_FILE || -f $AUTH_FILE ]] || { fail '授权文件路径不是普通文件。'; return 1; }
     install -d -m 700 "$HOME/.ssh" || return 1
     [[ -e $AUTH_FILE ]] || ( umask 077; : > "$AUTH_FILE" ) || return 1
     chmod 700 "$HOME/.ssh" && chmod 600 "$AUTH_FILE"
@@ -85,7 +94,7 @@ rollback_generated_key() {
 
 # Extract key material after optional authorized_keys options. ssh-keygen validates it.
 key_data() {
-    local line=$1 part type blob
+    local line=$1 type blob
     [[ $line != *$'\r'* && $line != *$'\n'* && ${#line} -le 16384 ]] || return 1
     if [[ $line =~ (^|[[:space:]])(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521))[[:space:]]+([A-Za-z0-9+/=]+)($|[[:space:]]) ]]; then
         type=${BASH_REMATCH[2]}; blob=${BASH_REMATCH[4]}
@@ -109,17 +118,18 @@ key_fingerprint() {
     printf '%s\n' "$output" | awk '{print $2}'
 }
 key_count() {
-    local line count=0
-    [[ -f $AUTH_FILE ]] || { say 0; return; }
+    local file=${1:-$AUTH_FILE} line count=0
+    [[ -f $file ]] || { say 0; return; }
     while IFS= read -r line || [[ -n $line ]]; do
         key_fingerprint "$line" >/dev/null 2>&1 && ((count+=1))
-    done < "$AUTH_FILE"
+    done < "$file"
     say "$count"
 }
 list_keys() {
     local line fp n=0
     [[ -f $AUTH_FILE ]] || { say '没有授权文件。'; return; }
     while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%$'\r'}
         fp=$(key_fingerprint "$line" 2>/dev/null) || continue
         ((n+=1))
         printf '[%d] %s %s\n' "$n" "$fp" "${line:0:110}"
@@ -127,32 +137,42 @@ list_keys() {
     ((n)) || say '没有有效的授权公钥。'
 }
 add_keys() {
-    local source=$1 line fp oldfp existing=0 duplicate=0 added=0 invalid=0 tmp
+    local source=$1 line fp old oldfp added=0 invalid=0 tmp trailing_newline
+    local -A fingerprints=() records=()
     init_env || return 1
-    tmp=$(mktemp "$HOME/.ssh/.authorized_keys.XXXXXXXX") || return 1
+    tmp=$(mktemp "${AUTH_FILE%/*}/.authorized_keys.XXXXXXXX") || return 1
     TMP_FILES+=("$tmp")
     cp -p -- "$AUTH_FILE" "$tmp" || return 1
-    while IFS= read -r line || [[ -n $line ]]; do
-        [[ -z ${line//[[:space:]]/} || $line == \#* ]] && continue
+    while IFS= read -r old || [[ -n $old ]]; do
+        old=${old%$'\r'}
+        oldfp=$(key_fingerprint "$old" 2>/dev/null) || continue
+        fingerprints[$oldfp]=1
+        records[$old]=1
+    done < "$tmp"
+    # Keep stdin available for the operator's confirmation.
+    while IFS= read -r -u 3 line || [[ -n $line ]]; do
+        line=${line%$'\r'}
+        [[ $line =~ ^[[:blank:]]*(#|$) ]] && continue
         fp=$(key_fingerprint "$line" 2>/dev/null) || { ((invalid+=1)); continue; }
-        existing=0; duplicate=0
-        while IFS= read -r old || [[ -n $old ]]; do
-            oldfp=$(key_fingerprint "$old" 2>/dev/null) || continue
-            if [[ $oldfp == "$fp" ]]; then
-                existing=1
-                [[ $old == "$line" ]] && duplicate=1
+        if [[ ${fingerprints[$fp]+yes} ]]; then
+            if [[ ${records[$line]+yes} ]]; then
+                say "跳过重复公钥 $fp"
+            else
+                say "[冲突] $fp 已存在，但授权选项或备注不同；请人工检查。"
             fi
-        done < "$tmp"
-        if (( existing )); then
-            if (( duplicate )); then say "跳过重复公钥 $fp";
-            else say "[冲突] $fp 已存在，但授权选项或备注不同；请人工检查。"; fi
             continue
         fi
         say "来源公钥：$fp ${line:0:100}"
         confirm '确认授权此公钥' || continue
+        if (( added == 0 )) && [[ -s $tmp ]]; then
+            trailing_newline=$(tail -c 1 -- "$tmp" | wc -l) || return 1
+            if (( trailing_newline == 0 )); then printf '\n' >> "$tmp" || return 1; fi
+        fi
         printf '%s\n' "$line" >> "$tmp" || return 1
+        fingerprints[$fp]=1
+        records[$line]=1
         ((added+=1))
-    done < "$source"
+    done 3< "$source"
     if (( added )); then
         backup_auth || return 1
         chmod 600 "$tmp" && mv -f -- "$tmp" "$AUTH_FILE" || return 1
@@ -167,9 +187,10 @@ delete_key() {
     init_env || return 1
     list_keys
     read -r -p '删除编号（0 取消）：' answer || return 1
-    [[ $answer =~ ^[0-9]+$ ]] || return 1
+    [[ $answer =~ ^[0-9]{1,9}$ ]] || { fail '请输入有效的公钥编号。'; return 1; }
+    answer=$((10#$answer))
     (( answer > 0 )) || return 0
-    tmp=$(mktemp "$HOME/.ssh/.authorized_keys.XXXXXXXX") || return 1
+    tmp=$(mktemp "${AUTH_FILE%/*}/.authorized_keys.XXXXXXXX") || return 1
     TMP_FILES+=("$tmp")
     while IFS= read -r line || [[ -n $line ]]; do
         if fp=$(key_fingerprint "$line" 2>/dev/null); then
@@ -248,18 +269,30 @@ generate_key() {
 sshd_bin() { if command -v sshd >/dev/null; then command -v sshd; elif [[ -x /usr/sbin/sshd ]]; then say /usr/sbin/sshd; else return 1; fi; }
 effective() { local bin; bin=$(sshd_bin) || return 1; "$bin" -T -C "user=${1:-$(id -un)},host=localhost,addr=127.0.0.1" 2>/dev/null; }
 active_ports() {
-    local p
     command -v ss >/dev/null || return 1
     ss -H -ltn 2>/dev/null | awk '{print $4}' | sed -nE 's/.*:([0-9]+)$/\1/p' | sort -un
 }
-port_listening() { active_ports | grep -qx "$1"; }
-wait_for_port() {
-    local port=$1 attempt
+configured_ports() { effective | awk '$1=="port"{print $2}' | sort -un; }
+ssh_listening_ports() {
+    local pid
+    pid=$(systemctl show --property=MainPID --value "$SERVICE") || return 1
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+    ss -H -ltnp | awk -v pid="$pid" '
+        index($0, "pid=" pid ",") {
+            sub(/^.*:/, "", $4)
+            if ($4 ~ /^[0-9]+$/) print $4
+        }
+    ' | sort -un
+}
+wait_for_ssh_ports() {
+    local expected=$1 actual attempt
     for ((attempt=0; attempt<20; attempt++)); do
-        port_listening "$port" && return 0
+        if actual=$(ssh_listening_ports) && [[ $actual == "$expected" ]]; then
+            return 0
+        fi
         sleep 0.25
     done
-    return 1
+    fail "SSH 监听端口与配置不符（预期 ${expected//$'\n'/,}，实际 ${actual//$'\n'/,}）。"
 }
 service_detect() {
     if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then
@@ -275,7 +308,9 @@ service_detect() {
     fi
 }
 reload_service() {
-    "$(sshd_bin | tail -n 1)" -t || return 1
+    local bin
+    bin=$(sshd_bin) || return 1
+    "$bin" -t || return 1
     systemctl reload "$SERVICE" || return 1
     systemctl is-active --quiet "$SERVICE"
 }
@@ -293,7 +328,7 @@ tx_setup() {
     TX_DIR=$(mktemp -d "$BACKUP_DIR/tx.XXXXXXXX") || return 1
     cp -p -- "$SSH_CONFIG" "$TX_DIR/sshd_config" || return 1
     [[ -s $TX_DIR/sshd_config ]] || { fail '配置备份校验失败。'; return 1; }
-    effective | awk '$1=="port"{print $2}' > "$TX_DIR/ports" || return 1
+    configured_ports > "$TX_DIR/ports" || return 1
     [[ -s $TX_DIR/ports ]] || { fail '无法记录原始 SSH 端口。'; return 1; }
     systemctl is-active "$SERVICE" > "$TX_DIR/service" || return 1
     if command -v ufw >/dev/null; then ufw status numbered > "$TX_DIR/ufw.before" 2>&1 || return 1; fi
@@ -305,53 +340,88 @@ tx_setup() {
     say "事务备份：$TX_DIR"
 }
 rollback() {
-    local ok=0 p
+    local failed=0 expected restored
     (( TX_ACTIVE )) || return 0
-    cp -p -- "$TX_DIR/sshd_config" "$SSH_CONFIG" || ok=1
-    if (( ok == 0 )); then reload_service || ok=1; fi
-    if [[ -n $FW_ADDED ]]; then
-        case $FW_ADDED in
-            ufw:*) ufw delete allow "${FW_ADDED#*:}"/tcp || ok=1 ;;
-            firewalld:*) firewall-cmd --permanent --remove-port="${FW_ADDED#*:}"/tcp && firewall-cmd --reload || ok=1 ;;
-        esac
+    if restored=$(mktemp "${SSH_CONFIG%/*}/.sshkey-manager.XXXXXXXX"); then
+        TMP_FILES+=("$restored")
+        cp -p -- "$TX_DIR/sshd_config" "$restored" && mv -f -- "$restored" "$SSH_CONFIG" || failed=1
+    else
+        failed=1
     fi
-    if [[ -n $SE_ADDED ]]; then semanage port -d -t ssh_port_t -p tcp "$SE_ADDED" || ok=1; fi
-    while read -r p; do [[ -z $p ]] || wait_for_port "$p" || ok=1; done < "$TX_DIR/ports"
+    expected=$(<"$TX_DIR/ports")
+    if (( ! failed )); then
+        if reload_service; then
+            wait_for_ssh_ports "$expected" || failed=1
+        else
+            fail '原配置已写回，但重新加载 SSH 服务失败。'
+            failed=1
+        fi
+    else
+        fail '无法写回原始 SSH 配置。'
+    fi
+    # Keep access rules in place if restoring the original listeners failed.
+    if (( ! failed )); then
+        case $FW_ADDED in
+            ufw:*) ufw delete allow "${FW_ADDED#*:}"/tcp || failed=1 ;;
+            firewalld:*) firewall-cmd --permanent --remove-port="${FW_ADDED#*:}"/tcp && firewall-cmd --reload || failed=1 ;;
+        esac
+        if [[ -n $SE_ADDED ]]; then semanage port -d -t ssh_port_t -p tcp "$SE_ADDED" || failed=1; fi
+    elif [[ -n $FW_ADDED || -n $SE_ADDED ]]; then
+        say '[警告] 保留本次添加的端口访问规则，等待人工检查。' >&2
+    fi
+    end_tx
+    if (( failed )); then
+        log_event rollback failure
+        fail "恢复未完全成功！请检查 $TX_DIR 并使用控制台修复。"
+        return 1
+    fi
+    log_event rollback success
+    say "已恢复原始配置，备份保留在 $TX_DIR"
+}
+end_tx() {
     TX_ACTIVE=0
     FW_ADDED=''
     SE_ADDED=''
     flock -u 9 2>/dev/null || :
-    if (( ok )); then log_event rollback failure; fail "恢复未完全成功！请检查 $TX_DIR 并使用控制台修复。"; return 1; fi
-    log_event rollback success
-    say "已恢复原始配置，备份保留在 $TX_DIR"
 }
-commit_tx() { TX_ACTIVE=0; log_event "$1" success; say "操作完成；备份：$TX_DIR"; FW_ADDED=''; SE_ADDED=''; flock -u 9 2>/dev/null || :; }
+commit_tx() {
+    end_tx
+    log_event "$1" success
+    say "操作完成；备份：$TX_DIR"
+}
+abort_tx() {
+    fail "$1"
+    rollback
+    return 1
+}
 
 # Only the main global section is edited. Conflicting Match or drop-in settings fail verification.
 write_config() {
-    local directives=$1 kind=$2 tmp
+    local directives=$1 kind=$2 tmp bin
     tmp=$(mktemp "${SSH_CONFIG%/*}/.sshkey-manager.XXXXXXXX") || return 1; TMP_FILES+=("$tmp")
     {
-        say '# BEGIN sshkey-manager managed settings'
-        printf '%s\n' "$directives"
+        say '# BEGIN sshkey-manager managed settings' &&
+        printf '%s\n' "$directives" &&
         awk -v kind="$kind" '
             /^# BEGIN sshkey-manager managed settings$/ {managed=1; next}
             /^# END sshkey-manager managed settings$/ {managed=0; next}
-            managed && kind=="port" && $1!="Port" {print}
-            managed && kind=="auth" && $1=="Port" {print}
-        ' "$SSH_CONFIG"
-        say '# END sshkey-manager managed settings'
+            managed && kind=="port" && tolower($1)!="port" {print}
+            managed && kind=="auth" && tolower($1)=="port" {print}
+        ' "$SSH_CONFIG" &&
+        say '# END sshkey-manager managed settings' &&
         awk -v kind="$kind" '
             /^# BEGIN sshkey-manager managed settings$/ {managed=1; next}
             /^# END sshkey-manager managed settings$/ {managed=0; next}
             managed {next}
-            !matchblock && /^[[:space:]]*Match[[:space:]]/ {matchblock=1}
-            !matchblock && ((kind=="port" && /^[[:space:]]*Port[[:space:]]/) || (kind=="auth" && /^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|PubkeyAuthentication)[[:space:]]/)) {
+            { line=tolower($0) }
+            !matchblock && line ~ /^[[:space:]]*match[[:space:]]/ {matchblock=1}
+            !matchblock && ((kind=="port" && line ~ /^[[:space:]]*port[[:space:]]/) || (kind=="auth" && line ~ /^[[:space:]]*(passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication)[[:space:]]/)) {
                 print "# sshkey-manager previous: " $0; next
             }
             {print}
         ' "$SSH_CONFIG"
     } > "$tmp" || return 1
+    bin=$(sshd_bin) && "$bin" -t -f "$tmp" || return 1
     chmod --reference="$SSH_CONFIG" "$tmp" && chown --reference="$SSH_CONFIG" "$tmp" && mv -f -- "$tmp" "$SSH_CONFIG"
 }
 config_conflicts() {
@@ -362,7 +432,7 @@ config_conflicts() {
     fi
 }
 check_key_login() {
-    local user=$1 data ak path
+    local user=$1 data ak path count
     id "$user" >/dev/null 2>&1 || { fail '用户不存在。'; return 1; }
     data=$(effective "$user") || { fail '无法取得该用户的有效 SSH 配置。'; return 1; }
     [[ $(awk '$1=="pubkeyauthentication"{print $2}' <<< "$data") == yes ]] || { fail 'PubkeyAuthentication 未启用。'; return 1; }
@@ -376,10 +446,7 @@ check_key_login() {
     [[ -f $path && ! -L $path ]] || { fail '目标用户授权文件不存在。'; return 1; }
     [[ $(stat -c %a "$path") == 600 && $(stat -c %a "${path%/*}") == 700 ]] || { fail '目标用户 SSH 文件权限异常。'; return 1; }
     [[ ! $(stat -c %a "${path%/.ssh/authorized_keys}") =~ [2367][0-7]$ ]] || { fail '用户主目录可能允许其他用户写入。'; return 1; }
-    local previous_auth=$AUTH_FILE count
-    AUTH_FILE=$path
-    count=$(key_count)
-    AUTH_FILE=$previous_auth
+    count=$(key_count "$path")
     (( count > 0 )) || fail '没有格式有效的授权公钥。'
 }
 set_password() {
@@ -392,7 +459,7 @@ set_password() {
         confirm '已通过独立连接成功使用密钥登录' || return 0
     fi
     config_conflicts 'PasswordAuthentication|KbdInteractiveAuthentication|PubkeyAuthentication' || return 1
-    if grep -Eq '^[[:space:]]*Match[[:space:]]' "$SSH_CONFIG" /etc/ssh/sshd_config.d/*.conf 2>/dev/null; then
+    if grep -Eiq '^[[:space:]]*Match[[:space:]]' "$SSH_CONFIG" /etc/ssh/sshd_config.d/*.conf 2>/dev/null; then
         fail '存在 Match 配置，无法确认所有连接的认证结果；请手工修改。'
         return 1
     fi
@@ -437,7 +504,7 @@ open_port() {
     fi
 }
 change_port() {
-    local new old ports directives p
+    local new ports listening expected directives
     require_root || return 1
     read -r -p '新端口 (1-65535)：' new || return 1
     [[ $new =~ ^[0-9]{1,5}$ ]] || { fail '端口无效。'; return 1; }
@@ -445,52 +512,77 @@ change_port() {
     (( new >= 1 && new <= 65535 )) || { fail '端口必须在 1 到 65535 之间。'; return 1; }
     config_conflicts Port || return 1
     service_detect || return 1
-    ports=$(effective | awk '$1=="port"{print $2}') || return 1
+    ports=$(configured_ports) || return 1
     [[ -n $ports ]] || { fail '无法确定当前有效端口。'; return 1; }
-    while read -r p; do port_listening "$p" || { fail "旧端口 $p 未监听，停止迁移。"; return 1; }; done <<< "$ports"
-    if port_listening "$new"; then fail '新端口已被占用或已经监听。'; return 1; fi
+    if [[ $ports == "$new" ]]; then
+        wait_for_ssh_ports "$ports" && say "SSH 已在端口 $new 监听。"
+        return
+    fi
     say '请先在云服务商安全组放行新端口；脚本无法验证云安全组。'
     confirm '已放行安全组并保持当前 SSH 会话' || return 0
     begin_tx || return 1
-    open_port "$new" || { rollback; return 1; }
-    directives=$(printf 'Port %s\n' $ports; printf 'Port %s' "$new")
-    write_config "$directives" port || { rollback; return 1; }
-    "$(sshd_bin)" -t && effective | awk '$1=="port"{print $2}' | grep -qx "$new" || { rollback; return 1; }
-    while read -r p; do effective | awk '$1=="port"{print $2}' | grep -qx "$p" || { rollback; return 1; }; done <<< "$ports"
-    reload_service || { rollback; return 1; }
-    wait_for_port "$new" || { fail "新端口 $new 未开始监听。"; rollback; return 1; }
-    while read -r p; do wait_for_port "$p" || { fail "旧端口 $p 未保持监听。"; rollback; return 1; }; done <<< "$ports"
-    say "新旧端口都在监听。请在另一终端用 ssh -p $new 用户@服务器地址 完成密钥登录并执行命令。"
+    if [[ $(<"$TX_DIR/ports") != "$ports" ]] || ! wait_for_ssh_ports "$ports"; then
+        end_tx
+        fail '当前配置或监听状态已变化，请检查后重试。'
+        return 1
+    fi
+    if ! grep -Fxq -- "$new" <<< "$ports"; then
+        if ! listening=$(active_ports) || grep -Fxq -- "$new" <<< "$listening"; then
+            end_tx
+            fail "无法确认端口 $new 可用。"
+            return 1
+        fi
+        expected=$(printf '%s\n' "$ports" "$new" | sort -un) || { end_tx; return 1; }
+        directives=$(awk '{print "Port " $1}' <<< "$expected") || { end_tx; return 1; }
+        open_port "$new" || { abort_tx "无法放行端口 $new。"; return 1; }
+        apply_ports "$directives" "$expected" || { rollback; return 1; }
+    fi
+    say "当前新旧端口均在监听。请在另一终端用 ssh -o ControlPath=none -p $new 用户@服务器地址 完成密钥登录并执行命令。"
     if ! confirm '已从外部成功使用新端口登录'; then
         say '未确认新连接，保留新旧双端口配置。'
         commit_tx port_transition
         return 0
     fi
     if confirm '确认关闭旧 SSH 端口监听'; then
-        write_config "Port $new" port || { rollback; return 1; }
-        [[ $(effective | awk '$1=="port"{print $2}') == "$new" ]] || { fail '仅保留新端口后的有效配置校验失败。'; rollback; return 1; }
-        reload_service || { fail '重新加载 SSH 服务失败。'; rollback; return 1; }
-        wait_for_port "$new" || { fail "重新加载后新端口 $new 未开始监听。"; rollback; return 1; }
+        apply_ports "Port $new" "$new" || { rollback; return 1; }
         say '旧防火墙规则未自动删除；请确认其他服务用途后手工清理。'
     else
         say '保留双端口监听。'
     fi
     commit_tx port_change
 }
+apply_ports() {
+    local directives=$1 expected=$2 actual
+    write_config "$directives" port || { fail '写入 SSH 端口配置失败。'; return 1; }
+    if ! actual=$(configured_ports) || [[ $actual != "$expected" ]]; then
+        fail "有效端口配置异常（预期 ${expected//$'\n'/,}，实际 ${actual//$'\n'/,}）。"
+        return 1
+    fi
+    reload_service || { fail '重新加载 SSH 服务失败。'; return 1; }
+    wait_for_ssh_ports "$expected"
+}
 environment() {
-    local service='未知' ports='未知' data
+    local unit service_id ports data password pubkey
+    local -A shown_services=()
     [[ -r /etc/os-release ]] && . /etc/os-release && say "系统：${PRETTY_NAME:-未知}"
     say "用户：$(id -un)"
     if command -v systemctl >/dev/null; then
-        for service in ssh.service sshd.service ssh.socket sshd.socket; do
-            systemctl is-active --quiet "$service" && say "SSH 管理：$service (active)"
+        for unit in ssh.service sshd.service ssh.socket sshd.socket; do
+            systemctl is-active --quiet "$unit" || continue
+            service_id=$(systemctl show --property=Id --value "$unit" 2>/dev/null) || service_id=$unit
+            service_id=${service_id:-$unit}
+            [[ ${shown_services[$service_id]+yes} ]] && continue
+            shown_services[$service_id]=1
+            say "SSH 管理：$service_id (active)"
         done
     fi
-    ports=$(effective 2>/dev/null | awk '$1=="port"{print $2}' | paste -sd, -)
+    data=$(effective) || data=''
+    ports=$(awk '$1=="port"{print $2}' <<< "$data" | paste -sd, -)
+    password=$(awk '$1=="passwordauthentication"{print $2; exit}' <<< "$data")
+    pubkey=$(awk '$1=="pubkeyauthentication"{print $2; exit}' <<< "$data")
     say "配置端口：${ports:-未知}"
-    data=$(effective 2>/dev/null)
-    say "密码认证：$(awk '$1=="passwordauthentication"{print $2}' <<< "$data" | head -1)"
-    say "公钥认证：$(awk '$1=="pubkeyauthentication"{print $2}' <<< "$data" | head -1)"
+    say "密码认证：${password:-未知}"
+    say "公钥认证：${pubkey:-未知}"
     say "当前授权公钥：$(key_count)"
     if command -v ufw >/dev/null; then ufw status | head -1; fi
     if command -v firewall-cmd >/dev/null; then firewall-cmd --state 2>/dev/null || :; fi
@@ -520,6 +612,7 @@ main() {
             0) break ;;
             *) fail '无效选择。' ;;
         esac
+        cleanup_temp_files
         pause
     done
 }
