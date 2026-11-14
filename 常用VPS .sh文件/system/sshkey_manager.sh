@@ -253,6 +253,14 @@ active_ports() {
     ss -H -ltn 2>/dev/null | awk '{print $4}' | sed -nE 's/.*:([0-9]+)$/\1/p' | sort -un
 }
 port_listening() { active_ports | grep -qx "$1"; }
+wait_for_port() {
+    local port=$1 attempt
+    for ((attempt=0; attempt<20; attempt++)); do
+        port_listening "$port" && return 0
+        sleep 0.25
+    done
+    return 1
+}
 service_detect() {
     if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then
         if systemctl is-active --quiet ssh.socket || systemctl is-active --quiet sshd.socket; then
@@ -308,12 +316,12 @@ rollback() {
         esac
     fi
     if [[ -n $SE_ADDED ]]; then semanage port -d -t ssh_port_t -p tcp "$SE_ADDED" || ok=1; fi
-    while read -r p; do [[ -z $p ]] || port_listening "$p" || ok=1; done < "$TX_DIR/ports"
+    while read -r p; do [[ -z $p ]] || wait_for_port "$p" || ok=1; done < "$TX_DIR/ports"
     TX_ACTIVE=0
     FW_ADDED=''
     SE_ADDED=''
     flock -u 9 2>/dev/null || :
-    if (( ok )); then log_event rollback failure; fail "恢复未完全成功！请检查 $TX_DIR 并使用控制台修复。"; fi
+    if (( ok )); then log_event rollback failure; fail "恢复未完全成功！请检查 $TX_DIR 并使用控制台修复。"; return 1; fi
     log_event rollback success
     say "已恢复原始配置，备份保留在 $TX_DIR"
 }
@@ -450,8 +458,8 @@ change_port() {
     "$(sshd_bin)" -t && effective | awk '$1=="port"{print $2}' | grep -qx "$new" || { rollback; return 1; }
     while read -r p; do effective | awk '$1=="port"{print $2}' | grep -qx "$p" || { rollback; return 1; }; done <<< "$ports"
     reload_service || { rollback; return 1; }
-    port_listening "$new" || { rollback; return 1; }
-    while read -r p; do port_listening "$p" || { rollback; return 1; }; done <<< "$ports"
+    wait_for_port "$new" || { fail "新端口 $new 未开始监听。"; rollback; return 1; }
+    while read -r p; do wait_for_port "$p" || { fail "旧端口 $p 未保持监听。"; rollback; return 1; }; done <<< "$ports"
     say "新旧端口都在监听。请在另一终端用 ssh -p $new 用户@服务器地址 完成密钥登录并执行命令。"
     if ! confirm '已从外部成功使用新端口登录'; then
         say '未确认新连接，保留新旧双端口配置。'
@@ -460,8 +468,9 @@ change_port() {
     fi
     if confirm '确认关闭旧 SSH 端口监听'; then
         write_config "Port $new" port || { rollback; return 1; }
-        [[ $(effective | awk '$1=="port"{print $2}') == "$new" ]] || { rollback; return 1; }
-        reload_service && port_listening "$new" || { rollback; return 1; }
+        [[ $(effective | awk '$1=="port"{print $2}') == "$new" ]] || { fail '仅保留新端口后的有效配置校验失败。'; rollback; return 1; }
+        reload_service || { fail '重新加载 SSH 服务失败。'; rollback; return 1; }
+        wait_for_port "$new" || { fail "重新加载后新端口 $new 未开始监听。"; rollback; return 1; }
         say '旧防火墙规则未自动删除；请确认其他服务用途后手工清理。'
     else
         say '保留双端口监听。'
