@@ -95,10 +95,12 @@ key_data() {
     fi
 }
 key_fingerprint() {
-    local material output tmp
-    material=$(key_data "$1") || return 1
+    local line=$1 material output tmp
+    # read leaves the CR from CRLF authorized_keys lines in the value.
+    line=${line%$'\r'}
+    material=$(key_data "$line") || return 1
     tmp=$(mktemp) || return 1
-    printf '%s\n' "$1" > "$tmp"
+    printf '%s\n' "$line" > "$tmp"
     ssh-keygen -lf "$tmp" -E sha256 >/dev/null 2>&1 || { rm -f -- "$tmp"; return 1; }
     printf '%s\n' "$material" > "$tmp"
     output=$(ssh-keygen -lf "$tmp" -E sha256 2>/dev/null)
