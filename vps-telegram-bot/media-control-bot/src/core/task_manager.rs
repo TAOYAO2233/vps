@@ -22,10 +22,10 @@ pub struct StopTicket {
     pub exclusive_target: Option<(u64, String)>,
     /// 待停止的 YouTube 任务列表 `(task_id, filename)`
     pub youtube_targets: Vec<(String, String)>,
+    youtube_enqueue_target: Option<u64>,
 }
 
 /// 发起 `/stop` 时的第一阶段判定结果。
-#[cfg(test)]
 #[derive(Debug, Clone)]
 pub enum StopInitiation {
     /// 当前没有任何运行中或排队中的任务
@@ -108,6 +108,43 @@ impl TaskManager {
         Self { state }
     }
 
+    /// Close task admission for the rest of the process lifetime.
+    pub async fn close_admission(&self) {
+        self.state.write().await.shutting_down = true;
+    }
+
+    /// Register the batch before yielding the Telegram callback worker.
+    pub async fn start_youtube_enqueue<F, Fut>(&self, work: F) -> Result<()>
+    where
+        F: FnOnce(tokio::sync::watch::Receiver<bool>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut state = self.state.write().await;
+        if state.shutting_down || state.stop_in_progress {
+            return Err(AppError::TaskStopping.into());
+        }
+        if state.has_active_task() {
+            let task_name = state.active_task_name().unwrap_or("运行中任务").to_string();
+            return Err(AppError::TaskAlreadyRunning { task_name }.into());
+        }
+        let name = "YouTube 批量入队";
+        if state.youtube_enqueue_task.as_ref().is_some_and(|t| !t.handle.is_finished()) {
+            return Err(AppError::TaskAlreadyRunning { task_name: name.to_string() }.into());
+        }
+        let task_id = state.alloc_task_id();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(work(cancel_rx));
+        state.youtube_enqueue_task = Some(TaskInfo {
+            task_id,
+            name: name.to_string(),
+            handle,
+            cancel_tx,
+            summary: ExclusiveStopSummary::default(),
+            started_at: Instant::now(),
+        });
+        Ok(())
+    }
+
     /// Cancel exactly one YouTube task, leaving other uploads untouched.
     pub async fn request_stop_youtube(&self, task_id: &str) -> bool {
         let state = self.state.read().await;
@@ -151,7 +188,7 @@ impl TaskManager {
         state.cleanup_active_task();
         state.cleanup_youtube_pool();
 
-        if state.stop_in_progress {
+        if state.shutting_down || state.stop_in_progress {
             return Err(AppError::TaskStopping.into());
         }
 
@@ -160,7 +197,8 @@ impl TaskManager {
             return Err(AppError::TaskAlreadyRunning { task_name: name }.into());
         }
 
-        let upload_count = state.active_youtube_count();
+        let enqueue_running = state.youtube_enqueue_task.as_ref().is_some_and(|t| !t.handle.is_finished());
+        let upload_count = state.active_youtube_count() + enqueue_running as usize;
         if upload_count > 0 {
             return Err(AppError::YoutubeUploadBlocking {
                 count: upload_count,
@@ -228,7 +266,7 @@ impl TaskManager {
         state.cleanup_active_task();
         state.cleanup_youtube_pool();
 
-        if state.stop_in_progress {
+        if state.shutting_down || state.stop_in_progress {
             return Err(AppError::TaskStopping.into());
         }
 
@@ -268,7 +306,10 @@ impl TaskManager {
         state.cleanup_active_task();
         state.cleanup_youtube_pool();
 
-        if state.stop_in_progress {
+        let batch_cancelled = state.youtube_enqueue_task.as_ref().is_some_and(|batch| {
+            !batch.handle.is_finished() && *batch.cancel_tx.borrow()
+        });
+        if state.shutting_down || state.stop_in_progress || batch_cancelled {
             return Err(AppError::TaskStopping.into());
         }
 
@@ -317,7 +358,11 @@ impl TaskManager {
                 Ok(Err(e)) => {
                     let safe_err = redact_secrets(&e.to_string());
                     warn!(task_id = %task_id_clone, error = %safe_err, "YouTube upload ended with error");
-                    "失败"
+                    if matches!(e.downcast_ref::<AppError>(), Some(AppError::YoutubeUploadStateUnconfirmed { .. })) {
+                        "待核实"
+                    } else {
+                        "失败"
+                    }
                 }
                 Err(join_err) => {
                     let safe_err = redact_secrets(&join_err.to_string());
@@ -328,7 +373,15 @@ impl TaskManager {
 
             // 无论成败或异常均在网络连接与辅助进度协程收尾后从上传池移除
             let mut state = state_clone.write().await;
-            state.record_task(format!("YouTube: {filename_log}"), result_label);
+            let video_id = state
+                .youtube_pool
+                .get(&task_id_clone)
+                .and_then(|task| task.video_id.as_deref());
+            let history_name = match video_id {
+                Some(id) => format!("YouTube: {filename_log} | https://youtu.be/{id}"),
+                None => format!("YouTube: {filename_log}"),
+            };
+            state.record_task(history_name, result_label);
             state.youtube_pool.remove(&task_id_clone);
         });
 
@@ -340,14 +393,14 @@ impl TaskManager {
     }
 
     /// 第一阶段：原子检查并向当前活跃任务发送取消信号（幂等保护连续 `/stop`）。
-    #[cfg(test)]
     pub async fn initiate_stop(&self) -> StopInitiation {
         let mut state = self.state.write().await;
         state.cleanup_active_task();
         state.cleanup_youtube_pool();
 
         let has_active = state.has_active_task();
-        let yt_count = state.active_youtube_count();
+        let batch_running = state.youtube_enqueue_task.as_ref().is_some_and(|t| !t.handle.is_finished());
+        let yt_count = state.active_youtube_count() + batch_running as usize;
 
         if !has_active && yt_count == 0 {
             state.stop_in_progress = false;
@@ -399,7 +452,10 @@ impl TaskManager {
                     })
                 });
 
-                excl_running || yt_running
+                let batch_running = state.youtube_enqueue_task.as_ref().is_some_and(|t| {
+                    Some(t.task_id) == ticket.youtube_enqueue_target && !t.handle.is_finished()
+                });
+                excl_running || yt_running || batch_running
             };
 
             if !any_remaining || Instant::now() >= deadline {
@@ -436,6 +492,16 @@ impl TaskManager {
 
             let mut stopped_youtube = Vec::new();
             let mut timed_out_youtube = Vec::new();
+            if let Some(batch_id) = ticket.youtube_enqueue_target {
+                let running = state.youtube_enqueue_task.as_ref().is_some_and(|t| {
+                    t.task_id == batch_id && !t.handle.is_finished()
+                });
+                if running {
+                    timed_out_youtube.push("YouTube 批量入队".to_string());
+                } else {
+                    stopped_youtube.push("YouTube 批量入队".to_string());
+                }
+            }
             for (yt_id, fname) in ticket.youtube_targets {
                 let still_active = state
                     .youtube_pool
@@ -463,19 +529,50 @@ impl TaskManager {
 
     /// 供进程停机信号（`SIGINT` / `SIGTERM`）与测试调用：对全部活跃任务发出取消并在有限时间内核实真实退出状态。
     pub async fn cancel_and_wait_all(&self, timeout: Duration) -> StopCompletionReport {
-        let ticket = {
-            let mut state = self.state.write().await;
-            state.cleanup_active_task();
-            state.cleanup_youtube_pool();
-            if !state.has_active_task() && state.active_youtube_count() == 0 {
-                state.stop_in_progress = false;
-                return StopCompletionReport::default();
+        match self.initiate_stop().await {
+            StopInitiation::NoActiveTasks => StopCompletionReport::default(),
+            StopInitiation::Started(ticket) => self.wait_for_stop_ticket(ticket, timeout).await,
+            StopInitiation::AlreadyStopping { .. } => {
+                // 已有停止协调器在等待，不抢占 stop_in_progress 守卫，仅静默等待全部任务退出或超时并如实汇总残留项
+                let deadline = Instant::now() + timeout;
+                loop {
+                    let done = {
+                        let mut state = self.state.write().await;
+                        state.cleanup_active_task();
+                        state.cleanup_youtube_pool();
+                        !state.has_active_task()
+                            && state.active_youtube_count() == 0
+                            && state.youtube_enqueue_task.as_ref().is_none_or(|t| t.handle.is_finished())
+                    };
+                    if done || Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                let mut state = self.state.write().await;
+                state.cleanup_active_task();
+                state.cleanup_youtube_pool();
+                let timed_out_exclusive = state.active_task.as_ref().map(|t| {
+                    (t.name.clone(), state.current_process_pid, t.summary.clone())
+                });
+                let mut timed_out_youtube: Vec<String> = state
+                    .youtube_pool
+                    .values()
+                    .filter(|t| t.handle.as_ref().is_some_and(|h| !h.is_finished()))
+                    .map(|t| t.filename.clone())
+                    .collect();
+                if let Some(batch) = state.youtube_enqueue_task.as_ref().filter(|t| !t.handle.is_finished()) {
+                    timed_out_youtube.push(batch.name.clone());
+                }
+                StopCompletionReport {
+                    had_tasks: true,
+                    stopped_exclusive: None,
+                    stopped_youtube: Vec::new(),
+                    timed_out_exclusive,
+                    timed_out_youtube,
+                }
             }
-            state.stop_in_progress = true;
-            collect_and_signal_targets(&mut state)
-        };
-
-        self.wait_for_stop_ticket(ticket, timeout).await
+        }
     }
 
     /// 检查是否有独占任务正在运行。
@@ -523,10 +620,17 @@ fn collect_and_signal_targets(state: &mut crate::core::state::AppState) -> StopT
         }
     }
     youtube_targets.sort_by(|a, b| a.0.cmp(&b.0));
+    let youtube_enqueue_target = state.youtube_enqueue_task.as_ref()
+        .filter(|t| !t.handle.is_finished())
+        .map(|t| {
+            let _ = t.cancel_tx.send(true);
+            t.task_id
+        });
 
     StopTicket {
         exclusive_target,
         youtube_targets,
+        youtube_enqueue_target,
     }
 }
 
@@ -645,6 +749,21 @@ mod tests {
             .await
             .unwrap();
         assert!(!done_rx.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_waits_for_enqueue_and_closes_admission() {
+        let manager = make_manager();
+        manager.start_youtube_enqueue(|mut cancel_rx| async move {
+            drop(cancel_rx.wait_for(|cancelled| *cancelled).await);
+        }).await.unwrap();
+
+        manager.close_admission().await;
+        let report = manager.cancel_and_wait_all(Duration::from_secs(1)).await;
+        assert!(report.all_exited());
+        assert_eq!(report.stopped_youtube, vec!["YouTube 批量入队".to_string()]);
+        assert!(manager.start_youtube_enqueue(|_| async {}).await.is_err());
+        assert!(manager.check_youtube_batch_capacity(1).await.is_err());
     }
 
     #[tokio::test]

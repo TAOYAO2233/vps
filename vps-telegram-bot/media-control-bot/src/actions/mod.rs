@@ -9,6 +9,7 @@ pub mod convert;
 pub mod delete;
 pub mod stream;
 pub mod youtube;
+mod youtube_notify;
 
 use std::time::Duration;
 

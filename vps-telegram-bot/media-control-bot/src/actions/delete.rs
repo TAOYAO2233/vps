@@ -25,7 +25,7 @@ use crate::storage::filesystem::format_file_size_bytes;
 use crate::storage::path::PathGuard;
 use crate::storage::trash::TrashStore;
 use crate::utils::format::escape_html;
-use crate::utils::redact::redact_secrets;
+use crate::utils::redact::{redact_secrets, sanitize_user_error};
 
 /// 渲染二次删除确认界面，并将绑定令牌与文件身份快照的批次存入共享状态。
 pub async fn render_delete_confirmation(
@@ -152,7 +152,19 @@ async fn do_delete(
         let s = state.read().await;
         Arc::clone(&s.disk_monitor)
     };
-    monitor.ensure_space_available(0).await?;
+    if let Err(e) = monitor.ensure_space_available(0).await {
+        edit_html_bounded(
+            &bot,
+            msg.chat.id,
+            msg.id,
+            format!(
+                "❌ <b>无法移入回收站</b>\n{}",
+                escape_html(&sanitize_user_error(&e))
+            ),
+        )
+        .await;
+        return Err(e);
+    }
     let guard = PathGuard::new(config.base_dir.clone());
     let trash = TrashStore::new(config.base_dir.clone(), config.trash_retention_days);
     let total = batch.targets.len();
@@ -170,7 +182,26 @@ async fn do_delete(
         }
 
         match target.verify_unchanged(&guard) {
-            Ok(verified_path) => match trash.move_to_trash(&verified_path) {
+            Ok(verified_path) => {
+                if let Err(e) = crate::storage::filesystem::ensure_stable_files(
+                    std::slice::from_ref(&verified_path),
+                    config.file_stable_seconds,
+                )
+                .await
+                {
+                    skipped_or_failed += 1;
+                    warn!(
+                        filename = %target.display_name(),
+                        reason = %redact_secrets(&e.to_string()),
+                        "Refused to trash file that is still being written"
+                    );
+                    continue;
+                }
+                // 2 秒稳定性等待结束后、实际移入前再次检查取消状态并绑定原确认快照执行提交
+                if *cancel_rx.borrow() {
+                    break;
+                }
+                match trash.move_to_trash_verified(target) {
                 Ok(_) => {
                     deleted += 1;
                     state.write().await.record_exclusive_deleted_progress(
@@ -193,7 +224,8 @@ async fn do_delete(
                         "Failed to remove verified file"
                     );
                 }
-            },
+            }
+            }
             Err(e) => {
                 skipped_or_failed += 1;
                 warn!(
@@ -227,12 +259,16 @@ async fn do_delete(
         msg.chat.id,
         msg.id,
         format!(
-            "🗑️ <b>文件已移入回收站！</b>\n\
+            "🗑️ <b>文件移入回收站完成</b>\n\
              ✅ 成功移入: <code>{deleted}/{total}</code> 个（可用 /trash 恢复）\n\
              ⚠️ 跳过或失败: <code>{skipped_or_failed}</code> 个"
         ),
     )
     .await;
+
+    if deleted == 0 && total > 0 {
+        return Err(AppError::Io("批量移入回收站全部失败或被跳过".to_string()).into());
+    }
 
     Ok(())
 }

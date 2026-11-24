@@ -54,21 +54,18 @@ impl DirListing {
 
 /// 扫描目录，返回子目录和视频文件列表（含大小）。
 ///
-/// 进入子目录时的路径越界校验由 [`crate::storage::path::PathGuard`] 负责，
-/// 因此这里只枚举条目本身，避免对每个条目都做一次 `canonicalize` 系统调用。
-///
-/// # Arguments
-///
-/// * `dir` - 要扫描的目录（调用方需保证其在 BASE_DIR 之内）
-///
-/// # Errors
-///
-/// 目录不存在或无法读取时返回错误。
+/// 若提供安全根边界，请优先调用 [`scan_directory_within`] 以过滤指向边界外的符号链接。
 pub fn scan_directory(dir: &Path) -> Result<DirListing> {
+    scan_directory_within(dir, dir)
+}
+
+/// 在指定安全根目录边界内扫描目录，跳过指向边界外的符号链接以防信息泄露。
+pub fn scan_directory_within(dir: &Path, base_dir: &Path) -> Result<DirListing> {
     if !dir.is_dir() {
         return Err(AppError::directory_not_found(dir).into());
     }
 
+    let canonical_base = base_dir.canonicalize().ok();
     let mut dirs: Vec<DirItem> = Vec::new();
     let mut files: Vec<DirItem> = Vec::new();
 
@@ -102,7 +99,21 @@ pub fn scan_directory(dir: &Path) -> Result<DirListing> {
         };
 
         let (is_dir, is_file, size) = if file_type.is_symlink() {
-            match std::fs::metadata(entry.path()) {
+            let entry_path = entry.path();
+            if let Some(ref base) = canonical_base {
+                match entry_path.canonicalize() {
+                    Ok(target_canon) if target_canon.starts_with(base) => {}
+                    Ok(_) => {
+                        warn!(name = %name, "Skipping symlink pointing outside BASE_DIR");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(name = %name, error = %e, "Failed to resolve symlink");
+                        continue;
+                    }
+                }
+            }
+            match std::fs::metadata(&entry_path) {
                 Ok(meta) => (meta.is_dir(), meta.is_file(), meta.len()),
                 Err(e) => {
                     warn!(name = %name, error = %e, "Failed to follow symlink");

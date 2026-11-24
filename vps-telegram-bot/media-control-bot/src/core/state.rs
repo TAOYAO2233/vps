@@ -376,6 +376,7 @@ pub struct MenuSession {
     pub selections: HashMap<ActionType, Vec<PathBuf>>,
     pub current_snapshot: Option<MenuSnapshot>,
     pub pending_delete: Option<PendingDeleteBatch>,
+    pub last_used_at: Instant,
 }
 
 /// 全局应用状态。
@@ -419,6 +420,10 @@ pub struct AppState {
 
     /// Serializes whole-batch capacity checks and enqueueing.
     pub youtube_enqueue_lock: Arc<Mutex<()>>,
+    /// 当前批量上传入队任务，由停止协调器一起回收。
+    pub youtube_enqueue_task: Option<TaskInfo>,
+    /// 进程停机开始后永久关闭任务入口。
+    pub shutting_down: bool,
 
     /// YouTube 上传池允许的最大任务总数（运行中 + 排队中）
     pub youtube_max_total_tasks: usize,
@@ -463,6 +468,8 @@ impl AppState {
             recent_tasks: VecDeque::new(),
             youtube_semaphore: Arc::new(Semaphore::new(config.youtube_max_concurrent_uploads)),
             youtube_enqueue_lock: Arc::new(Mutex::new(())),
+            youtube_enqueue_task: None,
+            shutting_down: false,
             youtube_max_total_tasks: config.youtube_max_total_tasks(),
             youtube_queue_store: Arc::new(YoutubeQueueStore::from_config(config)),
             selections: HashMap::new(),
@@ -492,6 +499,8 @@ impl AppState {
             recent_tasks: VecDeque::new(),
             youtube_semaphore: Arc::new(Semaphore::new(youtube_max_concurrent)),
             youtube_enqueue_lock: Arc::new(Mutex::new(())),
+            youtube_enqueue_task: None,
+            shutting_down: false,
             youtube_max_total_tasks: youtube_max_concurrent.saturating_add(10),
             youtube_queue_store: Arc::new(YoutubeQueueStore::new_noop()),
             selections: HashMap::new(),
@@ -519,13 +528,19 @@ impl AppState {
     }
 
     pub fn load_menu_session(&mut self, key: (i64, i32), base_dir: &Path) {
-        let session = self.menu_sessions.get(&key).cloned().unwrap_or_else(|| MenuSession {
-            current_dir: base_dir.to_path_buf(),
-            search_query: String::new(),
-            selections: HashMap::new(),
-            current_snapshot: None,
-            pending_delete: None,
-        });
+        let session = if let Some(existing) = self.menu_sessions.get_mut(&key) {
+            existing.last_used_at = Instant::now();
+            existing.clone()
+        } else {
+            MenuSession {
+                current_dir: base_dir.to_path_buf(),
+                search_query: String::new(),
+                selections: HashMap::new(),
+                current_snapshot: None,
+                pending_delete: None,
+                last_used_at: Instant::now(),
+            }
+        };
         self.current_dir = session.current_dir;
         self.search_query = session.search_query;
         self.selections = session.selections;
@@ -535,7 +550,12 @@ impl AppState {
 
     pub fn save_menu_session(&mut self, key: (i64, i32)) {
         if self.menu_sessions.len() >= 64 && !self.menu_sessions.contains_key(&key) {
-            if let Some(old_key) = self.menu_sessions.keys().next().copied() {
+            if let Some(old_key) = self
+                .menu_sessions
+                .iter()
+                .min_by_key(|(_, s)| s.last_used_at)
+                .map(|(k, _)| *k)
+            {
                 self.menu_sessions.remove(&old_key);
             }
         }
@@ -545,7 +565,15 @@ impl AppState {
             selections: self.selections.clone(),
             current_snapshot: self.current_snapshot.clone(),
             pending_delete: self.pending_delete.clone(),
+            last_used_at: Instant::now(),
         });
+    }
+
+    /// Remove accepted uploads from the originating panel's selections.
+    pub fn remove_menu_selections(&mut self, key: (i64, i32), action: &ActionType, paths: &[PathBuf]) {
+        if let Some(selected) = self.menu_sessions.get_mut(&key).and_then(|s| s.selections.get_mut(action)) {
+            selected.retain(|path| !paths.contains(path));
+        }
     }
 
     /// 更新指定独占任务的删除不可逆进度 `(已删除数, 总数, 已释放字节)`。
@@ -773,8 +801,10 @@ impl AppState {
     }
 
     /// 取消当前所有正在运行或排队中的任务（向当前独占任务和所有 YouTube 上传任务发送各自作用域的取消信号）。
-    #[cfg(test)]
     pub fn cancel_all(&mut self) {
+        if let Some(batch) = &self.youtube_enqueue_task {
+            let _ = batch.cancel_tx.send(true);
+        }
         if let Some(active) = &self.active_task {
             if !active.handle.is_finished() {
                 self.cancel_flag = true;

@@ -83,18 +83,32 @@ async fn main() -> anyhow::Result<()> {
     );
     if disk_monitor.ensure_space_available(0).await.is_ok() {
         let trash = TrashStore::new(config.base_dir.clone(), config.trash_retention_days);
-        match tokio::task::spawn_blocking(move || trash.cleanup_expired()).await {
-            Ok(Ok(count)) if count > 0 => info!(count, "Expired trash files removed"),
-            Ok(Ok(_)) => {}
+        match tokio::task::spawn_blocking(move || {
+            let reconciled = trash.reconcile()?;
+            let expired = trash.cleanup_expired()?;
+            Ok::<(usize, usize), anyhow::Error>((reconciled, expired))
+        })
+        .await
+        {
+            Ok(Ok((reconciled, count))) => {
+                if reconciled > 0 {
+                    info!(reconciled, "Reconciled incomplete trash records at startup");
+                }
+                if count > 0 {
+                    info!(count, "Expired trash files removed");
+                }
+            }
             Ok(Err(e)) => warn!(error = %redact_secrets(&e.to_string()), "Trash cleanup failed"),
             Err(e) => warn!(error = %e, "Trash cleanup worker failed"),
         }
     }
 
-    // 5. 启动后台周期性磁盘监测任务（默认每 300 秒检查一次）
+    // 5. 启动后台周期性磁盘监测任务（默认每 300 秒检查一次；挂载恢复或池腾出容量时自动重试搁置的 YouTube 恢复队列）
     let (bg_stop_tx, mut bg_stop_rx) = tokio::sync::watch::channel(false);
     let bg_monitor = Arc::clone(&disk_monitor);
     let bg_bot = tg_bot.clone();
+    let bg_state = Arc::clone(&app_state);
+    let bg_config = Arc::clone(&config);
     let bg_base_dir = config.base_dir.clone();
     let bg_trash_days = config.trash_retention_days;
     let check_interval = Duration::from_secs(config.disk_check_interval_secs.max(10));
@@ -107,17 +121,41 @@ async fn main() -> anyhow::Result<()> {
             tokio::select! {
                 _ = ticker.tick() => {
                     let _ = bg_monitor.check_and_notify(&bg_bot).await;
-                    if last_trash_cleanup.elapsed() >= Duration::from_secs(86_400)
-                        && bg_monitor.ensure_space_available(0).await.is_ok()
-                    {
-                        let trash = TrashStore::new(bg_base_dir.clone(), bg_trash_days);
-                        match tokio::task::spawn_blocking(move || trash.cleanup_expired()).await {
-                            Ok(Ok(count)) if count > 0 => info!(count, "Expired trash files removed"),
-                            Ok(Ok(_)) => {}
-                            Ok(Err(e)) => warn!(error = %redact_secrets(&e.to_string()), "Trash cleanup failed"),
-                            Err(e) => warn!(error = %e, "Trash cleanup worker failed"),
+                    if bg_monitor.ensure_space_available(0).await.is_ok() {
+                        // 若此前因挂载未就绪、池满或网络异常有搁置恢复项，定期尝试补调度
+                        match actions::youtube::recover_pending_uploads(
+                            &bg_bot,
+                            Arc::clone(&bg_state),
+                            Arc::clone(&bg_config),
+                        )
+                        .await
+                        {
+                            Ok(count) if count > 0 => {
+                                info!(recovered_tasks = count, "Recovered deferred YouTube upload tasks");
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!(
+                                    error = %redact_secrets(&e.to_string()),
+                                    "Periodic YouTube queue recovery attempt failed (non-fatal)"
+                                );
+                            }
                         }
-                        last_trash_cleanup = tokio::time::Instant::now();
+                        if last_trash_cleanup.elapsed() >= Duration::from_secs(86_400) {
+                            let trash = TrashStore::new(bg_base_dir.clone(), bg_trash_days);
+                            match tokio::task::spawn_blocking(move || {
+                                let _ = trash.reconcile();
+                                trash.cleanup_expired()
+                            })
+                            .await
+                            {
+                                Ok(Ok(count)) if count > 0 => info!(count, "Expired trash files removed"),
+                                Ok(Ok(_)) => {}
+                                Ok(Err(e)) => warn!(error = %redact_secrets(&e.to_string()), "Trash cleanup failed"),
+                                Err(e) => warn!(error = %e, "Trash cleanup worker failed"),
+                            }
+                            last_trash_cleanup = tokio::time::Instant::now();
+                        }
                     }
                 }
                 _ = bg_stop_rx.changed() => {
@@ -127,24 +165,28 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 6. 可选恢复未完成 YouTube 上传任务（保守默认 YOUTUBE_RECOVERY_MODE=none 时为空操作）
-    match actions::youtube::recover_pending_uploads(
-        &tg_bot,
-        Arc::clone(&app_state),
-        Arc::clone(&config),
-    )
-    .await
-    {
-        Ok(count) if count > 0 => {
-            info!(recovered_tasks = count, "Recovered pending YouTube upload tasks");
+    // 6. 可选恢复未完成 YouTube 上传任务（仅在目标媒体盘挂载健康时执行，挂载异常时保留队列不误删）
+    if disk_monitor.ensure_space_available(0).await.is_ok() {
+        match actions::youtube::recover_pending_uploads(
+            &tg_bot,
+            Arc::clone(&app_state),
+            Arc::clone(&config),
+        )
+        .await
+        {
+            Ok(count) if count > 0 => {
+                info!(recovered_tasks = count, "Recovered pending YouTube upload tasks");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    error = %redact_secrets(&e.to_string()),
+                    "Failed to recover pending YouTube uploads (non-fatal)"
+                );
+            }
         }
-        Ok(_) => {}
-        Err(e) => {
-            warn!(
-                error = %redact_secrets(&e.to_string()),
-                "Failed to recover pending YouTube uploads (non-fatal)"
-            );
-        }
+    } else {
+        warn!("Storage mount unavailable at startup; deferring YouTube queue recovery without removing persisted entries");
     }
 
     // 7. 构建 Dispatcher 并监听 SIGINT / SIGTERM 优雅停机
@@ -160,15 +202,30 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let _ = bg_stop_tx.send(true);
-    let _ = disk_bg_handle.await;
-
+    // Close admission before collecting the stop targets. Do not wait for the
+    // disk worker before broadcasting cancellation to the registered tasks.
     let task_manager = TaskManager::new(Arc::clone(&app_state));
-    task_manager
+    task_manager.close_admission().await;
+    let _ = bg_stop_tx.send(true);
+    let shutdown_report = task_manager
         .cancel_and_wait_all(Duration::from_secs(5))
         .await;
 
-    info!("Graceful shutdown complete.");
+    let disk_worker_stopped = matches!(
+        tokio::time::timeout(Duration::from_secs(3), disk_bg_handle).await,
+        Ok(Ok(()))
+    );
+
+    if shutdown_report.all_exited() && disk_worker_stopped {
+        info!("Graceful shutdown complete.");
+    } else {
+        warn!(
+            timed_out_exclusive = ?shutdown_report.timed_out_exclusive.as_ref().map(|(n, pid, _)| (n, pid)),
+            timed_out_youtube_count = shutdown_report.timed_out_youtube.len(),
+            disk_worker_stopped,
+            "Shutdown could not confirm that all tasks exited cleanly"
+        );
+    }
     flush_global_stdout();
     Ok(())
 }

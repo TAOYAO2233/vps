@@ -44,6 +44,9 @@ const MAX_STDERR_SUMMARY_LINES: usize = 14;
 /// 单条错误摘要行的最大字符长度。
 const MAX_STDERR_LINE_CHARS: usize = 240;
 
+/// 合并/重封装单步 FFmpeg 无活动停滞超时上限（5 分钟无任何 stderr/进度输出即判定卡死回收）。
+const FFMPEG_STEP_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// 发送 FFmpeg `q` 退出指令后的优雅停止等待时限。
 const GRACEFUL_QUIT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -80,7 +83,7 @@ async fn terminate_ffmpeg_gracefully(
         graceful_timeout_secs = GRACEFUL_QUIT_TIMEOUT.as_secs(),
         "FFmpeg did not exit within graceful timeout; escalating to SIGKILL fallback"
     );
-    let _ = child.kill().await;
+    let _ = child.start_kill();
     match tokio::time::timeout(FORCE_KILL_WAIT_TIMEOUT, child.wait()).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
@@ -131,9 +134,10 @@ impl<R: AsyncRead + Unpin> FfmpegLines<R> {
     pub async fn next_line(&mut self) -> std::io::Result<Option<String>> {
         loop {
             if let Some(pos) = self.pending.iter().position(|b| *b == b'\r' || *b == b'\n') {
+                let sep = self.pending[pos];
                 let buffer: Vec<u8> = self.pending.drain(..=pos).collect();
                 let line = &buffer[..buffer.len() - 1];
-                if self.pending.first() == Some(&b'\n') {
+                if sep == b'\r' && self.pending.first() == Some(&b'\n') {
                     self.pending.drain(..1);
                 }
                 return Ok(Some(String::from_utf8_lossy(line).into_owned()));
@@ -235,6 +239,30 @@ pub struct FfmpegProgressTick {
     pub percent: Option<f64>,
 }
 
+/// 等待取消通道真正变为 `true`；若发送端被释放则永不误触发取消。
+async fn wait_for_cancel(cancel_watch: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *cancel_watch.borrow_and_update() {
+            return;
+        }
+        if cancel_watch.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// 防止以 `-` 开头的相对路径被 FFmpeg 解析为命令行选项。
+fn safe_ffmpeg_output_path(path: &Path) -> OsString {
+    if !path.is_absolute() && path.to_string_lossy().starts_with('-') {
+        Path::new(".").join(path).into_os_string()
+    } else {
+        path.as_os_str().to_os_string()
+    }
+}
+
+/// 长视频低进度变化时的最大心跳上报间隔，避免超长推流期间 UI 长期无刷新。
+const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
 /// 已启动的结构化进度 FFmpeg 子进程（并发排空 `stderr` + 读取 `stdout` `-progress pipe:1`）。
 pub struct FfmpegProcess {
     child: Child,
@@ -245,11 +273,31 @@ pub struct FfmpegProcess {
     duration: f64,
     state: SharedState,
     last_emit: Option<Instant>,
+    last_activity_at: Instant,
     last_percent: f64,
     cur_out_time_secs: f64,
     cur_total_size: u64,
     stopped: bool,
     forced_kill_used: bool,
+}
+
+impl Drop for FfmpegProcess {
+    fn drop(&mut self) {
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+        }
+        if !self.stopped {
+            if let Ok(mut guard) = self.state.try_write() {
+                guard.current_process_pid = None;
+            } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let state = Arc::clone(&self.state);
+                handle.spawn(async move {
+                    state.write().await.current_process_pid = None;
+                });
+            }
+            self.stopped = true;
+        }
+    }
 }
 
 impl FfmpegProcess {
@@ -311,6 +359,7 @@ impl FfmpegProcess {
             duration,
             state: Arc::clone(state),
             last_emit: None,
+            last_activity_at: Instant::now(),
             last_percent: -1.0,
             cur_out_time_secs: 0.0,
             cur_total_size: 0,
@@ -323,6 +372,12 @@ impl FfmpegProcess {
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    /// 返回最近一次收到 FFmpeg 结构化进度心跳的时间戳（不受 UI 节流阈值影响）。
+    #[must_use]
+    pub fn last_activity_at(&self) -> Instant {
+        self.last_activity_at
     }
 
     /// 读取下一个经节流的结构化进度事件；返回 `None` 表示进度流已结束。
@@ -352,16 +407,22 @@ impl FfmpegProcess {
                     self.cur_total_size = sz;
                 }
             } else if let Some(state_val) = trimmed.strip_prefix("progress=") {
+                self.last_activity_at = Instant::now();
                 let is_end = state_val.trim() == "end";
                 let interval_ok = match self.last_emit {
                     Some(at) => at.elapsed() >= PROGRESS_MIN_INTERVAL,
+                    None => true,
+                };
+                let heartbeat_due = match self.last_emit {
+                    Some(at) => at.elapsed() >= PROGRESS_HEARTBEAT_INTERVAL,
                     None => true,
                 };
 
                 if self.duration > 0.0 {
                     let pct = ((self.cur_out_time_secs / self.duration) * 100.0).clamp(0.0, 100.0);
                     let delta_ok = pct - self.last_percent >= PROGRESS_MIN_DELTA;
-                    if !((delta_ok && interval_ok) || pct >= 100.0 || is_end) {
+                    let first_100 = pct >= 100.0 && self.last_percent < 100.0;
+                    if !((delta_ok && interval_ok) || heartbeat_due || first_100 || is_end) {
                         continue;
                     }
                     self.last_emit = Some(Instant::now());
@@ -427,11 +488,12 @@ impl FfmpegProcess {
             return Ok((None, summary, self.forced_kill_used));
         }
 
-        let _ = self.stdin.take();
         let mut cancel_watch = cancel_rx.clone();
+        // 进度管道结束后仍设置 30 秒收尾上限，防止 FFmpeg 关闭进度管道后卡死永久占槽
+        let exit_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
         loop {
-            if *cancel_watch.borrow() {
+            if *cancel_watch.borrow_and_update() {
                 let forced = self.stop_and_wait().await;
                 let summary = self.stderr_collector.lock().await.summary();
                 return Ok((None, summary, forced));
@@ -443,7 +505,13 @@ impl FfmpegProcess {
                         break;
                     }
                 }
-                _ = cancel_watch.changed() => {
+                () = wait_for_cancel(&mut cancel_watch) => {
+                    let forced = self.stop_and_wait().await;
+                    let summary = self.stderr_collector.lock().await.summary();
+                    return Ok((None, summary, forced));
+                }
+                _ = tokio::time::sleep_until(exit_deadline) => {
+                    warn!("FFmpeg timed out while draining stdout; terminating process");
                     let forced = self.stop_and_wait().await;
                     let summary = self.stderr_collector.lock().await.summary();
                     return Ok((None, summary, forced));
@@ -452,8 +520,17 @@ impl FfmpegProcess {
         }
 
         let exit_code = tokio::select! {
-            status_res = self.child.wait() => status_res?.code(),
-            _ = cancel_watch.changed() => {
+            status_res = self.child.wait() => {
+                let _ = self.stdin.take();
+                status_res?.code()
+            }
+            () = wait_for_cancel(&mut cancel_watch) => {
+                let forced = self.stop_and_wait().await;
+                let summary = self.stderr_collector.lock().await.summary();
+                return Ok((None, summary, forced));
+            }
+            _ = tokio::time::sleep_until(exit_deadline) => {
+                warn!("FFmpeg timed out waiting for process exit after progress EOF; terminating process");
                 let forced = self.stop_and_wait().await;
                 let summary = self.stderr_collector.lock().await.summary();
                 return Ok((None, summary, forced));
@@ -509,6 +586,9 @@ pub struct TsRemuxOptions {
 }
 
 /// 构造 concat 无损合并参数（严禁 `-y` 覆盖，统一使用 `-n` 与 `-c copy`）。
+///
+/// 显式映射全部非封面视频轨（`-map 0:V`）与全部音频轨（`-map 0:a?`），并排除字幕/数据流（`-sn -dn`），
+/// 防止含字幕或多音轨源文件导致无损封装失败或丢轨。
 #[must_use]
 pub fn build_concat_args(list_file: &Path, temp_output: &Path) -> Vec<OsString> {
     vec![
@@ -521,11 +601,17 @@ pub fn build_concat_args(list_file: &Path, temp_output: &Path) -> Vec<OsString> 
         OsString::from("0"),
         OsString::from("-i"),
         list_file.as_os_str().to_os_string(),
+        OsString::from("-map"),
+        OsString::from("0:V"),
+        OsString::from("-map"),
+        OsString::from("0:a?"),
+        OsString::from("-sn"),
+        OsString::from("-dn"),
         OsString::from("-c"),
         OsString::from("copy"),
         OsString::from("-movflags"),
         OsString::from("+faststart"),
-        temp_output.as_os_str().to_os_string(),
+        safe_ffmpeg_output_path(temp_output),
     ]
 }
 
@@ -534,6 +620,7 @@ pub fn build_concat_args(list_file: &Path, temp_output: &Path) -> Vec<OsString> 
 /// 关键约束：
 /// - 绝不传入编码器参数，强制 `-c copy -f mpegts`；
 /// - 若指定 `keep_duration_secs`，`-t <keep>` 严格置于 `-i <input>` **之前**；
+/// - 显式映射非封面视频轨与全部音频轨并排除字幕/数据流；
 /// - 统一使用 `-n` 禁止覆盖。
 #[must_use]
 pub fn build_remux_to_ts_args(
@@ -553,17 +640,25 @@ pub fn build_remux_to_ts_args(
     }
 
     if let Some(keep) = opts.keep_duration_secs {
-        args.push(OsString::from("-t"));
-        args.push(OsString::from(format!("{keep:.3}")));
+        if keep.is_finite() && keep > 0.0 {
+            args.push(OsString::from("-t"));
+            args.push(OsString::from(format!("{keep:.3}")));
+        }
     }
 
     args.push(OsString::from("-i"));
     args.push(input.as_os_str().to_os_string());
+    args.push(OsString::from("-map"));
+    args.push(OsString::from("0:V"));
+    args.push(OsString::from("-map"));
+    args.push(OsString::from("0:a?"));
+    args.push(OsString::from("-sn"));
+    args.push(OsString::from("-dn"));
     args.push(OsString::from("-c"));
     args.push(OsString::from("copy"));
     args.push(OsString::from("-f"));
     args.push(OsString::from("mpegts"));
-    args.push(ts_output.as_os_str().to_os_string());
+    args.push(safe_ffmpeg_output_path(ts_output));
     args
 }
 
@@ -574,11 +669,17 @@ pub fn build_remux_to_mp4_args(input: &Path, temp_output: &Path) -> Vec<OsString
         OsString::from("-n"),
         OsString::from("-i"),
         input.as_os_str().to_os_string(),
+        OsString::from("-map"),
+        OsString::from("0:V"),
+        OsString::from("-map"),
+        OsString::from("0:a?"),
+        OsString::from("-sn"),
+        OsString::from("-dn"),
         OsString::from("-c"),
         OsString::from("copy"),
         OsString::from("-movflags"),
         OsString::from("+faststart"),
-        temp_output.as_os_str().to_os_string(),
+        safe_ffmpeg_output_path(temp_output),
     ]
 }
 
@@ -640,42 +741,72 @@ impl FfmpegRunner {
 
         let collector = Arc::new(Mutex::new(BoundedStderrCollector::new()));
         let collector_bg = Arc::clone(&collector);
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let last_activity_bg = Arc::clone(&last_activity);
         let mut stderr_task = tokio::spawn(async move {
             let mut reader = FfmpegLines::new(stderr);
             while let Ok(Some(line)) = reader.next_line().await {
+                *last_activity_bg.lock().await = Instant::now();
                 collector_bg.lock().await.push_line(&line);
             }
         });
 
         let mut cancel_watch = cancel_rx.clone();
-        let status = tokio::select! {
-            wait_res = child.wait() => {
-                let _ = stdin.take();
-                match wait_res {
-                    Ok(st) => st,
-                    Err(e) => {
+        let mut stall_ticker = tokio::time::interval(Duration::from_secs(5));
+        stall_ticker.tick().await;
+        let status = loop {
+            tokio::select! {
+                wait_res = child.wait() => {
+                    let _ = stdin.take();
+                    match wait_res {
+                        Ok(st) => break st,
+                        Err(e) => {
+                            if tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await.is_err() {
+                                stderr_task.abort();
+                            }
+                            state.write().await.current_process_pid = None;
+                            return Err(e.into());
+                        }
+                    }
+                }
+                () = wait_for_cancel(&mut cancel_watch) => {
+                    let forced = terminate_ffmpeg_gracefully(&mut child, &mut stdin, pid).await;
+                    if tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await.is_err() {
+                        stderr_task.abort();
+                    }
+                    state.write().await.current_process_pid = None;
+                    let guard = collector.lock().await;
+                    return Ok(FfmpegStepOutcome {
+                        exit_code: None,
+                        cancelled: true,
+                        forced_kill_used: forced,
+                        last_progress_secs: guard.last_progress_secs(),
+                        stderr_summary: guard.summary(),
+                    });
+                }
+                _ = stall_ticker.tick() => {
+                    if last_activity.lock().await.elapsed() >= FFMPEG_STEP_STALL_TIMEOUT {
+                        warn!(
+                            pid = ?pid,
+                            stall_secs = FFMPEG_STEP_STALL_TIMEOUT.as_secs(),
+                            "FFmpeg batch step stalled without output; terminating process"
+                        );
+                        let forced = terminate_ffmpeg_gracefully(&mut child, &mut stdin, pid).await;
                         if tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await.is_err() {
                             stderr_task.abort();
                         }
                         state.write().await.current_process_pid = None;
-                        return Err(e.into());
+                        let mut guard = collector.lock().await;
+                        guard.push_line("FFmpeg process stalled without progress and was terminated by watchdog");
+                        return Ok(FfmpegStepOutcome {
+                            exit_code: Some(-1),
+                            cancelled: false,
+                            forced_kill_used: forced,
+                            last_progress_secs: guard.last_progress_secs(),
+                            stderr_summary: guard.summary(),
+                        });
                     }
                 }
-            }
-            _ = cancel_watch.changed() => {
-                let forced = terminate_ffmpeg_gracefully(&mut child, &mut stdin, pid).await;
-                if tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await.is_err() {
-                    stderr_task.abort();
-                }
-                state.write().await.current_process_pid = None;
-                let guard = collector.lock().await;
-                return Ok(FfmpegStepOutcome {
-                    exit_code: None,
-                    cancelled: true,
-                    forced_kill_used: forced,
-                    last_progress_secs: guard.last_progress_secs(),
-                    stderr_summary: guard.summary(),
-                });
             }
         };
 

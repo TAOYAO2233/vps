@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::core::state::{ActionType, SharedState, SnapshotEntry};
 use crate::storage::filesystem::format_file_size_bytes;
 use crate::storage::path::PathGuard;
-use crate::storage::scanner::scan_directory;
+use crate::storage::scanner::scan_directory_within;
 use crate::ui::pagination::Paginator;
 use crate::utils::format::escape_html;
 use crate::utils::redact::sanitize_user_error;
@@ -67,7 +67,12 @@ pub async fn render_file_selector(
     };
 
     let scan_dir = current_dir.clone();
-    let mut listing = match tokio::task::spawn_blocking(move || scan_directory(&scan_dir)).await {
+    let scan_base = canonical_base.clone();
+    let mut listing = match tokio::task::spawn_blocking(move || {
+        scan_directory_within(&scan_dir, &scan_base)
+    })
+    .await
+    {
         Ok(Ok(listing)) => listing,
         Ok(Err(e)) => {
             bot.edit_message_text(
@@ -117,13 +122,26 @@ pub async fn render_file_selector(
     let page_items = &listing.items[paginator.range()];
     let is_multi_select = action.is_multi_select();
 
+    let lookup_paths: Vec<PathBuf> = {
+        let dir = current_dir.clone();
+        let names: Vec<String> = page_items.iter().map(|it| it.name.clone()).collect();
+        tokio::task::spawn_blocking(move || {
+            names
+                .into_iter()
+                .map(|name| {
+                    let joined = dir.join(&name);
+                    joined.canonicalize().unwrap_or(joined)
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_else(|_| page_items.iter().map(|it| current_dir.join(&it.name)).collect())
+    };
+
     let mut button_items: Vec<(String, String)> = Vec::with_capacity(page_items.len());
     for (i, item) in page_items.iter().enumerate() {
         let real_idx = paginator.start_index() + i;
-        let joined_path = current_dir.join(&item.name);
-        let lookup_path = joined_path
-            .canonicalize()
-            .unwrap_or_else(|_| joined_path.clone());
+        let lookup_path = &lookup_paths[i];
 
         if item.is_dir {
             button_items.push((
@@ -135,7 +153,7 @@ pub async fn render_file_selector(
             if is_multi_select {
                 let order_opt = ordered_selections
                     .iter()
-                    .position(|p| p == &lookup_path)
+                    .position(|p| p == lookup_path)
                     .map(|pos| pos + 1);
                 let checkbox = match (action, order_opt) {
                     (ActionType::Concat, Some(ord)) => format!("✅#{ord} "),
@@ -225,10 +243,23 @@ pub async fn render_file_selector(
         header.push_str("\n\n⚠️ 当前目录下既无子文件夹也无支持的视频文件。");
     }
 
-    bot.edit_message_text(msg.chat.id, msg.id, header)
+    if header.chars().count() > 3900 {
+        header = header.chars().take(3880).collect::<String>() + "\n…";
+    }
+
+    if let Err(err) = bot
+        .edit_message_text(msg.chat.id, msg.id, header)
         .parse_mode(ParseMode::Html)
         .reply_markup(keyboard)
-        .await?;
+        .await
+    {
+        if !matches!(
+            err,
+            teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified)
+        ) {
+            return Err(err.into());
+        }
+    }
 
     Ok(())
 }

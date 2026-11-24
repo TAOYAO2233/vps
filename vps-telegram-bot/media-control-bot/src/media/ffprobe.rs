@@ -91,6 +91,12 @@ struct RawFfprobeOutput {
     format: Option<RawFormat>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct RawDisposition {
+    #[serde(default)]
+    attached_pic: u8,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawStream {
     codec_type: Option<String>,
@@ -104,6 +110,8 @@ struct RawStream {
     channels: Option<u32>,
     channel_layout: Option<String>,
     duration: Option<String>,
+    #[serde(default)]
+    disposition: RawDisposition,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +131,11 @@ pub fn parse_ffprobe_json(json_text: &str) -> Result<MediaProbeInfo> {
     let mut max_stream_duration: f64 = 0.0;
 
     for stream in raw.streams {
+        // 忽略内嵌静态封面图（attached_pic），避免干扰视频流数量、编码与时长判断
+        if stream.codec_type.as_deref() == Some("video") && stream.disposition.attached_pic != 0 {
+            continue;
+        }
+
         if let Some(dur_str) = &stream.duration {
             if let Ok(d) = dur_str.trim().parse::<f64>() {
                 if d.is_finite() && d > max_stream_duration {
@@ -225,6 +238,7 @@ pub async fn probe_media_cancellable(
         "json",
         "-show_format",
         "-show_streams",
+        "-i",
     ])
     .arg(path)
     .stdin(Stdio::null())
@@ -253,10 +267,9 @@ pub async fn probe_media_cancellable(
                 break;
             }
             let remain = (2 * 1024 * 1024usize).saturating_sub(buf.len());
-            if remain == 0 {
-                break;
+            if remain > 0 {
+                buf.extend_from_slice(&chunk[..n.min(remain)]);
             }
-            buf.extend_from_slice(&chunk[..n.min(remain)]);
         }
         buf
     });
@@ -269,10 +282,9 @@ pub async fn probe_media_cancellable(
                 break;
             }
             let remain = (64 * 1024usize).saturating_sub(buf.len());
-            if remain == 0 {
-                break;
+            if remain > 0 {
+                buf.extend_from_slice(&chunk[..n.min(remain)]);
             }
-            buf.extend_from_slice(&chunk[..n.min(remain)]);
         }
         buf
     });
@@ -295,15 +307,24 @@ pub async fn probe_media_cancellable(
                 }
             }
         }
-        _ = cancel_watch.changed() => {
-            let _ = child.kill().await;
+        () = async {
+            loop {
+                if *cancel_watch.borrow_and_update() {
+                    return;
+                }
+                if cancel_watch.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        } => {
+            let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             stdout_task.abort();
             stderr_task.abort();
             return Err(AppError::Cancelled.into());
         }
         _ = tokio::time::sleep(timeout_dur) => {
-            let _ = child.kill().await;
+            let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             stdout_task.abort();
             stderr_task.abort();
@@ -389,6 +410,20 @@ pub fn check_concat_stream_compatibility(
                 reason: format!("分段 #{seg_no} ({seg_name}) 不包含有效视频流"),
             });
         };
+
+        if probe.video_streams.len() != first_probe.video_streams.len()
+            || probe.audio_streams.len() != first_probe.audio_streams.len()
+        {
+            return Err(AppError::StreamIncompatible {
+                reason: format!(
+                    "分段 #{seg_no} ({seg_name}) 音视频轨数量（{}V/{}A）与分段 #1 ({first_name})（{}V/{}A）不一致",
+                    probe.video_streams.len(),
+                    probe.audio_streams.len(),
+                    first_probe.video_streams.len(),
+                    first_probe.audio_streams.len()
+                ),
+            });
+        }
 
         if cur_v.codec_name != ref_v.codec_name {
             return Err(AppError::StreamIncompatible {
@@ -487,6 +522,17 @@ pub fn check_rtmp_flv_compatibility(probe: &MediaProbeInfo) -> std::result::Resu
                     audio.codec_name
                 ),
             });
+        }
+        if audio.codec_name == "mp3" {
+            if let Some(sr) = audio.sample_rate {
+                if !matches!(sr, 44100 | 22050 | 11025) {
+                    return Err(AppError::StreamIncompatible {
+                        reason: format!(
+                            "源 MP3 音频采样率 {sr}Hz 不符合 FLV 容器规范（仅支持 44100/22050/11025Hz，本系统禁止重编码）"
+                        ),
+                    });
+                }
+            }
         }
     }
 

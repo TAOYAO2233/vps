@@ -1,7 +1,7 @@
 //! YouTube 上传队列可选持久化存储（默认 `YOUTUBE_RECOVERY_MODE=none` 不启用）。
 //!
 //! 安全与并发一致性保证（v1.1 修正）：
-//! - 保守默认模式下（`YoutubeRecoveryMode::None`），所有持久化操作均为空操作（no-op），绝不擅自在重启后自动上传；
+//! - 保守默认模式下（`YoutubeRecoveryMode::None`），所有队列持久化操作均为空操作（no-op），绝不擅自在重启后自动上传；成功结果由独立的 results 存储保存；
 //! - **跨批次全局串行互斥**：除由 [`crate::core::state::AppState`] 持有全进程共享实例外，底层按规范化队列路径通过
 //!   全局锁表 `QUEUE_FILE_LOCKS` 共享同一把异步互斥锁，彻底杜绝多批次并发 `upsert` / `update_session_uri` / `remove` 后写覆盖先写；
 //! - **显式错误传播**：所有落盘操作均返回 `Result<()>`（不静默吞掉写盘错误），确保 `requeue` / `resume` 模式可在发送首个视频分块前严格确认会话 URI 已安全落盘；
@@ -24,7 +24,7 @@ use crate::utils::redact::{redact_secrets, register_youtube_session_uri};
 static QUEUE_FILE_LOCKS: Lazy<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     Lazy::new(|| StdMutex::new(HashMap::new()));
 
-fn lock_for_queue_file(path: &Path) -> Arc<Mutex<()>> {
+pub(super) fn lock_for_queue_file(path: &Path) -> Arc<Mutex<()>> {
     let key = normalize_queue_key(path);
     let mut map = QUEUE_FILE_LOCKS
         .lock()
@@ -36,28 +36,49 @@ fn lock_for_queue_file(path: &Path) -> Arc<Mutex<()>> {
 }
 
 fn normalize_queue_key(path: &Path) -> PathBuf {
-    if let Ok(canon) = path.canonicalize() {
-        return canon;
-    }
-    if let Some(parent) = path.parent() {
-        let base_parent = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
-        if let Ok(canon_parent) = base_parent.canonicalize() {
-            if let Some(name) = path.file_name() {
-                return canon_parent.join(name);
-            }
-        }
-    }
-    if path.is_absolute() {
+    use std::path::Component;
+
+    // 先构造词法规范化的绝对路径（消除 `.` 与 `..`），确保目录创建前后锁键始终一致
+    let abs = if path.is_absolute() {
         path.to_path_buf()
     } else if let Ok(cwd) = std::env::current_dir() {
         cwd.join(path)
     } else {
         path.to_path_buf()
+    };
+
+    let mut clean = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                clean.pop();
+            }
+            other => clean.push(other.as_os_str()),
+        }
     }
+
+    // 沿祖先链找到最深的已存在目录并做 canonicalize，再拼回剩余相对路径
+    let mut existing = clean.as_path();
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        if let Some(name) = existing.file_name() {
+            tail.push(name.to_os_string());
+        }
+        match existing.parent() {
+            Some(p) if !p.as_os_str().is_empty() && p != existing => existing = p,
+            _ => break,
+        }
+    }
+
+    if let Ok(mut canon) = existing.canonicalize() {
+        for part in tail.into_iter().rev() {
+            canon.push(part);
+        }
+        return canon;
+    }
+
+    clean
 }
 
 /// 持久化的单个待完成 YouTube 上传任务条目。
@@ -77,7 +98,7 @@ pub struct PersistedUploadEntry {
     pub chat_id: i64,
     /// 可恢复上传会话 URI（仅在 `requeue` / `resume` 防重核查与续传时记录，文件权限强制 `0600`）
     pub session_uri: Option<String>,
-    /// 是否处于“全部字节已发送但服务端持续返回 308 未确认最终 video_id”的待核实状态
+    /// 是否需要人工核实原会话（沿用旧 JSON 字段名，不保证全部字节均已发送）
     #[serde(default)]
     pub unconfirmed_full_upload: bool,
 }
@@ -96,6 +117,11 @@ pub struct YoutubeQueueStore {
 }
 
 impl YoutubeQueueStore {
+    /// Independent, always-enabled result history beside the recovery queue.
+    pub fn results(&self) -> super::results::YoutubeResultStore {
+        super::results::YoutubeResultStore::beside_queue(&self.queue_file)
+    }
+
     /// 根据全局配置创建队列持久化管理器（同一文件路径共享全局串行锁）。
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
@@ -141,7 +167,10 @@ impl YoutubeQueueStore {
             return Ok(Vec::new());
         }
         let _guard = self.file_lock.lock().await;
-        let data = read_queue_file_strict(&self.queue_file)?;
+        let path = self.queue_file.clone();
+        let data = tokio::task::spawn_blocking(move || read_queue_file_strict(&path))
+            .await
+            .context("YouTube queue load worker panicked")??;
         for entry in &data.entries {
             if let Some(uri) = &entry.session_uri {
                 register_youtube_session_uri(uri);
@@ -160,13 +189,18 @@ impl YoutubeQueueStore {
         }
 
         let _guard = self.file_lock.lock().await;
-        let mut data = read_queue_file_strict(&self.queue_file)?;
-        if let Some(existing) = data.entries.iter_mut().find(|e| e.task_id == entry.task_id) {
-            *existing = entry;
-        } else {
-            data.entries.push(entry);
-        }
-        save_queue_file_strict(&self.queue_file, &data)
+        let path = self.queue_file.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut data = read_queue_file_strict(&path)?;
+            if let Some(existing) = data.entries.iter_mut().find(|e| e.task_id == entry.task_id) {
+                *existing = entry;
+            } else {
+                data.entries.push(entry);
+            }
+            save_queue_file_strict(&path, &data)
+        })
+        .await
+        .context("YouTube queue upsert worker panicked")?
     }
 
     /// 为指定任务安全持久化已分配的 Resumable Session URI。
@@ -179,20 +213,27 @@ impl YoutubeQueueStore {
             return Ok(());
         }
         let _guard = self.file_lock.lock().await;
-        let mut data = read_queue_file_strict(&self.queue_file)?;
-        let existing = data
-            .entries
-            .iter_mut()
-            .find(|e| e.task_id == task_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Persisted upload task entry missing for task_id={task_id}")
-            })?;
-        existing.session_uri = Some(session_uri.to_string());
-        existing.unconfirmed_full_upload = false;
-        save_queue_file_strict(&self.queue_file, &data)
+        let path = self.queue_file.clone();
+        let task_id = task_id.to_string();
+        let session_uri = session_uri.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut data = read_queue_file_strict(&path)?;
+            let existing = data
+                .entries
+                .iter_mut()
+                .find(|e| e.task_id == task_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Persisted upload task entry missing for task_id={task_id}")
+                })?;
+            existing.session_uri = Some(session_uri);
+            existing.unconfirmed_full_upload = false;
+            save_queue_file_strict(&path, &data)
+        })
+        .await
+        .context("YouTube queue update_session_uri worker panicked")?
     }
 
-    /// 标记任务处于“全部字节已发送但服务端持续返回 308 未确认 video_id”状态，保留会话信息供后续核实。
+    /// 标记最终状态待核实，保留原会话；启用持久化但条目缺失时明确报错。
     pub async fn mark_state_unconfirmed(
         &self,
         task_id: &str,
@@ -205,15 +246,24 @@ impl YoutubeQueueStore {
             return Ok(());
         }
         let _guard = self.file_lock.lock().await;
-        let mut data = read_queue_file_strict(&self.queue_file)?;
-        if let Some(existing) = data.entries.iter_mut().find(|e| e.task_id == task_id) {
+        let path = self.queue_file.clone();
+        let task_id = task_id.to_string();
+        let session_uri = session_uri.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            let mut data = read_queue_file_strict(&path)?;
+            let existing = data
+                .entries
+                .iter_mut()
+                .find(|e| e.task_id == task_id)
+                .ok_or_else(|| anyhow::anyhow!("Cannot retain missing upload task: {task_id}"))?;
             if let Some(uri) = session_uri {
-                existing.session_uri = Some(uri.to_string());
+                existing.session_uri = Some(uri);
             }
             existing.unconfirmed_full_upload = true;
-            save_queue_file_strict(&self.queue_file, &data)?;
-        }
-        Ok(())
+            save_queue_file_strict(&path, &data)
+        })
+        .await
+        .context("YouTube queue mark_state_unconfirmed worker panicked")?
     }
 
     /// 在任务成功完成、被手动 `/stop` 取消或确定性永久失败后移除持久化记录。
@@ -222,13 +272,19 @@ impl YoutubeQueueStore {
             return Ok(());
         }
         let _guard = self.file_lock.lock().await;
-        let mut data = read_queue_file_strict(&self.queue_file)?;
-        let before = data.entries.len();
-        data.entries.retain(|e| e.task_id != task_id);
-        if data.entries.len() != before {
-            save_queue_file_strict(&self.queue_file, &data)?;
-        }
-        Ok(())
+        let path = self.queue_file.clone();
+        let task_id = task_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut data = read_queue_file_strict(&path)?;
+            let before = data.entries.len();
+            data.entries.retain(|e| e.task_id != task_id);
+            if data.entries.len() != before {
+                save_queue_file_strict(&path, &data)?;
+            }
+            Ok(())
+        })
+        .await
+        .context("YouTube queue remove worker panicked")?
     }
 }
 

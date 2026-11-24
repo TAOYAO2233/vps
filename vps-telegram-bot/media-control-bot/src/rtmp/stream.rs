@@ -63,8 +63,14 @@ pub fn classify_rtmp_failure(stderr_summary: &str, timed_out_by_watchdog: bool) 
     }
 
     let lower = stderr_summary.to_ascii_lowercase();
-    if lower.contains("403")
-        || lower.contains("401")
+    if lower.contains("403 forbidden")
+        || lower.contains("401 unauthorized")
+        || lower.contains("returned 403")
+        || lower.contains("returned 401")
+        || lower.contains("http error 403")
+        || lower.contains("http error 401")
+        || lower.contains("status 403")
+        || lower.contains("status 401")
         || lower.contains("unauthorized")
         || lower.contains("forbidden")
         || lower.contains("publish failed")
@@ -129,10 +135,11 @@ pub struct RtmpStreamer {
 impl RtmpStreamer {
     /// 创建推流器实例，自动校验 URL 并将其注册进全局脱敏注册表。
     pub fn new(rtmp_url: String, rw_timeout_secs: u64) -> Result<Self> {
-        validate_rtmp_url(&rtmp_url)?;
-        register_rtmp_secret(&rtmp_url);
+        let trimmed = rtmp_url.trim().to_string();
+        validate_rtmp_url(&trimmed)?;
+        register_rtmp_secret(&trimmed);
         Ok(Self {
-            rtmp_url,
+            rtmp_url: trimmed,
             rw_timeout_secs: rw_timeout_secs.max(5),
         })
     }

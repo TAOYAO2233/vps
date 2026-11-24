@@ -27,9 +27,12 @@ pub async fn ensure_stable_files(paths: &[PathBuf], quiet_secs: u64) -> Result<(
                 .unwrap_or_default()
                 .as_secs() < quiet_secs
         {
+            let display_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
             return Err(AppError::invalid_argument(format!(
-                "文件仍在写入或刚结束录制: {}",
-                path.display()
+                "文件仍在写入或刚结束录制: {display_name}"
             ))
             .into());
         }
@@ -122,6 +125,13 @@ pub struct TempWorkDir {
 impl TempWorkDir {
     /// 在已校验位于 `BASE_DIR` 内的 `parent_dir` 下创建唯一临时子目录。
     pub fn create_in(guard: &PathGuard, parent_dir: &Path, prefix: &str) -> Result<Self> {
+        if prefix.is_empty()
+            || !prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            anyhow::bail!("Invalid temporary directory prefix");
+        }
         let canonical_parent = guard.assert_inside(parent_dir)?;
         let pid = std::process::id();
         let now_ns = std::time::SystemTime::now()
@@ -189,8 +199,11 @@ impl Drop for TempWorkDir {
 ///
 /// 先在同一父目录下以 `create_new` 创建权限受限的临时文件，写完 `sync_all` 后原子 `rename` 到目标路径。
 pub fn write_private_file_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    if !parent.as_os_str().is_empty() && !parent.exists() {
+    let parent = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if parent != Path::new(".") && !parent.exists() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create parent directory: {}", parent.display()))?;
     }

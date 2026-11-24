@@ -161,6 +161,7 @@ pub struct Config {
     pub youtube_recovery_mode: YoutubeRecoveryMode,
 
     /// YouTube 上传队列持久化文件路径（默认 `./youtube_upload_queue.json`）
+    /// 已确认上传结果独立保存在同目录的 `<队列文件名>.results.json`，不受恢复模式开关影响。
     #[serde(default = "default_youtube_queue_file")]
     pub youtube_queue_file: PathBuf,
 

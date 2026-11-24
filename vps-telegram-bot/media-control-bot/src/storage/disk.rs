@@ -344,11 +344,27 @@ pub fn parse_mountinfo(content: &str) -> Vec<MountInfoEntry> {
     entries
 }
 
-/// 规范化挂载路径末尾斜杠（保留根路径 `/`）。
+/// 规范化挂载路径（折叠重复斜杠与末尾斜杠；空路径不静默归一为 `/`）。
 #[must_use]
 fn normalize_mount_path(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    let trimmed = s.trim_end_matches('/');
+    let raw = path.to_string_lossy();
+    if raw.is_empty() {
+        return PathBuf::new();
+    }
+    let mut collapsed = String::with_capacity(raw.len());
+    let mut prev_slash = false;
+    for ch in raw.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                collapsed.push('/');
+                prev_slash = true;
+            }
+        } else {
+            collapsed.push(ch);
+            prev_slash = false;
+        }
+    }
+    let trimmed = collapsed.trim_end_matches('/');
     if trimmed.is_empty() {
         PathBuf::from("/")
     } else {
@@ -357,7 +373,7 @@ fn normalize_mount_path(path: &Path) -> PathBuf {
 }
 
 /// 在解析好的 `mountinfo` 列表中校验目标挂载点（取最后一次覆盖挂载记录）。
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn verify_mount_in_entries(
     entries: &[MountInfoEntry],
     expected_mount: &Path,
@@ -388,9 +404,15 @@ pub fn verify_mount_in_entries(
 }
 
 /// 读取 Linux 文件系统挂载表与 `statvfs` 原始统计，返回实时 [`DiskUsageStats`]。
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn read_live_disk_stats(mount_point: &Path) -> std::result::Result<DiskUsageStats, DiskProbeError> {
     let normalized = normalize_mount_path(mount_point);
+    if normalized.as_os_str().is_empty() {
+        return Err(DiskProbeError::StatFailed {
+            mount_point: normalized,
+            reason: "挂载路径为空".to_string(),
+        });
+    }
 
     // 1. 校验挂载点目录本身存在且不是符号链接
     let sym_meta = std::fs::symlink_metadata(&normalized).map_err(|e| DiskProbeError::StatFailed {
@@ -442,8 +464,8 @@ pub fn read_live_disk_stats(mount_point: &Path) -> std::result::Result<DiskUsage
     ))
 }
 
-/// 非 Unix 平台的编译兼容桩实现（生产目标环境为 Linux VPS）。
-#[cfg(not(unix))]
+/// 非 Linux 平台的编译兼容桩实现（生产目标环境为 Linux VPS）。
+#[cfg(not(target_os = "linux"))]
 pub fn read_live_disk_stats(mount_point: &Path) -> std::result::Result<DiskUsageStats, DiskProbeError> {
     Err(DiskProbeError::StatFailed {
         mount_point: normalize_mount_path(mount_point),
@@ -514,14 +536,14 @@ pub fn evaluate_capacity_alert(
     // 挂载点已正常读取，自动解除挂载异常去重锁
     after_reset.mount_anomaly_latched = false;
 
-    // 1. 先执行回落复位判断（小于等于对应复位值时解锁该级）
-    if stats.raw_use_percent <= resets.reset_l1 {
+    // 1. 先执行回落复位判断（钳制复位阈值严格低于触发阈值，防止误配导致每次重复报警）
+    if stats.raw_use_percent <= resets.reset_l1.min(89.99) {
         after_reset.latched_levels[0] = false;
     }
-    if stats.raw_use_percent <= resets.reset_l2 {
+    if stats.raw_use_percent <= resets.reset_l2.min(94.99) {
         after_reset.latched_levels[1] = false;
     }
-    if stats.raw_use_percent <= resets.reset_l3 {
+    if stats.raw_use_percent <= resets.reset_l3.min(97.99) {
         after_reset.latched_levels[2] = false;
     }
 
@@ -710,7 +732,11 @@ impl DiskMonitor {
                     AlertEvaluation::NoAlert { updated_state } => {
                         if updated_state != prev_state {
                             *self.alert_state.lock().await = updated_state.clone();
-                            persist_alert_state_quietly(&self.state_file, &updated_state);
+                            let sf = self.state_file.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                persist_alert_state_quietly(&sf, &updated_state);
+                            })
+                            .await;
                         }
                     }
                     AlertEvaluation::SendCapacityAlert {
@@ -738,10 +764,11 @@ impl DiskMonitor {
                                     "Disk capacity alert sent to admin"
                                 );
                                 *self.alert_state.lock().await = state_if_send_succeeds.clone();
-                                persist_alert_state_quietly(
-                                    &self.state_file,
-                                    &state_if_send_succeeds,
-                                );
+                                let sf = self.state_file.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    persist_alert_state_quietly(&sf, &state_if_send_succeeds);
+                                })
+                                .await;
                             }
                             Err(send_err) => {
                                 let safe_err = redact_secrets(&send_err.to_string());
@@ -752,10 +779,11 @@ impl DiskMonitor {
                                 );
                                 if state_if_send_fails != prev_state {
                                     *self.alert_state.lock().await = state_if_send_fails.clone();
-                                    persist_alert_state_quietly(
-                                        &self.state_file,
-                                        &state_if_send_fails,
-                                    );
+                                    let sf = self.state_file.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        persist_alert_state_quietly(&sf, &state_if_send_fails);
+                                    })
+                                    .await;
                                 }
                             }
                         }
@@ -790,10 +818,11 @@ impl DiskMonitor {
                                 "Mount anomaly alert sent to admin"
                             );
                             *self.alert_state.lock().await = state_if_send_succeeds.clone();
-                            persist_alert_state_quietly(
-                                &self.state_file,
-                                &state_if_send_succeeds,
-                            );
+                            let sf = self.state_file.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                persist_alert_state_quietly(&sf, &state_if_send_succeeds);
+                            })
+                            .await;
                         }
                         Err(send_err) => {
                             let safe_send_err = redact_secrets(&send_err.to_string());
@@ -841,6 +870,67 @@ impl DiskMonitor {
         }
 
         Ok(stats)
+    }
+
+    /// 针对实际写入目录执行挂载设备一致性核验与剩余空间检查（防止 `BASE_DIR` 或子挂载位于不同文件系统）。
+    pub async fn ensure_space_available_for_path(
+        &self,
+        target_dir: &Path,
+        required_bytes: u64,
+    ) -> Result<DiskUsageStats> {
+        let mount_stats = self.ensure_space_available(required_bytes).await?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let mount_point = self.mount_point.clone();
+            let dir = target_dir.to_path_buf();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                use std::os::unix::fs::MetadataExt;
+                let mount_dev = std::fs::metadata(&mount_point)
+                    .map_err(|e| AppError::StorageMountUnavailable {
+                        mount_point: mount_point.clone(),
+                        reason: e.to_string(),
+                    })?
+                    .dev();
+                let dir_dev = std::fs::metadata(&dir)
+                    .map_err(|e| AppError::StorageMountUnavailable {
+                        mount_point: dir.clone(),
+                        reason: e.to_string(),
+                    })?
+                    .dev();
+                if dir_dev != mount_dev {
+                    return Err(AppError::StorageMountUnavailable {
+                        mount_point: dir,
+                        reason: "实际写入目录与受监控存储挂载点不在同一文件系统".to_string(),
+                    }
+                    .into());
+                }
+                let vfs = rustix::fs::statvfs(&dir).map_err(|e| AppError::StorageMountUnavailable {
+                    mount_point: dir.clone(),
+                    reason: e.to_string(),
+                })?;
+                let frsize = if vfs.f_frsize > 0 { vfs.f_frsize } else { vfs.f_bsize };
+                let avail_bytes = (vfs.f_bavail as u64).saturating_mul(frsize as u64);
+                if avail_bytes < required_bytes {
+                    return Err(AppError::InsufficientDiskSpace {
+                        required_bytes,
+                        available_bytes: avail_bytes,
+                    }
+                    .into());
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| AppError::StorageMountUnavailable {
+                mount_point: self.mount_point.clone(),
+                reason: e.to_string(),
+            })??;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        let _ = target_dir;
+
+        Ok(mount_stats)
     }
 }
 

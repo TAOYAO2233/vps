@@ -27,6 +27,9 @@ const OVERLAP_HOLDBACK_BYTES: usize = 2048;
 /// 派生秘密片段（如路径末段流密钥、查询令牌）允许注册的最小长度，防止误伤极短公共词。
 const MIN_DERIVED_SECRET_LEN: usize = 6;
 
+/// 全局运行时秘密注册表最大条目数，防止长期运行无界增长。
+const MAX_RUNTIME_SECRETS: usize = 256;
+
 /// 全局运行时秘密注册表（按长度降序排列，优先匹配完整长秘密）。
 static GLOBAL_SECRETS: Lazy<RwLock<Vec<String>>> = Lazy::new(|| RwLock::new(Vec::new()));
 
@@ -43,7 +46,12 @@ static TG_BOT_URL_REGEX: Lazy<Regex> = Lazy::new(|| {
 
 /// 匹配独立的 Telegram Bot Token（形如 `123456789:AA...`）
 static TG_BOT_TOKEN_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\b\d{6,15}:[A-Za-z0-9_-]{25,80}\b").unwrap());
+    Lazy::new(|| Regex::new(r"\b\d{6,15}:[A-Za-z0-9_-]{25,80}").unwrap());
+
+/// 匹配含认证凭据的代理/HTTP URL（如 `http://user:pass@host`、`socks5h://user:pass@host`）
+static PROXY_URL_CREDS_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)((?:https?|socks5h?|socks4a?)://)[^/\s\x22'<>\\@]+@").unwrap()
+});
 
 /// 匹配完整 RTMP/RTMPS/RTMPE/RTMPT/RTMPTE URL
 static RTMP_URL_REGEX: Lazy<Regex> =
@@ -61,9 +69,12 @@ static YOUTUBE_SESSION_URI_REGEX: Lazy<Regex> = Lazy::new(|| {
 static UPLOAD_ID_PARAM_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)(\bupload_id=)[^&\s\x22'<>\\]+").unwrap());
 
-/// 匹配 `Authorization: Bearer ...` 或 `authorization=Bearer ...`
+/// 匹配 `Authorization: Bearer/Basic ...`、`authorization=...` 及带引号形式
 static AUTH_HEADER_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s\x22',;\\\}\]]+").unwrap()
+    Regex::new(
+        r#"(?i)(authorization\s*[:=]\s*["']?(?:(?:bearer|basic|digest|token)\s+)?)[^\s\x22',;\\\}\]]+"#,
+    )
+    .unwrap()
 });
 
 /// 匹配独立的 `Bearer <token>` 片段
@@ -72,20 +83,20 @@ static BEARER_TOKEN_REGEX: Lazy<Regex> =
 
 /// 匹配 Google OAuth2 Access Token（`ya29....`）
 static GOOGLE_ACCESS_TOKEN_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\bya29\.[A-Za-z0-9._-]{10,}\b").unwrap());
+    Lazy::new(|| Regex::new(r"\bya29\.[A-Za-z0-9._-]{10,}").unwrap());
 
 /// 匹配 Google OAuth2 Refresh Token（`1//...`）
 static GOOGLE_REFRESH_TOKEN_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\b1//[A-Za-z0-9._-]{16,}\b").unwrap());
+    Lazy::new(|| Regex::new(r"\b1//[A-Za-z0-9._-]{16,}").unwrap());
 
 /// 匹配 Google OAuth2 Client Secret（`GOCSPX-...`）
 static GOOGLE_CLIENT_SECRET_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\bGOCSPX-[A-Za-z0-9._-]{10,}\b").unwrap());
+    Lazy::new(|| Regex::new(r"\bGOCSPX-[A-Za-z0-9._-]{10,}").unwrap());
 
-/// 匹配 JSON（含转义 JSON）中的敏感键值字段
+/// 匹配 JSON（含转义 JSON）中的敏感键值字段（支持值内含转义字符）
 static JSON_SECRET_FIELD_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?i)(\\*")(access_token|refresh_token|client_secret|bot_token|stream_key|rtmp_url|session_uri)(\\*"\s*:\s*\\*")([^"\\]+)(\\*")"#,
+        r#"(?i)(\\*")(access_token|refresh_token|id_token|client_secret|bot_token|stream_key|rtmp_url|session_uri|password|api_key|authorization|proxy_url)(\\*"\s*:\s*\\*")((?:[^"\\]|\\.)+)(\\*")"#,
     )
     .unwrap()
 });
@@ -123,8 +134,11 @@ fn insert_secret_variants(list: &mut Vec<String>, raw: &str) {
         }
     }
 
-    // 较长字符串优先替换，防止子串先行替换导致残余尾巴泄露
+    // 较长字符串优先替换，防止子串先行替换导致残余尾巴泄露，并限制总条目数防止无界增长
     list.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    if list.len() > MAX_RUNTIME_SECRETS {
+        list.truncate(MAX_RUNTIME_SECRETS);
+    }
 }
 
 /// 注册单个精确秘密值（如 `BOT_TOKEN`、`client_secret`、`refresh_token`、`access_token`）。
@@ -206,6 +220,32 @@ pub fn register_youtube_session_uri(session_uri: &str) {
     }
 }
 
+/// 注册带认证凭据的代理 URL 及其密码片段。
+fn register_proxy_secret(proxy_url: &str) {
+    let trimmed = proxy_url.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Ok(parsed) = Url::parse(trimmed) {
+        let has_creds = parsed.password().is_some() || !parsed.username().is_empty();
+        if !has_creds {
+            return;
+        }
+        if let Ok(mut guard) = GLOBAL_SECRETS.write() {
+            insert_secret_variants(&mut guard, trimmed);
+            if let Some(password) = parsed.password() {
+                if !password.is_empty() {
+                    insert_secret_variants(&mut guard, password);
+                }
+            }
+            let username = parsed.username();
+            if username.len() >= MIN_DERIVED_SECRET_LEN {
+                insert_secret_variants(&mut guard, username);
+            }
+        }
+    }
+}
+
 /// 从环境变量预注册敏感配置（供日志系统初始化前最早调用）。
 pub fn preload_secrets_from_env() {
     if let Ok(token) = std::env::var("BOT_TOKEN") {
@@ -213,6 +253,18 @@ pub fn preload_secrets_from_env() {
     }
     if let Ok(rtmp) = std::env::var("RTMP_URL") {
         register_rtmp_secret(&rtmp);
+    }
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        if let Ok(proxy) = std::env::var(key) {
+            register_proxy_secret(&proxy);
+        }
     }
 }
 
@@ -282,6 +334,10 @@ pub fn redact_with_secrets(input: &str, runtime_secrets: &[String]) -> String {
     // 1. 先按模式将结构化敏感 URL 规范替换为安全形式，避免后续产生半截残片
     out = TG_BOT_URL_REGEX
         .replace_all(&out, format!("${{1}}{REDACTED}"))
+        .into_owned();
+
+    out = PROXY_URL_CREDS_REGEX
+        .replace_all(&out, format!("${{1}}{REDACTED}@"))
         .into_owned();
 
     out = RTMP_URL_REGEX
@@ -426,7 +482,7 @@ pub fn sanitize_user_error(err: &anyhow::Error) -> String {
             }
             AppError::YoutubeUploadStateUnconfirmed { filename } => {
                 format!(
-                    "服务端状态未确认（{filename}）：全部字节已发送但 YouTube 持续返回 308 未给出最终 video_id，已停止轮询并保留会话信息供后续核实。"
+                    "服务端状态未确认（{filename}）：未能取得有效的最终 Video ID，不能据此认定上传失败。请先核实原会话或 YouTube Studio，避免重复上传。"
                 )
             }
             AppError::RtmpUrlNotConfigured => {
@@ -501,19 +557,25 @@ impl<W: Write> RedactingStreamState<W> {
             return Ok(());
         }
 
-        // 防御异常超长无换行输出：在安全空白边界处切分，保留尾部重叠窗口以防截断秘密
+        // 防御异常超长无换行输出：先对整段缓冲执行脱敏再按边界切分，防止敏感凭据横跨切分点被截断泄露
         if self.pending.len() > MAX_BUFFER_WITHOUT_NEWLINE {
-            let target_cut = self.pending.len().saturating_sub(OVERLAP_HOLDBACK_BYTES);
-            let cut_idx = self.pending[..target_cut]
-                .iter()
-                .rposition(|b| matches!(*b, b' ' | b'\t' | b'\r'))
-                .map(|idx| idx + 1)
-                .unwrap_or_else(|| utf8_floor_boundary(&self.pending, target_cut));
+            let redacted_bytes = self.redact_chunk_bytes(&self.pending).into_bytes();
+            if redacted_bytes.len() > OVERLAP_HOLDBACK_BYTES {
+                let target_cut = redacted_bytes.len() - OVERLAP_HOLDBACK_BYTES;
+                let cut_idx = redacted_bytes[..target_cut]
+                    .iter()
+                    .rposition(|b| matches!(*b, b' ' | b'\t' | b'\r'))
+                    .map(|idx| idx + 1)
+                    .unwrap_or_else(|| utf8_floor_boundary(&redacted_bytes, target_cut));
 
-            if cut_idx > 0 {
-                let chunk: Vec<u8> = self.pending.drain(..cut_idx).collect();
-                let redacted = self.redact_chunk_bytes(&chunk);
-                self.inner.write_all(redacted.as_bytes())?;
+                if cut_idx > 0 {
+                    self.inner.write_all(&redacted_bytes[..cut_idx])?;
+                    self.pending = redacted_bytes[cut_idx..].to_vec();
+                } else {
+                    self.pending = redacted_bytes;
+                }
+            } else {
+                self.pending = redacted_bytes;
             }
         }
 
@@ -533,7 +595,7 @@ impl<W: Write> RedactingStreamState<W> {
 /// 寻找不超过 `index` 的合法 UTF-8 字符起始边界。
 fn utf8_floor_boundary(bytes: &[u8], index: usize) -> usize {
     let mut idx = index.min(bytes.len());
-    while idx > 0 && (bytes[idx] & 0b1100_0000) == 0b1000_0000 {
+    while idx > 0 && idx < bytes.len() && (bytes[idx] & 0b1100_0000) == 0b1000_0000 {
         idx -= 1;
     }
     idx

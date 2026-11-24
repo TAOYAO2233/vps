@@ -30,10 +30,10 @@ static BRACKET_DATE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\[\d[^\]]*\]
 
 /// 将秒数格式化为 `HH:MM:SS` 字符串。
 ///
-/// 若时长 `<= 0` 则返回 `"未知"`。
+/// 若时长非有限数或 `<= 0` 则返回 `"未知"`。
 #[must_use]
 pub fn format_duration(seconds: f64) -> String {
-    if seconds <= 0.0 {
+    if !seconds.is_finite() || seconds <= 0.0 {
         return "未知".to_string();
     }
     let total = seconds as u64;
@@ -46,7 +46,10 @@ pub fn format_duration(seconds: f64) -> String {
 /// 将秒数格式化为紧凑的经过时间字符串（如 `1m05s`、`1h01m01s`、`45s`）。
 #[must_use]
 pub fn format_elapsed(seconds: f64) -> String {
-    let total = seconds.max(0.0) as u64;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return "0s".to_string();
+    }
+    let total = seconds as u64;
     let h = total / 3600;
     let m = (total % 3600) / 60;
     let s = total % 60;

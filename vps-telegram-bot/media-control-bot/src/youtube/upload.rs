@@ -155,6 +155,8 @@ pub struct ResumableUploadOptions {
     pub recovery_mode: YoutubeRecoveryMode,
     /// 基础退避间隔（默认 2 秒，单元测试可缩短）
     pub base_backoff: Duration,
+    /// 可选的入队/恢复时捕获的源文件身份快照，防止排队期间文件被替换
+    pub expected_identity: Option<SourceFileIdentity>,
 }
 
 impl Default for ResumableUploadOptions {
@@ -165,6 +167,7 @@ impl Default for ResumableUploadOptions {
             existing_session_uri: None,
             recovery_mode: YoutubeRecoveryMode::None,
             base_backoff: Duration::from_secs(2),
+            expected_identity: None,
         }
     }
 }
@@ -216,13 +219,17 @@ impl YoutubeUploader {
 
     /// Query an existing upload session without sending video data or creating a new session.
     pub async fn verify_session(&self, session_uri: &str, total_bytes: u64) -> Result<Option<String>> {
+        register_youtube_session_uri(session_uri);
+        validate_session_uri(session_uri, YOUTUBE_RESUMABLE_INIT_URL)?;
         let auth = load_authenticator(&self.token_file).await?;
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_only()
             .enable_http1()
             .build();
-        let client = Client::builder().build::<_, Body>(https);
+        let client = Client::builder()
+            .pool_idle_timeout(Duration::from_secs(60))
+            .build::<_, Body>(https);
         let mut token = fetch_access_token(&auth, false).await?;
         for attempt in 0..2 {
             match query_session_status(&client, session_uri, &token, total_bytes).await {
@@ -234,6 +241,7 @@ impl YoutubeUploader {
                 SessionQueryOutcome::Unauthorized => anyhow::bail!("YouTube OAuth authorization failed"),
                 SessionQueryOutcome::Expired => anyhow::bail!("YouTube upload session expired; verify in YouTube Studio"),
                 SessionQueryOutcome::Transient { reason, .. }
+                | SessionQueryOutcome::FinalResponseUnconfirmed(reason)
                 | SessionQueryOutcome::Permanent(reason) => anyhow::bail!("{}", redact_secrets(&reason)),
             }
         }
@@ -242,22 +250,30 @@ impl YoutubeUploader {
 
     /// 执行私享视频可恢复上传，返回服务端确认的 `video_id`。
     #[allow(clippy::too_many_arguments)]
-    pub async fn upload<ProgFn, SessFn, SessFut>(
+    pub async fn upload<ProgFn, SessFn, SessFut, FinalFn, FinalFut>(
         &self,
         file_path: &Path,
         title: &str,
         existing_session_uri: Option<String>,
+        expected_identity: Option<SourceFileIdentity>,
         recovery_mode: YoutubeRecoveryMode,
-        cancel_rx: tokio::sync::watch::Receiver<bool>,
+        existing_completion_uncertain: bool,
+        mut cancel_rx: tokio::sync::watch::Receiver<bool>,
         progress_callback: ProgFn,
         session_callback: SessFn,
+        final_chunk_callback: FinalFn,
     ) -> Result<String>
     where
         ProgFn: FnMut(UploadProgress) + Send,
         SessFn: FnMut(String) -> SessFut + Send,
         SessFut: Future<Output = Result<()>> + Send,
+        FinalFn: FnMut() -> FinalFut + Send,
+        FinalFut: Future<Output = Result<()>> + Send,
     {
-        let auth = std::sync::Arc::new(load_authenticator(&self.token_file).await?);
+        let filename = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("video");
+        let auth = std::sync::Arc::new(
+            oauth_or_cancel(load_authenticator(&self.token_file), &mut cancel_rx, filename).await?
+        );
 
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
@@ -272,13 +288,15 @@ impl YoutubeUploader {
             existing_session_uri,
             recovery_mode,
             base_backoff: Duration::from_secs(2),
+            expected_identity,
         };
 
-        execute_resumable_upload(
+        execute_resumable_upload_with_final_hook(
             &client,
             file_path,
             title,
             opts,
+            existing_completion_uncertain,
             move |force_refresh| {
                 let auth_clone = std::sync::Arc::clone(&auth);
                 async move { fetch_access_token(&auth_clone, force_refresh).await }
@@ -286,12 +304,134 @@ impl YoutubeUploader {
             cancel_rx,
             progress_callback,
             session_callback,
+            final_chunk_callback,
         )
         .await
     }
 }
 
-/// 将任意分块字节数规范化为合法的 `256 KiB` 正整数倍。
+/// 等待取消通道真正变为 `true`；若发送端被释放则永不误触发取消。
+async fn wait_for_cancel(cancel_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *cancel_rx.borrow_and_update() {
+            return;
+        }
+        if cancel_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// 校验可恢复上传 `session_uri` 的协议与域名合法性，防止向非 Google 主机泄露 OAuth Bearer Token。
+///
+/// 当 `expected_init_endpoint` 为 Google 官方 HTTPS 端点时，强制要求 `session_uri` 使用 `https` 且域名为
+/// `googleapis.com` 或 `*.googleapis.com`；本地测试 mock 端点则要求同源（scheme/host/port 一致）。
+fn validate_session_uri(session_uri: &str, expected_init_endpoint: &str) -> Result<()> {
+    let parsed = url::Url::parse(session_uri)
+        .map_err(|_| AppError::YoutubeApiError {
+            message: "无效的 YouTube 上传会话 URI".to_string(),
+        })?;
+    let host = parsed
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| AppError::YoutubeApiError {
+            message: "YouTube 上传会话 URI 缺少有效主机名".to_string(),
+        })?;
+
+    if let Ok(expected) = url::Url::parse(expected_init_endpoint) {
+        let expected_host = expected.host_str().map(str::to_ascii_lowercase).unwrap_or_default();
+        let is_google_endpoint = expected.scheme() == "https"
+            && (expected_host == "googleapis.com" || expected_host.ends_with(".googleapis.com"));
+        if !is_google_endpoint {
+            // 测试用本地 mock server：校验同源
+            if parsed.scheme() == expected.scheme()
+                && host == expected_host
+                && parsed.port_or_known_default() == expected.port_or_known_default()
+            {
+                return Ok(());
+            }
+            return Err(AppError::YoutubeApiError {
+                message: "上传会话 URI 与目标端点不同源，已拒绝携带令牌访问".to_string(),
+            }
+            .into());
+        }
+    }
+
+    if parsed.scheme() != "https" || !(host == "googleapis.com" || host.ends_with(".googleapis.com")) {
+        return Err(AppError::YoutubeApiError {
+            message: "拒绝向非 *.googleapis.com HTTPS 域名发送 YouTube 鉴权令牌".to_string(),
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// 清理并按 UTF-16 码元上限截断 YouTube 视频标题（过滤 `<`、`>` 及控制字符，拒绝纯空白）。
+fn sanitize_youtube_title(raw_title: &str) -> String {
+    let without_ext = if VideoExtensions::is_video(raw_title) {
+        raw_title
+            .rsplit_once('.')
+            .map(|(stem, _)| stem)
+            .filter(|stem| !stem.trim().is_empty())
+            .unwrap_or(raw_title)
+    } else {
+        raw_title
+    };
+
+    let cleaned: String = without_ext
+        .chars()
+        .map(|c| {
+            if c == '<' || c == '>' || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "Untitled Video".to_string();
+    }
+
+    let mut out = String::new();
+    let mut utf16_units = 0usize;
+    for ch in trimmed.chars() {
+        let units = ch.len_utf16();
+        if utf16_units + units > 95 {
+            break;
+        }
+        out.push(ch);
+        utf16_units += units;
+    }
+    let final_title = out.trim();
+    if final_title.is_empty() {
+        "Untitled Video".to_string()
+    } else {
+        final_title.to_string()
+    }
+}
+
+/// 取消尚未完成的上传会话时，尽力发送 `DELETE <session_uri>` 释放服务端残留会话（限时 3 秒）。
+async fn best_effort_delete_session<C>(
+    client: &Client<C, Body>,
+    session_uri: &str,
+    access_token: &str,
+) where
+    C: Connect + Clone + Send + Sync + 'static,
+{
+    if let Ok(req) = Request::builder()
+        .method(Method::DELETE)
+        .uri(session_uri)
+        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(3), client.request(req)).await;
+    }
+}
+
+/// 将任意分块字节数规范化为合法的 `256 KiB` 正整数倍（防止极大值溢出）。
 #[must_use]
 pub fn align_chunk_size(raw_bytes: usize) -> usize {
     let clamped = raw_bytes.max(YOUTUBE_CHUNK_GRANULARITY);
@@ -299,7 +439,9 @@ pub fn align_chunk_size(raw_bytes: usize) -> usize {
     if rem == 0 {
         clamped
     } else {
-        clamped + (YOUTUBE_CHUNK_GRANULARITY - rem)
+        clamped
+            .checked_add(YOUTUBE_CHUNK_GRANULARITY - rem)
+            .unwrap_or(usize::MAX - (usize::MAX % YOUTUBE_CHUNK_GRANULARITY))
     }
 }
 
@@ -315,14 +457,23 @@ pub fn parse_confirmed_offset_from_range(range_header: Option<&str>, total_bytes
         return Ok(0);
     }
 
-    let without_unit = trimmed
-        .strip_prefix("bytes=")
-        .or_else(|| trimmed.strip_prefix("bytes "))
-        .unwrap_or(trimmed);
+    let lower_prefix = trimmed.get(..6).map(str::to_ascii_lowercase);
+    let without_unit = match lower_prefix.as_deref() {
+        Some("bytes=") | Some("bytes ") => &trimmed[6..],
+        _ => anyhow::bail!("Malformed 308 Range header unit"),
+    };
 
-    let Some((_start_str, end_str)) = without_unit.split_once('-') else {
+    let Some((start_str, end_str)) = without_unit.split_once('-') else {
         anyhow::bail!("Malformed 308 Range header");
     };
+
+    let start_byte: u64 = start_str
+        .trim()
+        .parse()
+        .context("Invalid start byte in 308 Range header")?;
+    if start_byte != 0 {
+        anyhow::bail!("Unexpected non-zero start byte ({start_byte}) in 308 Range header");
+    }
 
     let end_inclusive: u64 = end_str
         .trim()
@@ -342,6 +493,7 @@ pub fn parse_confirmed_offset_from_range(range_header: Option<&str>, total_bytes
 #[derive(Debug)]
 enum SessionQueryOutcome {
     Completed(String),
+    FinalResponseUnconfirmed(String),
     Incomplete(u64),
     Unauthorized,
     Expired,
@@ -355,6 +507,7 @@ enum SessionQueryOutcome {
 #[derive(Debug)]
 enum ChunkPutOutcome {
     Completed(String),
+    FinalResponseUnconfirmed(String),
     Incomplete(u64),
     Unauthorized,
     Expired,
@@ -372,10 +525,10 @@ pub async fn execute_resumable_upload<C, TokenFn, TokenFut, ProgFn, SessFn, Sess
     file_path: &Path,
     title: &str,
     opts: ResumableUploadOptions,
-    mut token_provider: TokenFn,
-    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
-    mut progress_callback: ProgFn,
-    mut session_callback: SessFn,
+    token_provider: TokenFn,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    progress_callback: ProgFn,
+    session_callback: SessFn,
 ) -> Result<String>
 where
     C: Connect + Clone + Send + Sync + 'static,
@@ -385,38 +538,89 @@ where
     SessFn: FnMut(String) -> SessFut + Send,
     SessFut: Future<Output = Result<()>> + Send,
 {
+    execute_resumable_upload_with_final_hook(
+        client,
+        file_path,
+        title,
+        opts,
+        false,
+        token_provider,
+        cancel_rx,
+        progress_callback,
+        session_callback,
+        || async { Ok(()) },
+    )
+    .await
+}
+
+/// 带末块发送前持久化钩子的协议执行引擎：在发送末块前先通知上层将“可能已完成”状态落盘，防止崩溃重启后 `requeue` 重复成片。
+#[allow(clippy::too_many_arguments)]
+async fn execute_resumable_upload_with_final_hook<
+    C,
+    TokenFn,
+    TokenFut,
+    ProgFn,
+    SessFn,
+    SessFut,
+    FinalFn,
+    FinalFut,
+>(
+    client: &Client<C, Body>,
+    file_path: &Path,
+    title: &str,
+    opts: ResumableUploadOptions,
+    existing_completion_uncertain: bool,
+    mut token_provider: TokenFn,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    mut progress_callback: ProgFn,
+    mut session_callback: SessFn,
+    mut final_chunk_callback: FinalFn,
+) -> Result<String>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+    TokenFn: FnMut(bool) -> TokenFut + Send,
+    TokenFut: Future<Output = Result<String>> + Send,
+    ProgFn: FnMut(UploadProgress) + Send,
+    SessFn: FnMut(String) -> SessFut + Send,
+    SessFut: Future<Output = Result<()>> + Send,
+    FinalFn: FnMut() -> FinalFut + Send,
+    FinalFut: Future<Output = Result<()>> + Send,
+{
     let filename = file_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("video")
         .to_string();
 
-    let source_id = SourceFileIdentity::capture(file_path)?;
+    let source_id = match opts.expected_identity {
+        Some(expected) => {
+            expected.verify_unchanged(file_path)?;
+            expected
+        }
+        None => SourceFileIdentity::capture(file_path)?,
+    };
     let total_bytes = source_id.size;
     let chunk_size = align_chunk_size(opts.chunk_size_bytes);
 
-    // Keep the local filename intact, but omit its video extension in YouTube metadata.
-    let upload_title = if VideoExtensions::is_video(title) {
-        title
-            .rsplit_once('.')
-            .map(|(stem, _)| stem)
-            .filter(|stem| !stem.is_empty())
-            .unwrap_or(title)
-    } else {
-        title
-    };
-    let title_truncated: String = upload_title.chars().take(95).collect();
-    let mut access_token = token_provider(false).await?;
+    // Keep the local filename intact, sanitize forbidden chars/whitespace and bound UTF-16 units.
+    let title_truncated = sanitize_youtube_title(title);
+    let mut access_token = oauth_or_cancel(token_provider(false), &mut cancel_rx, &filename).await?;
     let mut refreshed_after_401 = false;
     let mut session_restarts: u32 = 0;
     let mut transient_retries: u32 = 0;
     let mut full_confirmation_retries: u32 = 0;
     let mut no_progress_retries: u32 = 0;
 
+    if let Some(ref existing_uri) = opts.existing_session_uri {
+        register_youtube_session_uri(existing_uri);
+        validate_session_uri(existing_uri, &opts.init_endpoint)?;
+    }
     let mut session_uri_opt = opts.existing_session_uri.clone();
     let mut need_status_query = session_uri_opt.is_some();
     let mut is_initial_recovery_query = session_uri_opt.is_some();
     let mut confirmed_offset: u64 = 0;
+    // Once completion may have happened, never replace this session automatically.
+    let mut completion_uncertain = existing_completion_uncertain;
 
     progress_callback(UploadProgress {
         local_sent_bytes: 0,
@@ -425,7 +629,16 @@ where
     });
 
     loop {
-        if *cancel_rx.borrow() {
+        if *cancel_rx.borrow_and_update() {
+            if completion_uncertain || confirmed_offset >= total_bytes {
+                return Err(AppError::YoutubeUploadStateUnconfirmed {
+                    filename: filename.clone(),
+                }
+                .into());
+            }
+            if let Some(ref uri) = session_uri_opt {
+                best_effort_delete_session(client, uri, &access_token).await;
+            }
             return Err(AppError::YoutubeUploadCancelled {
                 filename: filename.clone(),
             }
@@ -433,23 +646,27 @@ where
         }
 
         // 每次网络交互前校验原文件未被改动
-        source_id.verify_unchanged(file_path)?;
+        source_id.verify_unchanged(file_path)
+            .map_err(|e| preserve_completion_error(e, completion_uncertain, &filename))?;
 
         // 1. 若尚无上传会话，先发起 POST 创建 Resumable Session
         let session_uri = match &session_uri_opt {
             Some(uri) => uri.clone(),
             None => {
-                match initiate_resumable_session(
-                    client,
-                    &opts.init_endpoint,
-                    &access_token,
-                    &title_truncated,
-                    total_bytes,
-                )
-                .await
-                {
+                let init = tokio::select! {
+                    result = initiate_resumable_session(
+                        client,
+                        &opts.init_endpoint,
+                        &access_token,
+                        &title_truncated,
+                        total_bytes,
+                    ) => result,
+                    () = wait_for_cancel(&mut cancel_rx) => return Err(AppError::YoutubeUploadCancelled { filename: filename.clone() }.into()),
+                };
+                match init {
                     Ok(new_uri) => {
                         register_youtube_session_uri(&new_uri);
+                        validate_session_uri(&new_uri, &opts.init_endpoint)?;
                         // The session must be durable before the first video byte is sent.
                         session_callback(new_uri.clone()).await?;
                         info!(
@@ -467,7 +684,7 @@ where
                     }
                     Err(InitSessionError::Unauthorized) if !refreshed_after_401 => {
                         refreshed_after_401 = true;
-                        access_token = token_provider(true).await?;
+                        access_token = oauth_or_cancel(token_provider(true), &mut cancel_rx, &filename).await?;
                         continue;
                     }
                     Err(InitSessionError::Unauthorized) => {
@@ -493,6 +710,7 @@ where
                             transient_retries,
                             &mut cancel_rx,
                             &filename,
+                            false,
                         )
                         .await?;
                         continue;
@@ -506,7 +724,17 @@ where
 
         // 2. 重试前或恢复启动时：先查询既有会话的已确认偏移，严防盲目重传造成重复视频
         if need_status_query {
-            match query_session_status(client, &session_uri, &access_token, total_bytes).await {
+            let query = tokio::select! {
+                result = query_session_status(client, &session_uri, &access_token, total_bytes) => result,
+                () = wait_for_cancel(&mut cancel_rx) => {
+                    if completion_uncertain || confirmed_offset >= total_bytes {
+                        return Err(AppError::YoutubeUploadStateUnconfirmed { filename: filename.clone() }.into());
+                    }
+                    best_effort_delete_session(client, &session_uri, &access_token).await;
+                    return Err(AppError::YoutubeUploadCancelled { filename: filename.clone() }.into());
+                }
+            };
+            match query {
                 SessionQueryOutcome::Completed(video_id) => {
                     progress_callback(UploadProgress {
                         local_sent_bytes: total_bytes,
@@ -520,27 +748,42 @@ where
                     );
                     return Ok(video_id);
                 }
+                SessionQueryOutcome::FinalResponseUnconfirmed(reason) => {
+                    completion_uncertain = true;
+                    is_initial_recovery_query = false;
+                    transient_retries += 1;
+                    warn!(filename = %filename, reason = %redact_secrets(&reason), "Completion response could not be read; retaining original session");
+                    if transient_retries > MAX_TRANSIENT_RETRIES {
+                        return Err(AppError::YoutubeUploadStateUnconfirmed { filename: filename.clone() }.into());
+                    }
+                    wait_backoff_or_cancel(None, opts.base_backoff, transient_retries, &mut cancel_rx, &filename, completion_uncertain).await?;
+                    continue;
+                }
                 SessionQueryOutcome::Incomplete(server_offset) => {
                     need_status_query = false;
-                    refreshed_after_401 = false;
 
                     if is_initial_recovery_query
                         && opts.recovery_mode == YoutubeRecoveryMode::Requeue
+                        && !completion_uncertain
                         && server_offset < total_bytes
                     {
                         // requeue 策略：确认旧会话未完成后，丢弃半截会话并从头新建上传
                         is_initial_recovery_query = false;
+                        refreshed_after_401 = false;
                         session_uri_opt = None;
                         confirmed_offset = 0;
                         continue;
                     }
 
                     is_initial_recovery_query = false;
+                    // 仅当服务端确认偏移真正前进时才重置 401 刷新预算，防止查询 308 与分块 401 死循环
                     if server_offset > confirmed_offset {
                         no_progress_retries = 0;
+                        refreshed_after_401 = false;
                     }
                     confirmed_offset = server_offset;
                     if server_offset >= total_bytes {
+                        completion_uncertain = true;
                         full_confirmation_retries += 1;
                         if full_confirmation_retries > MAX_TRANSIENT_RETRIES {
                             return Err(AppError::YoutubeUploadStateUnconfirmed {
@@ -554,6 +797,7 @@ where
                             full_confirmation_retries,
                             &mut cancel_rx,
                             &filename,
+                            completion_uncertain,
                         )
                         .await?;
                     } else {
@@ -567,17 +811,18 @@ where
                 }
                 SessionQueryOutcome::Unauthorized if !refreshed_after_401 => {
                     refreshed_after_401 = true;
-                    access_token = token_provider(true).await?;
+                    access_token = oauth_or_cancel(token_provider(true), &mut cancel_rx, &filename).await
+                        .map_err(|e| preserve_completion_error(e, completion_uncertain, &filename))?;
                     continue;
                 }
                 SessionQueryOutcome::Unauthorized => {
-                    return Err(AppError::YoutubeApiError {
+                    return Err(preserve_completion_error(AppError::YoutubeApiError {
                         message: "查询上传进度时 OAuth 鉴权失败（401）".to_string(),
                     }
-                    .into());
+                    .into(), completion_uncertain, &filename));
                 }
                 SessionQueryOutcome::Expired => {
-                    if confirmed_offset >= total_bytes
+                    if completion_uncertain || confirmed_offset >= total_bytes
                         || (is_initial_recovery_query
                             && opts.recovery_mode == YoutubeRecoveryMode::Resume)
                     {
@@ -609,7 +854,7 @@ where
                 } => {
                     transient_retries += 1;
                     if transient_retries > MAX_TRANSIENT_RETRIES {
-                        if confirmed_offset >= total_bytes {
+                        if completion_uncertain || confirmed_offset >= total_bytes {
                             return Err(AppError::YoutubeUploadStateUnconfirmed {
                                 filename: filename.clone(),
                             }
@@ -626,12 +871,13 @@ where
                         transient_retries,
                         &mut cancel_rx,
                         &filename,
+                        completion_uncertain || confirmed_offset >= total_bytes,
                     )
                     .await?;
                     continue;
                 }
                 SessionQueryOutcome::Permanent(msg) => {
-                    if confirmed_offset >= total_bytes {
+                    if completion_uncertain || confirmed_offset >= total_bytes {
                         return Err(AppError::YoutubeUploadStateUnconfirmed {
                             filename: filename.clone(),
                         }
@@ -651,6 +897,12 @@ where
         // 3. 发送下一个分块（非末块恒为 chunk_size 即 256 KiB 整数倍）
         let remaining = total_bytes - confirmed_offset;
         let chunk_len = remaining.min(chunk_size as u64) as usize;
+        // 一旦准备发送末块，先持久化“可能已完成”标记再发送网络数据，
+        // 防止进程在服务端收完末块后崩溃重启时被 requeue 误判并创建重复视频。
+        if confirmed_offset + (chunk_len as u64) >= total_bytes && !completion_uncertain {
+            completion_uncertain = true;
+            final_chunk_callback().await?;
+        }
 
         debug!(
             filename = %filename,
@@ -672,7 +924,15 @@ where
             &mut cancel_rx,
             &mut progress_callback,
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            if completion_uncertain {
+                warn!(filename = %filename, error = %redact_secrets(&e.to_string()), "Final chunk interrupted or cancelled; retaining session for verification");
+                AppError::YoutubeUploadStateUnconfirmed { filename: filename.clone() }.into()
+            } else {
+                e
+            }
+        })?;
 
         match put_outcome {
             ChunkPutOutcome::Completed(video_id) => {
@@ -683,6 +943,15 @@ where
                 });
                 info!(filename = %filename, video_id = %video_id, "YouTube resumable upload succeeded");
                 return Ok(video_id);
+            }
+            ChunkPutOutcome::FinalResponseUnconfirmed(reason) => {
+                completion_uncertain = true;
+                need_status_query = true;
+                transient_retries += 1;
+                warn!(filename = %filename, reason = %redact_secrets(&reason), "Final upload response invalid; querying original session");
+                if transient_retries > MAX_TRANSIENT_RETRIES {
+                    return Err(AppError::YoutubeUploadStateUnconfirmed { filename: filename.clone() }.into());
+                }
             }
             ChunkPutOutcome::Incomplete(new_confirmed) => {
                 refreshed_after_401 = false;
@@ -700,6 +969,7 @@ where
                         no_progress_retries,
                         &mut cancel_rx,
                         &filename,
+                        completion_uncertain,
                     )
                     .await?;
                     need_status_query = true;
@@ -707,6 +977,9 @@ where
                     no_progress_retries = 0;
                     transient_retries = 0;
                     confirmed_offset = new_confirmed;
+                    if confirmed_offset >= total_bytes {
+                        completion_uncertain = true;
+                    }
                     progress_callback(UploadProgress {
                         local_sent_bytes: confirmed_offset,
                         server_confirmed_bytes: confirmed_offset,
@@ -716,16 +989,20 @@ where
             }
             ChunkPutOutcome::Unauthorized if !refreshed_after_401 => {
                 refreshed_after_401 = true;
-                access_token = token_provider(true).await?;
+                access_token = oauth_or_cancel(token_provider(true), &mut cancel_rx, &filename).await
+                    .map_err(|e| preserve_completion_error(e, completion_uncertain, &filename))?;
                 need_status_query = true;
             }
             ChunkPutOutcome::Unauthorized => {
-                return Err(AppError::YoutubeApiError {
+                return Err(preserve_completion_error(AppError::YoutubeApiError {
                     message: "分块上传期间 OAuth 令牌失效且刷新后仍被拒绝（401）".to_string(),
                 }
-                .into());
+                .into(), completion_uncertain, &filename));
             }
             ChunkPutOutcome::Expired => {
+                if completion_uncertain || confirmed_offset + chunk_len as u64 >= total_bytes {
+                    return Err(AppError::YoutubeUploadStateUnconfirmed { filename: filename.clone() }.into());
+                }
                 if session_restarts < 1 {
                     session_restarts += 1;
                     warn!(filename = %filename, "Upload session expired mid-upload; restarting once");
@@ -742,6 +1019,9 @@ where
                 retry_after,
                 reason,
             } => {
+                if confirmed_offset + chunk_len as u64 >= total_bytes {
+                    completion_uncertain = true;
+                }
                 transient_retries += 1;
                 if transient_retries > MAX_TRANSIENT_RETRIES {
                     return Err(AppError::YoutubeUploadStateUnconfirmed {
@@ -761,15 +1041,45 @@ where
                     transient_retries,
                     &mut cancel_rx,
                     &filename,
+                    completion_uncertain,
                 )
                 .await?;
                 // 关键规则：重试发送数据前必须先向既有 session 查询服务端实际确认偏移！
                 need_status_query = true;
             }
             ChunkPutOutcome::Permanent(msg) => {
+                if completion_uncertain {
+                    return Err(AppError::YoutubeUploadStateUnconfirmed { filename: filename.clone() }.into());
+                }
                 return Err(AppError::YoutubeApiError { message: msg }.into());
             }
         }
+    }
+}
+
+fn preserve_completion_error(error: anyhow::Error, uncertain: bool, filename: &str) -> anyhow::Error {
+    if uncertain {
+        warn!(filename, error = %redact_secrets(&error.to_string()), "Cannot finish verifying potentially completed upload");
+        AppError::YoutubeUploadStateUnconfirmed { filename: filename.to_string() }.into()
+    } else {
+        error
+    }
+}
+
+async fn oauth_or_cancel<T>(
+    operation: impl Future<Output = Result<T>>,
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+    filename: &str,
+) -> Result<T> {
+    if *cancel_rx.borrow_and_update() {
+        return Err(AppError::YoutubeUploadCancelled { filename: filename.to_string() }.into());
+    }
+    tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(60), operation) => match result {
+            Ok(result) => result,
+            Err(_) => Err(AppError::YoutubeApiError { message: "OAuth 操作超时".to_string() }.into()),
+        },
+        () = wait_for_cancel(cancel_rx) => Err(AppError::YoutubeUploadCancelled { filename: filename.to_string() }.into()),
     }
 }
 
@@ -792,6 +1102,7 @@ async fn initiate_resumable_session<C>(
 where
     C: Connect + Clone + Send + Sync + 'static,
 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let payload = VideoInsertMetadata {
         snippet: VideoInsertSnippet {
             title: title.to_string(),
@@ -817,7 +1128,7 @@ where
         .body(Body::from(json_bytes))
         .map_err(|e| InitSessionError::Permanent(redact_secrets(&e.to_string())))?;
 
-    let resp = match tokio::time::timeout(Duration::from_secs(60), client.request(req)).await {
+    let resp = match tokio::time::timeout_at(deadline, client.request(req)).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             return Err(InitSessionError::Transient {
@@ -849,7 +1160,11 @@ where
         return Ok(loc.to_string());
     }
 
-    let body_text = read_bounded_body_text(resp.into_body()).await;
+    let body_text = match tokio::time::timeout_at(deadline, read_bounded_body_text(resp.into_body())).await {
+        Ok(Ok(text)) => text,
+        Ok(Err(reason)) => reason,
+        Err(_) => "初始化会话响应体读取超时".to_string(),
+    };
     if code == 401 {
         Err(InitSessionError::Unauthorized)
     } else if is_transient_http_status(code) {
@@ -873,6 +1188,7 @@ async fn query_session_status<C>(
 where
     C: Connect + Clone + Send + Sync + 'static,
 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let req = match Request::builder()
         .method(Method::PUT)
         .uri(session_uri)
@@ -885,7 +1201,7 @@ where
         Err(e) => return SessionQueryOutcome::Permanent(redact_secrets(&e.to_string())),
     };
 
-    let resp = match tokio::time::timeout(Duration::from_secs(60), client.request(req)).await {
+    let resp = match tokio::time::timeout_at(deadline, client.request(req)).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             return SessionQueryOutcome::Transient {
@@ -909,13 +1225,16 @@ where
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let body_text = read_bounded_body_text(resp.into_body()).await;
+    let body_result = match tokio::time::timeout_at(deadline, read_bounded_body_text(resp.into_body())).await {
+        Ok(result) => result,
+        Err(_) => Err("会话查询响应体读取超时".to_string()),
+    };
+    if matches!(code, 200 | 201) {
+        return final_query_response(body_result);
+    }
+    let body_text = body_result.unwrap_or_else(|reason| reason);
 
     match code {
-        200 | 201 => match parse_video_id_from_json(&body_text) {
-            Ok(vid) => SessionQueryOutcome::Completed(vid),
-            Err(msg) => SessionQueryOutcome::Permanent(msg),
-        },
         308 => match parse_confirmed_offset_from_range(range_hdr.as_deref(), total_bytes) {
             Ok(offset) => SessionQueryOutcome::Incomplete(offset),
             Err(e) => SessionQueryOutcome::Permanent(redact_secrets(&e.to_string())),
@@ -930,8 +1249,48 @@ where
     }
 }
 
+fn final_query_response(body: std::result::Result<String, String>) -> SessionQueryOutcome {
+    match body.and_then(|text| parse_video_id_from_json(&text)) {
+        Ok(video_id) => SessionQueryOutcome::Completed(video_id),
+        Err(reason) => SessionQueryOutcome::FinalResponseUnconfirmed(reason),
+    }
+}
+
+// A single deadline covers file reads, request body backpressure, response headers
+// and response body. Dropping the inner future closes its body sender/connection.
 #[allow(clippy::too_many_arguments)]
 async fn upload_single_chunk<C, ProgFn>(
+    client: &Client<C, Body>, file_path: &Path, source_id: &SourceFileIdentity,
+    session_uri: &str, access_token: &str, offset: u64, chunk_len: usize,
+    total_bytes: u64, cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+    progress_callback: &mut ProgFn,
+) -> Result<ChunkPutOutcome>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+    ProgFn: FnMut(UploadProgress) + Send,
+{
+    let filename = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("video").to_string();
+    if *cancel_rx.borrow_and_update() {
+        return Err(AppError::YoutubeUploadCancelled { filename }.into());
+    }
+    let mut inner_cancel = cancel_rx.clone();
+    let operation = upload_single_chunk_inner(
+        client, file_path, source_id, session_uri, access_token, offset,
+        chunk_len, total_bytes, &mut inner_cancel, progress_callback,
+    );
+    tokio::select! {
+        result = tokio::time::timeout(CHUNK_REQUEST_TIMEOUT, operation) => match result {
+            Ok(result) => result,
+            Err(_) => Ok(ChunkPutOutcome::Transient {
+                retry_after: None, reason: "分块请求整体超时（含发送及响应体读取）".to_string(),
+            }),
+        },
+        () = wait_for_cancel(cancel_rx) => Err(AppError::YoutubeUploadCancelled { filename }.into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_single_chunk_inner<C, ProgFn>(
     client: &Client<C, Body>,
     file_path: &Path,
     source_id: &SourceFileIdentity,
@@ -961,6 +1320,21 @@ where
             message: e.to_string(),
         }
     })?;
+    let opened_meta = file.metadata().await.map_err(|e| AppError::FileIo {
+        path: file_path.to_path_buf(),
+        message: e.to_string(),
+    })?;
+    let opened_mtime = opened_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
+    if !opened_meta.is_file()
+        || opened_meta.len() != total_bytes
+        || (source_id.modified_nanos.is_some() && opened_mtime != source_id.modified_nanos)
+    {
+        return Err(AppError::SourceFileChanged { filename }.into());
+    }
     file.seek(SeekFrom::Start(offset)).await?;
 
     let end_inclusive = offset + (chunk_len as u64) - 1;
@@ -986,17 +1360,26 @@ where
 
     // 边读取 64 KiB 切片边推入 HTTP 请求体，同时监听对端提前响应与用户 /stop 取消
     let resp_result = loop {
-        if *cancel_rx.borrow() {
+        if *cancel_rx.borrow_and_update() {
             sender.abort();
             return Err(AppError::YoutubeUploadCancelled { filename }.into());
         }
 
         if sent_in_chunk >= chunk_len {
+            // 末块发完前再次核验文件大小未被外部追加扩展
+            if offset + (chunk_len as u64) == total_bytes {
+                if let Ok(meta) = file.metadata().await {
+                    if meta.len() != total_bytes {
+                        sender.abort();
+                        return Err(AppError::SourceFileChanged { filename }.into());
+                    }
+                }
+            }
             // 关闭发送端（EOF），等待服务端返回 308 或 200/201
             drop(sender);
             let awaited = tokio::select! {
                 res = &mut request_fut => Some(res),
-                _ = cancel_rx.changed() => None,
+                () = wait_for_cancel(cancel_rx) => None,
                 _ = tokio::time::sleep(CHUNK_REQUEST_TIMEOUT) => {
                     return Ok(ChunkPutOutcome::Transient {
                         retry_after: None,
@@ -1047,7 +1430,7 @@ where
             res = &mut request_fut => {
                 break res;
             }
-            _ = cancel_rx.changed() => {
+            () = wait_for_cancel(cancel_rx) => {
                 sender.abort();
                 return Err(AppError::YoutubeUploadCancelled { filename }.into());
             }
@@ -1071,13 +1454,13 @@ where
         .get(RANGE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let body_text = read_bounded_body_text(resp.into_body()).await;
+    let body_result = read_bounded_body_text(resp.into_body()).await;
+    if matches!(code, 200 | 201) {
+        return Ok(final_chunk_response(body_result));
+    }
+    let body_text = body_result.unwrap_or_else(|reason| reason);
 
     Ok(match code {
-        200 | 201 => match parse_video_id_from_json(&body_text) {
-            Ok(vid) => ChunkPutOutcome::Completed(vid),
-            Err(msg) => ChunkPutOutcome::Permanent(msg),
-        },
         308 => match parse_confirmed_offset_from_range(range_hdr.as_deref(), total_bytes) {
             Ok(confirmed) => ChunkPutOutcome::Incomplete(confirmed),
             Err(e) => ChunkPutOutcome::Permanent(redact_secrets(&e.to_string())),
@@ -1090,6 +1473,13 @@ where
         },
         c => ChunkPutOutcome::Permanent(format_youtube_http_error(c, &body_text)),
     })
+}
+
+fn final_chunk_response(body: std::result::Result<String, String>) -> ChunkPutOutcome {
+    match body.and_then(|text| parse_video_id_from_json(&text)) {
+        Ok(video_id) => ChunkPutOutcome::Completed(video_id),
+        Err(reason) => ChunkPutOutcome::FinalResponseUnconfirmed(reason),
+    }
 }
 
 fn is_transient_http_status(code: u16) -> bool {
@@ -1108,6 +1498,7 @@ async fn wait_backoff_or_cancel(
     attempt: u32,
     cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
     filename: &str,
+    completion_uncertain: bool,
 ) -> Result<()> {
     let shift = attempt.saturating_sub(1).min(5);
     let exp_delay = base_backoff
@@ -1117,24 +1508,32 @@ async fn wait_backoff_or_cancel(
 
     tokio::select! {
         _ = tokio::time::sleep(delay) => Ok(()),
-        _ = cancel_rx.changed() => Err(AppError::YoutubeUploadCancelled {
-            filename: filename.to_string(),
-        }.into()),
+        () = wait_for_cancel(cancel_rx) => {
+            if completion_uncertain {
+                Err(AppError::YoutubeUploadStateUnconfirmed {
+                    filename: filename.to_string(),
+                }.into())
+            } else {
+                Err(AppError::YoutubeUploadCancelled {
+                    filename: filename.to_string(),
+                }.into())
+            }
+        }
     }
 }
 
-async fn read_bounded_body_text(mut body: Body) -> String {
+async fn read_bounded_body_text(mut body: Body) -> std::result::Result<String, String> {
     use hyper::body::HttpBody;
     let mut collected = Vec::new();
-    while let Some(Ok(chunk)) = body.data().await {
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(|e| format!("读取 YouTube 响应体失败: {}", redact_secrets(&e.to_string())))?;
         let remain = (64 * 1024usize).saturating_sub(collected.len());
-        if remain == 0 {
-            break;
+        if chunk.len() > remain {
+            return Err("YouTube 响应体超过 64 KiB 限制".to_string());
         }
-        let slice = &chunk[..chunk.len().min(remain)];
-        collected.extend_from_slice(slice);
+        collected.extend_from_slice(&chunk);
     }
-    String::from_utf8_lossy(&collected).into_owned()
+    String::from_utf8(collected).map_err(|_| "YouTube 响应体不是有效 UTF-8".to_string())
 }
 
 fn parse_video_id_from_json(body_text: &str) -> std::result::Result<String, String> {
@@ -1187,6 +1586,88 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn body_read_failure_is_not_treated_as_a_complete_json_response() {
+        let (mut sender, body) = Body::channel();
+        let writer = tokio::spawn(async move {
+            sender.send_data(Bytes::from_static(br#"{"id":"video123"}"#)).await.unwrap();
+            sender.abort();
+        });
+        let outcome = read_bounded_body_text(body).await;
+        writer.await.unwrap();
+        assert!(outcome.is_err());
+        assert!(matches!(final_chunk_response(outcome), ChunkPutOutcome::FinalResponseUnconfirmed(_)));
+    }
+
+    #[tokio::test]
+    async fn oversized_response_body_is_an_error() {
+        assert!(read_bounded_body_text(Body::from(vec![b'x'; 65_537])).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_stalled_final_response_body() {
+        exercise_stalled_body(true).await;
+    }
+
+    #[tokio::test]
+    async fn whole_chunk_deadline_includes_response_body_reading() {
+        exercise_stalled_body(false).await;
+    }
+
+    async fn exercise_stalled_body(cancel: bool) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("video.mp4");
+        std::fs::write(&path, [7u8; 128]).unwrap();
+        let identity = SourceFileIdentity::capture(&path).unwrap();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        // Hold the response sender open without emitting or closing its body.
+        let held_sender = Arc::new(StdMutex::new(None));
+        let ready_service = Arc::clone(&ready);
+        let held_service = Arc::clone(&held_sender);
+        let service = make_service_fn(move |_| {
+            let ready = Arc::clone(&ready_service);
+            let held = Arc::clone(&held_service);
+            async move {
+                Ok::<_, Infallible>(service_fn(move |request: Request<Body>| {
+                    let ready = Arc::clone(&ready);
+                    let held = Arc::clone(&held);
+                    async move {
+                        hyper::body::to_bytes(request.into_body()).await.unwrap();
+                        let (sender, body) = Body::channel();
+                        *held.lock().unwrap() = Some(sender);
+                        ready.notify_one();
+                        Ok::<_, Infallible>(Response::builder().status(200).body(body).unwrap())
+                    }
+                }))
+            }
+        });
+        let server = Server::bind(&([127, 0, 0, 1], 0).into()).serve(service);
+        let url = format!("http://{}/upload", server.local_addr());
+        let server_task = tokio::spawn(server);
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let upload_task = tokio::spawn(async move {
+            let mut progress = |_| {};
+            upload_single_chunk(&Client::new(), &path, &identity, &url, "fake", 0, 128, 128,
+                &mut cancel_rx, &mut progress).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), ready.notified()).await.unwrap();
+        tokio::task::yield_now().await;
+        if cancel {
+            cancel_tx.send(true).unwrap();
+        } else {
+            tokio::time::pause();
+            tokio::time::advance(CHUNK_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), upload_task).await.unwrap().unwrap();
+        if cancel {
+            assert!(matches!(result.unwrap_err().downcast_ref::<AppError>(), Some(AppError::YoutubeUploadCancelled { .. })));
+        } else {
+            assert!(matches!(result.unwrap(), ChunkPutOutcome::Transient { .. }));
+            tokio::time::resume();
+        }
+        server_task.abort();
+    }
+
     #[test]
     fn test_align_chunk_size_and_range_parser() {
         assert_eq!(align_chunk_size(1), 256 * 1024);
@@ -1203,6 +1684,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_resumable_upload_chunking_status_recovery_and_no_duplicate_video() {
+        exercise_final_response(502, "gateway glitch after final chunk", false).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_final_json_is_recovered_without_creating_a_second_video() {
+        exercise_final_response(200, "truncated-json", false).await;
+    }
+
+    #[tokio::test]
+    async fn missing_final_video_id_is_recovered_from_original_session() {
+        exercise_final_response(201, "{}", false).await;
+    }
+
+    #[tokio::test]
+    async fn expired_session_after_malformed_final_response_is_retained_as_unconfirmed() {
+        exercise_final_response(200, "truncated-json", true).await;
+    }
+
+    async fn exercise_final_response(final_code: u16, final_body: &'static str, expire_after_final: bool) {
         // 准备 600 KiB 测试视频文件（按 256 KiB 分块：256 KiB + 256 KiB + 88 KiB 共 3 块）
         let tmp = TempDir::new().unwrap();
         let video_path = tmp.path().join("test_live.mp4");
@@ -1266,6 +1766,9 @@ mod tests {
                             query_c.fetch_add(1, Ordering::SeqCst);
                             let cur_len = buf_c.lock().unwrap().len();
                             if cur_len == total_len {
+                                if expire_after_final {
+                                    return Ok(Response::builder().status(404).body(Body::empty()).unwrap());
+                                }
                                 return Ok(Response::builder()
                                     .status(StatusCode::OK)
                                     .body(Body::from(r#"{"id":"yt_vid_recovered_ok"}"#))
@@ -1314,11 +1817,11 @@ mod tests {
                                 .unwrap());
                         }
 
-                        // 模拟最末块服务端实际上已落盘，但响应网络闪断（返回 502）
+                        // Final bytes are stored, but the final response may be corrupt/lost.
                         if drop_final_c.fetch_add(1, Ordering::SeqCst) == 0 {
                             return Ok(Response::builder()
-                                .status(StatusCode::BAD_GATEWAY)
-                                .body(Body::from("gateway glitch after final chunk"))
+                                .status(final_code)
+                                .body(Body::from(final_body))
                                 .unwrap());
                         }
 
@@ -1344,9 +1847,10 @@ mod tests {
             existing_session_uri: None,
             recovery_mode: YoutubeRecoveryMode::None,
             base_backoff: Duration::from_millis(10),
+            expected_identity: None,
         };
 
-        let vid = execute_resumable_upload(
+        let outcome = execute_resumable_upload(
             &client,
             &video_path,
             "测试无重复可恢复上传",
@@ -1358,19 +1862,22 @@ mod tests {
             },
             |_sess| async { Ok(()) },
         )
-        .await
-        .unwrap();
+        .await;
 
         srv_handle.abort();
 
-        assert_eq!(vid, "yt_vid_recovered_ok");
+        if expire_after_final {
+            let error = outcome.unwrap_err();
+            assert!(matches!(error.downcast_ref::<AppError>(), Some(AppError::YoutubeUploadStateUnconfirmed { .. })));
+        } else {
+            assert_eq!(outcome.unwrap(), "yt_vid_recovered_ok");
+        }
         // 核心断言：全程只创建了 1 次 POST 会话（绝未产生重复视频），且通过 PUT bytes */total 查询恢复了完成状态！
         assert_eq!(post_sessions.load(Ordering::SeqCst), 1);
         assert!(status_queries.load(Ordering::SeqCst) >= 2);
         assert_eq!(*server_buf.lock().unwrap(), payload);
-        assert_eq!(
-            confirmed_events.last().copied(),
-            Some((total_len as u64, total_len as u64))
-        );
+        if !expire_after_final {
+            assert_eq!(confirmed_events.last().copied(), Some((total_len as u64, total_len as u64)));
+        }
     }
 }

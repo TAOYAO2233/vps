@@ -16,7 +16,7 @@ use teloxide::prelude::*;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use super::{edit_html_bounded, edit_html_cancellable, send_html_cancellable};
+use super::{edit_html_bounded, edit_html_cancellable, send_html_bounded, send_html_cancellable};
 use crate::config::Config;
 use crate::core::state::{ActionType, SharedState};
 use crate::core::task_manager::TaskManager;
@@ -85,13 +85,32 @@ async fn do_convert(
     let mut total_input_bytes: u64 = 0;
 
     for raw in &raw_files {
-        let valid = guard.assert_regular_file_no_symlink(raw)?;
+        let valid = match guard.assert_regular_file_no_symlink(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                send_html_bounded(
+                    &bot,
+                    msg.chat.id,
+                    format!("❌ <b>转封装预检失败</b>:\n{}", escape_html(&sanitize_user_error(&e))),
+                )
+                .await;
+                return Err(e);
+            }
+        };
         let sz = std::fs::metadata(&valid).map_or(0, |m| m.len());
         total_input_bytes = total_input_bytes.saturating_add(sz);
         verified_files.push(valid);
     }
 
-    ensure_stable_files(&verified_files, config.file_stable_seconds).await?;
+    if let Err(e) = ensure_stable_files(&verified_files, config.file_stable_seconds).await {
+        send_html_bounded(
+            &bot,
+            msg.chat.id,
+            format!("❌ <b>转封装预检未通过</b>:\n{}", escape_html(&sanitize_user_error(&e))),
+        )
+        .await;
+        return Err(e);
+    }
     let total = verified_files.len();
     state
         .write()
@@ -111,18 +130,33 @@ async fn do_convert(
         Arc::clone(&s.disk_monitor)
     };
     let required_bytes = estimate_convert_required_bytes(total_input_bytes);
-    if let Err(e) = disk_monitor.ensure_space_available(required_bytes).await {
-        edit_html_bounded(
-            &bot,
-            msg.chat.id,
-            progress_msg.id,
-            format!(
-                "❌ <b>转封装预检未通过</b>:\n{}",
-                escape_html(&sanitize_user_error(&e))
-            ),
-        )
-        .await;
-        return Err(e);
+    let mut target_dirs: Vec<PathBuf> = Vec::new();
+    for f in &verified_files {
+        let dir = f.parent().unwrap_or(&config.base_dir).to_path_buf();
+        if !target_dirs.contains(&dir) {
+            target_dirs.push(dir);
+        }
+    }
+    if target_dirs.is_empty() {
+        target_dirs.push(config.base_dir.clone());
+    }
+    for dir in &target_dirs {
+        if let Err(e) = disk_monitor
+            .ensure_space_available_for_path(dir, required_bytes)
+            .await
+        {
+            edit_html_bounded(
+                &bot,
+                msg.chat.id,
+                progress_msg.id,
+                format!(
+                    "❌ <b>转封装预检未通过</b>:\n{}",
+                    escape_html(&sanitize_user_error(&e))
+                ),
+            )
+            .await;
+            return Err(e);
+        }
     }
 
     let progress_bar = ProgressBar::default();
@@ -175,7 +209,13 @@ async fn do_convert(
             .unwrap_or("output.mp4")
             .to_string();
 
-        let temp_dir = TempWorkDir::create_in(&guard, &parent, "remux")?;
+        let temp_dir = match TempWorkDir::create_in(&guard, &parent, "remux") {
+            Ok(d) => d,
+            Err(e) => {
+                failed_notes.push(format!("{filename}: {}", sanitize_user_error(&e)));
+                continue;
+            }
+        };
         let temp_output = temp_dir.path().join("candidate.mp4");
         remove_if_exists(&temp_output);
 
@@ -201,11 +241,32 @@ async fn do_convert(
 
         let args = build_remux_to_mp4_args(file_path, &temp_output);
         let duration = src_probe.duration_secs;
-        let mut process = FfmpegProcess::spawn(args, duration, &state).await?;
+        let mut process = match FfmpegProcess::spawn(args, duration, &state).await {
+            Ok(p) => p,
+            Err(e) => {
+                drop(temp_dir);
+                failed_notes.push(format!("{filename}: {}", sanitize_user_error(&e)));
+                continue;
+            }
+        };
         let mut cancel_watch = cancel_rx.clone();
+        let stall_timeout = std::time::Duration::from_secs(300);
+        let mut stalled = false;
 
         loop {
-            if *cancel_watch.borrow() {
+            if *cancel_watch.borrow_and_update() {
+                if process.stop_and_wait().await {
+                    state.write().await.record_exclusive_forced_kill(task_id);
+                }
+                break;
+            }
+            if process.last_activity_at().elapsed() >= stall_timeout {
+                warn!(
+                    input = %filename,
+                    stall_secs = stall_timeout.as_secs(),
+                    "Lossless MP4 remux stalled without progress; stopping ffmpeg"
+                );
+                stalled = true;
                 if process.stop_and_wait().await {
                     state.write().await.record_exclusive_forced_kill(task_id);
                 }
@@ -246,12 +307,22 @@ async fn do_convert(
                         Ok(None) | Err(_) => break,
                     }
                 }
-                _ = cancel_watch.changed() => {
+                _ = async {
+                    loop {
+                        if *cancel_watch.borrow_and_update() {
+                            return;
+                        }
+                        if cancel_watch.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                } => {
                     if process.stop_and_wait().await {
                         state.write().await.record_exclusive_forced_kill(task_id);
                     }
                     break;
                 }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
             }
         }
 
@@ -267,6 +338,12 @@ async fn do_convert(
             return Err(AppError::Cancelled.into());
         }
 
+        if stalled {
+            drop(temp_dir);
+            failed_notes.push(format!("{filename}: FFmpeg 长时间无进展已自动终止"));
+            continue;
+        }
+
         let temp_size = std::fs::symlink_metadata(&temp_output)
             .ok()
             .filter(|m| m.file_type().is_file())
@@ -277,10 +354,15 @@ async fn do_convert(
                 .await
             {
                 Ok(out_probe) => {
-                    let duration_ok = src_probe.duration_secs > 0.0
-                        && out_probe.duration_secs > 0.0
-                        && out_probe.duration_secs >= src_probe.duration_secs * 0.95
-                        && out_probe.duration_secs <= src_probe.duration_secs * 1.05 + 2.0;
+                    let duration_ok = if src_probe.duration_secs > 0.0 {
+                        out_probe.duration_secs.is_finite()
+                            && out_probe.duration_secs > 0.0
+                            && out_probe.duration_secs >= src_probe.duration_secs * 0.95
+                            && out_probe.duration_secs <= src_probe.duration_secs * 1.05 + 2.0
+                    } else {
+                        // 源容器头未记录时长（如部分 FLV/TS）时，仅要求输出 MP4 具备有效正时长
+                        out_probe.duration_secs.is_finite() && out_probe.duration_secs > 0.0
+                    };
                     let streams_ok = out_probe.video_streams.len() == src_probe.video_streams.len()
                         && out_probe.audio_streams.len() == src_probe.audio_streams.len()
                         && out_probe.video_streams.iter().zip(&src_probe.video_streams)
@@ -347,6 +429,10 @@ async fn do_convert(
     }
 
     edit_html_bounded(&bot, msg.chat.id, progress_msg.id, summary).await;
+
+    if success_count == 0 && total > 0 {
+        return Err(AppError::Io("批量无损转封装全部失败".to_string()).into());
+    }
 
     Ok(())
 }

@@ -5,4 +5,5 @@
 pub mod api;
 pub mod oauth;
 pub mod persistence;
+pub mod results;
 pub mod upload;

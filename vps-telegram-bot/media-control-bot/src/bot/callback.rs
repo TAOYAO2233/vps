@@ -35,7 +35,7 @@ use crate::core::task_manager::TaskManager;
 use crate::storage::path::PathGuard;
 use crate::storage::filesystem::format_file_size_bytes;
 use crate::storage::trash::TrashStore;
-use crate::storage::scanner::scan_directory;
+use crate::storage::scanner::scan_directory_within;
 use crate::ui::menu::render_main_menu;
 use crate::bot::commands::render_trash_panel;
 use crate::ui::pagination::Paginator;
@@ -68,17 +68,32 @@ pub async fn callback_handler(
 
     info!(user_id = user_id, callback_data = %data, "Callback received");
 
-    let menu_key = (msg.chat.id.0, msg.id.0);
-    let menu_lock = {
-        let s = state.read().await;
-        Arc::clone(&s.menu_lock)
-    };
-    let outcome = {
+    // 非文件选择器回调（尤其是紧急停止按钮、YouTube 历史/核实、回收站面板）不获取全局 menu_lock，
+    // 也不读写 menu_sessions，彻底消除队头阻塞并防止覆盖文件选择器上下文。
+    let uses_menu_session = !(data.starts_with("stop_yt_")
+        || data.starts_with("stop_excl_")
+        || data.starts_with("pending_")
+        || data.starts_with("history_yt_")
+        || data.starts_with("resend_yt_")
+        || data.starts_with("verify_yt_")
+        || data == "menu_trash"
+        || data.starts_with("trash_page_")
+        || data.starts_with("restore_")
+        || data.starts_with("trash_clear_"));
+
+    let outcome = if uses_menu_session {
+        let menu_key = (msg.chat.id.0, msg.id.0);
+        let menu_lock = {
+            let s = state.read().await;
+            Arc::clone(&s.menu_lock)
+        };
         let _menu_guard = menu_lock.lock().await;
         state.write().await.load_menu_session(menu_key, &config.base_dir);
         let result = dispatch_callback(&bot, &q, &msg, &data, Arc::clone(&state), Arc::clone(&config)).await;
         state.write().await.save_menu_session(menu_key);
         result
+    } else {
+        dispatch_callback(&bot, &q, &msg, &data, Arc::clone(&state), Arc::clone(&config)).await
     };
     if let Err(e) = outcome {
         let safe_log = redact_secrets(&e.to_string());
@@ -111,9 +126,29 @@ async fn dispatch_callback(
 ) -> anyhow::Result<()> {
     let path_guard = PathGuard::new(config.base_dir.clone());
 
-    if let Some(task_id) = data.strip_prefix("pending_resume_") {
+    if let Some(raw_page) = data.strip_prefix("pending_page_") {
+        let page = raw_page
+            .parse::<usize>()
+            .map_err(|_| crate::errors::AppError::invalid_argument("页码无效"))?;
         bot.answer_callback_query(&q.id).await?;
-        actions::youtube::resume_pending_upload(bot, msg, state, config, task_id).await?;
+        crate::bot::commands::render_pending_panel(bot, msg, &state, &config, page, true).await?;
+        return Ok(());
+    }
+    if let Some(task_id) = data.strip_prefix("pending_resume_") {
+        bot.answer_callback_query(&q.id).text("正在尝试继续上传任务…").await?;
+        let bot_bg = bot.clone();
+        let msg_bg = msg.clone();
+        let tid_bg = task_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) =
+                actions::youtube::resume_pending_upload(&bot_bg, &msg_bg, state, config, &tid_bg)
+                    .await
+            {
+                let _ = bot_bg
+                    .send_message(msg_bg.chat.id, format!("❌ {}", sanitize_user_error(&e)))
+                    .await;
+            }
+        });
         return Ok(());
     }
     if let Some(task_id) = data.strip_prefix("pending_dropask_") {
@@ -131,6 +166,10 @@ async fn dispatch_callback(
         return Ok(());
     }
     if let Some(task_id) = data.strip_prefix("pending_drop_") {
+        let enqueue_lock = Arc::clone(&state.read().await.youtube_enqueue_lock);
+        let Ok(_enqueue_guard) = enqueue_lock.try_lock() else {
+            anyhow::bail!("正在处理上传队列，请稍后再放弃恢复记录");
+        };
         let store = {
             let s = state.read().await;
             if s.youtube_pool.contains_key(task_id) {
@@ -138,42 +177,97 @@ async fn dispatch_callback(
             }
             Arc::clone(&s.youtube_queue_store)
         };
-        let exists = store.load_recoverable_entries().await?
-            .iter().any(|e| e.task_id == task_id && e.unconfirmed_full_upload);
-        if !exists { anyhow::bail!("待核实任务已不存在"); }
+        let exists = store.load_recoverable_entries().await?.iter().any(|e| {
+            e.task_id == task_id
+                && (e.chat_id == msg.chat.id.0
+                    || (e.chat_id == 0 && msg.chat.id.0 == config.admin_id))
+        });
+        if !exists { anyhow::bail!("待核实或搁置任务已不存在或不属于当前聊天"); }
         store.remove(task_id).await?;
         bot.answer_callback_query(&q.id).text("已放弃恢复记录。").await?;
         return Ok(());
     }
 
     if let Some(id) = data.strip_prefix("restore_") {
-        bot.answer_callback_query(&q.id).await?;
         let monitor = {
             let s = state.read().await;
             Arc::clone(&s.disk_monitor)
         };
-        monitor.ensure_space_available(0).await?;
-        let store = TrashStore::new(config.base_dir.clone(), config.trash_retention_days);
-        let restored = store.restore(id)?;
-        bot.send_message(msg.chat.id, format!("✅ 已恢复：{}", restored.display())).await?;
-        render_trash_panel(bot, msg, &state, &config, true).await?;
+        monitor
+            .ensure_space_available_for_path(&config.base_dir, 0)
+            .await?;
+        let bot_bg = bot.clone();
+        let msg_bg = msg.clone();
+        let state_bg = Arc::clone(&state);
+        let cfg_bg = Arc::clone(&config);
+        let restore_id = id.to_string();
+        TaskManager::new(Arc::clone(&state))
+            .start_exclusive("恢复回收站文件", move |_task_id, cancel_rx| async move {
+                let store = TrashStore::new(cfg_bg.base_dir.clone(), cfg_bg.trash_retention_days);
+                let res = tokio::task::spawn_blocking(move || store.restore(&restore_id, &cancel_rx)).await;
+                match res {
+                    Ok(Ok(restored)) => {
+                        let restored_name = restored
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown");
+                        let _ = bot_bg
+                            .send_message(msg_bg.chat.id, format!("✅ 已恢复：{restored_name}"))
+                            .await;
+                        let _ = render_trash_panel(&bot_bg, &msg_bg, &state_bg, &cfg_bg, 0, true).await;
+                        Ok(())
+                    }
+                    Ok(Err(e)) if e.downcast_ref::<crate::errors::AppError>() == Some(&crate::errors::AppError::Cancelled) => {
+                        let _ = actions::send_html_bounded(&bot_bg, msg_bg.chat.id, "🛑 已停止恢复，文件仍在回收站。".to_string()).await;
+                        Err(e)
+                    }
+                    Ok(Err(e)) => {
+                        let _ = bot_bg
+                            .send_message(msg_bg.chat.id, format!("❌ 恢复失败：{}", sanitize_user_error(&e)))
+                            .await;
+                        Err(e)
+                    }
+                    Err(e) => {
+                        let err: anyhow::Error = e.into();
+                        let _ = bot_bg
+                            .send_message(msg_bg.chat.id, format!("❌ 恢复任务异常：{}", sanitize_user_error(&err)))
+                            .await;
+                        Err(err)
+                    }
+                }
+            })
+            .await?;
+        bot.answer_callback_query(&q.id).text("正在恢复文件…").await?;
         return Ok(());
     }
 
     if data == "menu_trash" {
         bot.answer_callback_query(&q.id).await?;
-        render_trash_panel(bot, msg, &state, &config, true).await?;
+        render_trash_panel(bot, msg, &state, &config, 0, true).await?;
+        return Ok(());
+    }
+
+    if let Some(raw_page) = data.strip_prefix("trash_page_") {
+        let page = raw_page
+            .parse::<usize>()
+            .map_err(|_| crate::errors::AppError::invalid_argument("回收站页码无效"))?;
+        bot.answer_callback_query(&q.id).await?;
+        render_trash_panel(bot, msg, &state, &config, page, true).await?;
         return Ok(());
     }
 
     if data == "trash_clear_ask" {
         let monitor = { Arc::clone(&state.read().await.disk_monitor) };
-        monitor.ensure_space_available(0).await?;
+        monitor
+            .ensure_space_available_for_path(&config.base_dir, 0)
+            .await?;
         let store = TrashStore::new(config.base_dir.clone(), config.trash_retention_days);
-        let entries = store.list()?;
+        let entries = tokio::task::spawn_blocking(move || store.list())
+            .await
+            .map_err(|e| anyhow::anyhow!("回收站列表读取线程异常: {e}"))??;
         if entries.is_empty() {
             bot.answer_callback_query(&q.id).text("回收站已清空。").await?;
-            render_trash_panel(bot, msg, &state, &config, true).await?;
+            render_trash_panel(bot, msg, &state, &config, 0, true).await?;
             return Ok(());
         }
         let bytes = entries.iter().fold(0_u64, |sum, entry| sum.saturating_add(entry.size));
@@ -194,51 +288,122 @@ async fn dispatch_callback(
 
     if let Some(token) = data.strip_prefix("trash_clear_confirm_") {
         let monitor = { Arc::clone(&state.read().await.disk_monitor) };
-        monitor.ensure_space_available(0).await?;
-        let store = TrashStore::new(config.base_dir.clone(), config.trash_retention_days);
-        let entries = store.list()?;
+        monitor
+            .ensure_space_available_for_path(&config.base_dir, 0)
+            .await?;
+        let store_list = TrashStore::new(config.base_dir.clone(), config.trash_retention_days);
+        let entries = tokio::task::spawn_blocking(move || store_list.list())
+            .await
+            .map_err(|e| anyhow::anyhow!("回收站列表读取线程异常: {e}"))??;
         if entries.is_empty() || TrashStore::snapshot_token(&entries) != token {
             bot.answer_callback_query(&q.id)
                 .text("回收站内容已变化，请重新确认。")
                 .show_alert(true).await?;
-            render_trash_panel(bot, msg, &state, &config, true).await?;
+            render_trash_panel(bot, msg, &state, &config, 0, true).await?;
             return Ok(());
         }
-        bot.answer_callback_query(&q.id).text("正在清空回收站…").await?;
+        let bot_bg = bot.clone();
+        let msg_bg = msg.clone();
+        let state_bg = Arc::clone(&state);
+        let cfg_bg = Arc::clone(&config);
         let expected = token.to_string();
-        let report = tokio::task::spawn_blocking(move || store.clear_all(&expected)).await;
-        match report {
-            Ok(Ok(report)) => {
-                let heading = if report.failed == 0 {
-                    "🧹 <b>回收站已清空</b>"
-                } else {
-                    "⚠️ <b>回收站部分清理失败</b>"
-                };
-                bot.edit_message_text(msg.chat.id, msg.id, format!(
-                    "{heading}\n已清理：{} 个\n释放空间：{}\n失败：{} 个",
-                    report.removed, format_file_size_bytes(report.freed_bytes), report.failed
-                ))
-                    .parse_mode(teloxide::types::ParseMode::Html)
-                    .reply_markup(InlineKeyboardMarkup::new(vec![vec![
-                        InlineKeyboardButton::callback("返回回收站", "menu_trash"),
-                    ]]))
-                    .await?;
+        // 纳入独占任务后台执行并立即释放聊天处理器，避免阻塞同一聊天的 /stop 与停止按钮
+        TaskManager::new(Arc::clone(&state))
+            .start_exclusive("清空回收站", move |_task_id, cancel_rx| async move {
+                let store = TrashStore::new(cfg_bg.base_dir.clone(), cfg_bg.trash_retention_days);
+                let report = tokio::task::spawn_blocking(move || store.clear_all(&expected, &cancel_rx)).await;
+                match report {
+                    Ok(Ok(report)) => {
+                        let heading = if report.cancelled {
+                            "🛑 <b>已停止清空回收站</b>"
+                        } else if report.failed == 0 {
+                            "🧹 <b>回收站已清空</b>"
+                        } else {
+                            "⚠️ <b>回收站部分清理失败</b>"
+                        };
+                        let _ = bot_bg
+                            .edit_message_text(
+                                msg_bg.chat.id,
+                                msg_bg.id,
+                                format!(
+                                    "{heading}\n已清理：{} 个\n释放空间：{}\n失败：{} 个\n未处理：{} 个",
+                                    report.removed,
+                                    format_file_size_bytes(report.freed_bytes),
+                                    report.failed,
+                                    report.remaining,
+                                ),
+                            )
+                            .parse_mode(teloxide::types::ParseMode::Html)
+                            .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                                InlineKeyboardButton::callback("返回回收站", "menu_trash"),
+                            ]]))
+                            .await;
+                        if report.cancelled {
+                            return Err(crate::errors::AppError::Cancelled.into());
+                        }
+                        if report.removed == 0 && report.failed > 0 {
+                            anyhow::bail!("清空回收站全部失败");
+                        }
+                        Ok(())
+                    }
+                    Ok(Err(e)) => {
+                        let _ = bot_bg
+                            .send_message(msg_bg.chat.id, format!("清空失败：{}", sanitize_user_error(&e)))
+                            .await;
+                        let _ = render_trash_panel(&bot_bg, &msg_bg, &state_bg, &cfg_bg, 0, true).await;
+                        Err(e)
+                    }
+                    Err(e) => {
+                        let err: anyhow::Error = e.into();
+                        let _ = bot_bg
+                            .send_message(msg_bg.chat.id, format!("清空任务异常：{}", sanitize_user_error(&err)))
+                            .await;
+                        Err(err)
+                    }
+                }
+            })
+            .await?;
+        bot.answer_callback_query(&q.id).text("正在清空回收站…").await?;
+        return Ok(());
+    }
+
+    if let Some(page) = data.strip_prefix("history_yt_") {
+        let page = page.parse::<usize>().map_err(|_| crate::errors::AppError::invalid_argument("历史页码无效"))?;
+        bot.answer_callback_query(&q.id).await?;
+        crate::bot::commands::render_upload_history(bot, msg, &state, page).await?;
+        return Ok(());
+    }
+
+    if let Some(task_id) = data.strip_prefix("resend_yt_") {
+        bot.answer_callback_query(&q.id).text("正在补发已保存的上传结果…").await?;
+        let bot_bg = bot.clone();
+        let msg_bg = msg.clone();
+        let tid_bg = task_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = actions::youtube::resend_upload_result(&bot_bg, &msg_bg, &state, &tid_bg).await {
+                let _ = bot_bg
+                    .send_message(msg_bg.chat.id, format!("❌ 补发失败：{}", sanitize_user_error(&e)))
+                    .await;
             }
-            Ok(Err(e)) => {
-                bot.send_message(msg.chat.id, format!("清空失败：{}", sanitize_user_error(&e))).await?;
-                render_trash_panel(bot, msg, &state, &config, true).await?;
-            }
-            Err(e) => {
-                let err: anyhow::Error = e.into();
-                bot.send_message(msg.chat.id, format!("清空任务异常：{}", sanitize_user_error(&err))).await?;
-            }
-        }
+        });
         return Ok(());
     }
 
     if let Some(task_id) = data.strip_prefix("verify_yt_") {
         bot.answer_callback_query(&q.id).text("正在查询服务端状态…").await?;
-        actions::youtube::verify_pending_upload(bot, msg, &state, &config, task_id).await?;
+        let bot_bg = bot.clone();
+        let msg_bg = msg.clone();
+        let tid_bg = task_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) =
+                actions::youtube::verify_pending_upload(&bot_bg, &msg_bg, &state, &config, &tid_bg)
+                    .await
+            {
+                let _ = bot_bg
+                    .send_message(msg_bg.chat.id, format!("❌ 核实失败：{}", sanitize_user_error(&e)))
+                    .await;
+            }
+        });
         return Ok(());
     }
 
@@ -307,6 +472,7 @@ async fn dispatch_callback(
         {
             let mut s = state.write().await;
             s.current_dir = config.base_dir.clone();
+            s.search_query.clear();
             s.clear_selections(&action);
             s.pending_delete = None;
             s.current_snapshot = None;
@@ -523,8 +689,19 @@ async fn dispatch_callback(
 
             match action {
                 ActionType::Browse => {
-                    // action_browse 内部会自行调用 answer_callback_query（弹窗或确认），此处不重复应答
-                    actions::browse::action_browse(bot, q, msg, &config, safe_path).await?;
+                    // 异步后台执行 ffprobe，避免持有全局 menu_lock 阻塞其他按钮与紧急停止
+                    let bot_bg = bot.clone();
+                    let q_bg = q.clone();
+                    let msg_bg = msg.clone();
+                    let cfg_bg = Arc::clone(&config);
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            actions::browse::action_browse(&bot_bg, &q_bg, &msg_bg, &cfg_bg, safe_path)
+                                .await
+                        {
+                            warn!(error = %redact_secrets(&e.to_string()), "Browse probe failed");
+                        }
+                    });
                 }
                 ActionType::Stream => {
                     bot.answer_callback_query(&q.id).await?;
@@ -591,10 +768,15 @@ async fn dispatch_callback(
                     };
 
                     if has_active {
+                        let short_name: String = active_name
+                            .as_deref()
+                            .unwrap_or("运行中任务")
+                            .chars()
+                            .take(100)
+                            .collect();
                         bot.answer_callback_query(&q.id)
                             .text(format!(
-                                "已有任务正在运行：{}\n请先发送 /stop 或等待完成。",
-                                active_name.as_deref().unwrap_or("运行中任务")
+                                "已有任务正在运行：{short_name}\n请先发送 /stop 或等待完成。"
                             ))
                             .show_alert(true)
                             .await?;
@@ -693,8 +875,17 @@ async fn verify_snapshot_or_refresh(
         return Ok(None);
     };
 
+    let Ok(canonical_base) = path_guard.canonical_base() else {
+        reject_stale_and_refresh(bot, q, msg, state, config, expected_action).await?;
+        return Ok(None);
+    };
+
     let scan_dir = canonical_dir.clone();
-    let live_listing = match tokio::task::spawn_blocking(move || scan_directory(&scan_dir)).await {
+    let live_listing = match tokio::task::spawn_blocking(move || {
+        scan_directory_within(&scan_dir, &canonical_base)
+    })
+    .await
+    {
         Ok(Ok(l)) => l,
         _ => {
             reject_stale_and_refresh(bot, q, msg, state, config, expected_action).await?;

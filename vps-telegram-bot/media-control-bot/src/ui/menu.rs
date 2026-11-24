@@ -84,10 +84,19 @@ pub async fn render_main_menu(
         upload_count,
     );
 
-    bot.edit_message_text(msg.chat.id, msg.id, text)
+    if let Err(err) = bot
+        .edit_message_text(msg.chat.id, msg.id, text)
         .parse_mode(ParseMode::Html)
         .reply_markup(keyboard)
-        .await?;
+        .await
+    {
+        if !matches!(
+            err,
+            teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified)
+        ) {
+            return Err(err.into());
+        }
+    }
 
     Ok(())
 }

@@ -63,8 +63,10 @@ pub struct SegmentTrimRecord {
 /// 严格合并校验详情。
 #[derive(Debug, Clone)]
 pub struct MergeCheckDetails {
-    /// 输入分段原始总时长（秒）
+    /// 已知输入分段时长之和（秒）
     pub input_duration: f64,
+    /// 所有输入分段是否均有有效时长。
+    pub all_input_durations_known: bool,
     /// 期望保留总时长（扣除有界片尾截除后的秒数）
     pub expected_retained_duration: f64,
     /// 实际输出时长（秒）
@@ -93,6 +95,7 @@ pub struct MergeCheckDetails {
 pub fn evaluate_merge_strict(
     exit_code: Option<i32>,
     input_total_duration: f64,
+    all_input_durations_known: bool,
     input_total_size: u64,
     input_has_audio: bool,
     output_size: u64,
@@ -132,11 +135,16 @@ pub fn evaluate_merge_strict(
     };
 
     let trim_within_limit = total_trimmed_seconds <= max_loss_seconds;
+    let upper_duration_limit = (all_input_durations_known && expected_retained_duration > 0.0)
+        .then_some(expected_retained_duration * 1.05 + 2.0);
     let retained_ok = if expected_retained_duration > 0.0 {
         duration_ratio >= min_duration_ratio
-            && output_duration <= expected_retained_duration * 1.05 + 2.0
-    } else {
+            && upper_duration_limit.is_none_or(|limit| output_duration <= limit)
+    } else if !all_input_durations_known || input_total_duration <= 0.0 {
         output_duration > 0.0
+    } else {
+        // 输入时长已知但被截除至 0s，不允许静默通过
+        false
     };
     let duration_ok = probe_streams_ok && trim_within_limit && retained_ok;
 
@@ -157,6 +165,13 @@ pub fn evaluate_merge_strict(
         failure_reason = Some(format!(
             "片尾累计截除时长 ({total_trimmed_seconds}s) 超出允许上限 ({max_loss_seconds}s)"
         ));
+    } else if let Some(limit) = upper_duration_limit.filter(|limit| output_duration > *limit) {
+        failure_reason = Some(format!("输出时长 ({output_duration:.1}s) 超过允许上限 ({limit:.1}s)"));
+    } else if !retained_ok && !all_input_durations_known {
+        failure_reason = Some(format!(
+            "输出时长 ({output_duration:.1}s) 低于已知分段要求的下限 ({:.1}s)",
+            expected_retained_duration * min_duration_ratio,
+        ));
     } else if !retained_ok {
         failure_reason = Some(format!(
             "输出时长 ({:.1}s) 超出期望保留时长 ({:.1}s) 的合理范围（最低 {:.0}%）",
@@ -170,6 +185,7 @@ pub fn evaluate_merge_strict(
 
     let details = MergeCheckDetails {
         input_duration: input_total_duration,
+        all_input_durations_known,
         expected_retained_duration,
         output_duration,
         total_trimmed_seconds,
@@ -191,6 +207,7 @@ pub async fn validate_merged_output(
     output_path: &Path,
     exit_code: Option<i32>,
     input_total_duration: f64,
+    all_input_durations_known: bool,
     input_total_size: u64,
     input_has_audio: bool,
     total_trimmed_seconds: u64,
@@ -224,6 +241,7 @@ pub async fn validate_merged_output(
     Ok(evaluate_merge_strict(
         exit_code,
         input_total_duration,
+        all_input_durations_known,
         input_total_size,
         input_has_audio,
         output_size,
@@ -254,6 +272,12 @@ pub fn format_merge_check(details: &MergeCheckDetails) -> String {
         " ℹ️ 辅助提示：封装后体积占比较低（以音视频流与时长为准）"
     };
 
+    let duration_label = if details.all_input_durations_known { "输入总时长" } else { "已知分段时长合计" };
+    let ratio_text = if details.all_input_durations_known {
+        format!(" ({duration_ratio_pct:.1}%)")
+    } else {
+        "（部分分段时长未知）".to_string()
+    };
     let trim_line = if details.total_trimmed_seconds > 0 {
         format!(
             "\n✂️ 片尾无损截除: <code>{}s</code>（期望保留 <code>{}</code>）",
@@ -265,8 +289,8 @@ pub fn format_merge_check(details: &MergeCheckDetails) -> String {
     };
 
     format!(
-        "⏱️ 输入总时长: <code>{}</code>{trim_line}\n\
-         ⏱️ 输出时长: <code>{}</code> ({duration_ratio_pct:.1}%){duration_note}\n\
+        "⏱️ {duration_label}: <code>{}</code>{trim_line}\n\
+         ⏱️ 输出时长: <code>{}</code>{ratio_text}{duration_note}\n\
          📦 输出大小: <code>{output_size_mb:.2}MB</code> / 输入 <code>{input_size_mb:.2}MB</code> ({size_ratio_pct:.1}%){size_note}",
         format_duration(details.input_duration),
         format_duration(details.output_duration),
@@ -429,6 +453,7 @@ mod tests {
         let (ok_none, _) = evaluate_merge_strict(
             Some(0),
             3600.0,
+            true,
             1_000_000,
             true,
             980_000,
@@ -444,6 +469,7 @@ mod tests {
         let (ok_zero, _) = evaluate_merge_strict(
             Some(0),
             3600.0,
+            true,
             1_000_000,
             true,
             980_000,
@@ -463,6 +489,7 @@ mod tests {
         let (ok_no_audio, _) = evaluate_merge_strict(
             Some(0),
             3600.0,
+            true,
             1_000_000,
             true,
             980_000,
@@ -479,6 +506,7 @@ mod tests {
         let (ok_short, _) = evaluate_merge_strict(
             Some(0),
             3600.0,
+            true,
             1_000_000,
             true,
             980_000,
@@ -495,6 +523,7 @@ mod tests {
         let (ok_excess_trim, _) = evaluate_merge_strict(
             Some(0),
             3600.0,
+            true,
             1_000_000,
             true,
             980_000,
@@ -508,12 +537,26 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_input_duration_preserves_lower_bound_without_assuming_maximum() {
+        let short = make_valid_probe(1_800.0, true);
+        let long = make_valid_probe(4_200.0, true);
+        let validate = |probe, all_known| {
+            evaluate_merge_strict(Some(0), 3_600.0, all_known, 1_000_000, true,
+                1_000_000, Some(probe), 0, 3, 0.95, 0.5).0
+        };
+        assert!(!validate(&short, false));
+        assert!(validate(&long, false));
+        assert!(!validate(&long, true));
+    }
+
+    #[test]
     fn test_size_ratio_is_auxiliary_and_does_not_alone_fail_valid_merge() {
         // TS -> MP4 去除了 188B 包填充开销，体积变为输入的 75%（低于 0.80），但音视频流与时长完全正常
         let valid_probe = make_valid_probe(3598.0, true);
         let (ok, details) = evaluate_merge_strict(
             Some(0),
             3600.0,
+            true,
             1_000_000,
             true,
             750_000,

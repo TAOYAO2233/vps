@@ -20,7 +20,7 @@ use teloxide::prelude::*;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use super::{edit_html_bounded, edit_html_cancellable, send_html_cancellable};
+use super::{edit_html_bounded, edit_html_cancellable, send_html_bounded, send_html_cancellable};
 use crate::config::Config;
 use crate::core::state::{ActionType, SharedState};
 use crate::core::task_manager::TaskManager;
@@ -104,20 +104,46 @@ async fn do_concat(
     // 1. 严格按用户选择顺序逐个校验普通文件路径（绝不排序）
     let mut ordered_files: Vec<PathBuf> = Vec::with_capacity(raw_files.len());
     for raw in &raw_files {
-        let verified = guard.assert_regular_file_no_symlink(raw)?;
+        let verified = match guard.assert_regular_file_no_symlink(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                send_html_bounded(
+                    &bot,
+                    msg.chat.id,
+                    format!("❌ <b>无损合并预检失败</b>:\n{}", escape_html(&sanitize_user_error(&e))),
+                )
+                .await;
+                return Err(e);
+            }
+        };
         if !ordered_files.contains(&verified) {
             ordered_files.push(verified);
         }
     }
 
     if ordered_files.len() < 2 {
-        return Err(AppError::ConcatInsufficientFiles {
+        let err: anyhow::Error = AppError::ConcatInsufficientFiles {
             count: ordered_files.len(),
         }
-        .into());
+        .into();
+        send_html_bounded(
+            &bot,
+            msg.chat.id,
+            format!("❌ <b>无损合并预检失败</b>:\n{}", escape_html(&sanitize_user_error(&err))),
+        )
+        .await;
+        return Err(err);
     }
 
-    ensure_stable_files(&ordered_files, config.file_stable_seconds).await?;
+    if let Err(e) = ensure_stable_files(&ordered_files, config.file_stable_seconds).await {
+        send_html_bounded(
+            &bot,
+            msg.chat.id,
+            format!("❌ <b>无损合并预检未通过</b>:\n{}", escape_html(&sanitize_user_error(&e))),
+        )
+        .await;
+        return Err(e);
+    }
 
     let work_dir = ordered_files[0]
         .parent()
@@ -154,6 +180,7 @@ async fn do_concat(
         Vec::with_capacity(ordered_files.len());
     let mut total_input_size: u64 = 0;
     let mut input_total_duration: f64 = 0.0;
+    let mut all_durations_known = true;
 
     for (idx, path) in ordered_files.iter().enumerate() {
         if *cancel_rx.borrow() {
@@ -167,7 +194,11 @@ async fn do_concat(
 
         match probe_media_cancellable(path, config.ffprobe_timeout_secs, &cancel_rx).await {
             Ok(info) => {
-                input_total_duration += info.duration_secs.max(0.0);
+                if info.duration_secs.is_finite() && info.duration_secs > 0.0 {
+                    input_total_duration += info.duration_secs;
+                } else {
+                    all_durations_known = false;
+                }
                 probed_segments.push((path.clone(), info));
             }
             Err(e) if is_cancelled_err(&e) => {
@@ -208,7 +239,10 @@ async fn do_concat(
         let s = state.read().await;
         Arc::clone(&s.disk_monitor)
     };
-    if let Err(space_err) = disk_monitor.ensure_space_available(required_bytes).await {
+    if let Err(space_err) = disk_monitor
+        .ensure_space_available_for_path(&canonical_work_dir, required_bytes)
+        .await
+    {
         let report = format_merge_failure_report(
             "存储挂载与剩余空间预检",
             None,
@@ -261,6 +295,7 @@ async fn do_concat(
         &temp_merged_mp4,
         stage1_out.exit_code,
         input_total_duration,
+        all_durations_known,
         total_input_size,
         input_has_audio,
         0,
@@ -410,6 +445,7 @@ async fn do_concat(
             &temp_merged_mp4,
             concat_2a.exit_code,
             input_total_duration,
+            all_durations_known,
             total_input_size,
             input_has_audio,
             0,
@@ -552,6 +588,7 @@ async fn do_concat(
             &temp_merged_mp4,
             concat_2b.exit_code,
             input_total_duration,
+            all_durations_known,
             total_input_size,
             input_has_audio,
             0,
@@ -588,85 +625,254 @@ async fn do_concat(
             .await;
         }
 
+        let interrupted = !concat_2b.is_success();
         last_concat_stderr = concat_2b.stderr_summary;
         last_concat_time = concat_2b.last_progress_secs;
-        // 若拼接在某个边界中断，根据输出或处理时长定位疑似尾部损坏的前序分段
-        let broken_time = if check_2b.output_duration > 0.0 {
-            Some(check_2b.output_duration)
-        } else {
-            last_concat_time
-        };
-        if let Some(bt) = broken_time {
-            if let Some(suspected_idx) = locate_segment_by_cumulative_time(&probed_segments, bt) {
-                failed_seg_indices.push(suspected_idx);
-            }
+        // A successfully exited FFmpeg with an invalid duration provides no evidence of an interrupted segment.
+        if let Some(suspected_idx) = last_concat_time
+            .filter(|_| interrupted && all_durations_known)
+            .and_then(|time| locate_segment_by_cumulative_time(&probed_segments, time))
+        {
+            failed_seg_indices.push(suspected_idx);
         }
         last_concat_check = Some(check_2b);
     }
 
     // ── 阶段 2C：有界片尾无损截除探测（1..=merge_max_loss_seconds，-t 严格置于 -i 之前）──
-    if !failed_seg_indices.is_empty() && config.merge_max_loss_seconds > 0 {
-        let mut trims_applied: Vec<SegmentTrimRecord> = Vec::new();
-        let mut total_trimmed_secs: u64 = 0;
-        let mut all_repaired = true;
+    // 区分“2B 单段重封装失败”与“2B 拼接边界失败”：若仅有一个边界疑似分段，则逐秒截除并做整片拼接验证，
+    // 避免单段 verify_ts_segment 在 trim_s=1 即提前跳出而错过 2~3 秒的真实损坏尾部。
+    let single_boundary_candidate =
+        failed_seg_indices.len() == 1 && last_concat_check.is_some();
 
-        for &idx in &failed_seg_indices {
+    if !failed_seg_indices.is_empty() && config.merge_max_loss_seconds > 0 {
+        let mut verified_2c: Option<(Vec<SegmentTrimRecord>, u64, MergeCheckDetails)> = None;
+
+        if single_boundary_candidate {
+            let idx = failed_seg_indices[0];
             let (seg_path, seg_probe) = &probed_segments[idx];
             let seg_name = display_name(seg_path);
             let seg_dur = seg_probe.duration_secs;
-            let remaining_budget = config
-                .merge_max_loss_seconds
-                .saturating_sub(total_trimmed_secs);
+            if seg_dur > 2.0 {
+                for trim_s in 1..=config.merge_max_loss_seconds {
+                    if *cancel_rx.borrow() {
+                        drop(temp_dir);
+                        notify_cancelled(&bot, &msg, &progress_msg).await;
+                        return Err(AppError::Cancelled.into());
+                    }
+                    let keep_dur = seg_dur - (trim_s as f64);
+                    if keep_dur <= 1.0 {
+                        break;
+                    }
+                    let step = ffmpeg
+                        .remux_to_ts(
+                            seg_path,
+                            &ts_paths[idx],
+                            TsRemuxOptions {
+                                discard_corrupt_genpts: true,
+                                keep_duration_secs: Some(keep_dur),
+                            },
+                            &state,
+                            &cancel_rx,
+                        )
+                        .await?;
+                    record_forced_kill_if_needed(&state, task_id, &step).await;
+                    if step.cancelled || *cancel_rx.borrow() {
+                        drop(temp_dir);
+                        notify_cancelled(&bot, &msg, &progress_msg).await;
+                        return Err(AppError::Cancelled.into());
+                    }
+                    let ts_ok = match verify_ts_segment(
+                        &ts_paths[idx],
+                        &step,
+                        keep_dur,
+                        config.merge_min_duration_ratio,
+                        config.ffprobe_timeout_secs,
+                        &cancel_rx,
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) if is_cancelled_err(&e) => {
+                            drop(temp_dir);
+                            notify_cancelled(&bot, &msg, &progress_msg).await;
+                            return Err(e);
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if !ts_ok {
+                        continue;
+                    }
 
-            if remaining_budget == 0 || seg_dur <= 2.0 {
-                all_repaired = false;
-                break;
-            }
-
-            let mut repaired_this_seg = false;
-            for trim_s in 1..=remaining_budget {
-                if *cancel_rx.borrow() {
-                    drop(temp_dir);
-                    notify_cancelled(&bot, &msg, &progress_msg).await;
-                    return Err(AppError::Cancelled.into());
+                    remove_if_exists(&ts_list_file);
+                    write_concat_list(&ts_list_file, &ts_paths)?;
+                    let concat_2c = ffmpeg
+                        .run_concat(&ts_list_file, &temp_merged_mp4, &state, &cancel_rx)
+                        .await?;
+                    record_forced_kill_if_needed(&state, task_id, &concat_2c).await;
+                    if concat_2c.cancelled || *cancel_rx.borrow() {
+                        drop(temp_dir);
+                        notify_cancelled(&bot, &msg, &progress_msg).await;
+                        return Err(AppError::Cancelled.into());
+                    }
+                    let (ok_2c, check_2c) = match validate_merged_output(
+                        &temp_merged_mp4,
+                        concat_2c.exit_code,
+                        input_total_duration,
+                        all_durations_known,
+                        total_input_size,
+                        input_has_audio,
+                        trim_s,
+                        config.merge_max_loss_seconds,
+                        config.merge_min_duration_ratio,
+                        config.merge_min_size_ratio,
+                        config.ffprobe_timeout_secs,
+                        &cancel_rx,
+                    )
+                    .await
+                    {
+                        Ok(res) => res,
+                        Err(e) if is_cancelled_err(&e) => {
+                            drop(temp_dir);
+                            notify_cancelled(&bot, &msg, &progress_msg).await;
+                            return Err(e);
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if ok_2c {
+                        verified_2c = Some((
+                            vec![SegmentTrimRecord {
+                                segment_index: idx + 1,
+                                filename: seg_name.clone(),
+                                original_duration: seg_dur,
+                                trimmed_seconds: trim_s,
+                            }],
+                            trim_s,
+                            check_2c,
+                        ));
+                        break;
+                    }
                 }
+            }
+        } else {
+            let mut trims_applied: Vec<SegmentTrimRecord> = Vec::new();
+            let mut total_trimmed_secs: u64 = 0;
+            let mut all_repaired = true;
 
-                let keep_dur = seg_dur - (trim_s as f64);
-                if keep_dur <= 1.0 {
+            for &idx in &failed_seg_indices {
+                let (seg_path, seg_probe) = &probed_segments[idx];
+                let seg_name = display_name(seg_path);
+                let seg_dur = seg_probe.duration_secs;
+                let remaining_budget = config
+                    .merge_max_loss_seconds
+                    .saturating_sub(total_trimmed_secs);
+
+                if remaining_budget == 0 || seg_dur <= 2.0 {
+                    all_repaired = false;
                     break;
                 }
 
-                let step = ffmpeg
-                    .remux_to_ts(
-                        seg_path,
+                let mut repaired_this_seg = false;
+                for trim_s in 1..=remaining_budget {
+                    if *cancel_rx.borrow() {
+                        drop(temp_dir);
+                        notify_cancelled(&bot, &msg, &progress_msg).await;
+                        return Err(AppError::Cancelled.into());
+                    }
+
+                    let keep_dur = seg_dur - (trim_s as f64);
+                    if keep_dur <= 1.0 {
+                        break;
+                    }
+
+                    let step = ffmpeg
+                        .remux_to_ts(
+                            seg_path,
+                            &ts_paths[idx],
+                            TsRemuxOptions {
+                                discard_corrupt_genpts: true,
+                                keep_duration_secs: Some(keep_dur),
+                            },
+                            &state,
+                            &cancel_rx,
+                        )
+                        .await?;
+                    record_forced_kill_if_needed(&state, task_id, &step).await;
+
+                    if step.cancelled || *cancel_rx.borrow() {
+                        drop(temp_dir);
+                        notify_cancelled(&bot, &msg, &progress_msg).await;
+                        return Err(AppError::Cancelled.into());
+                    }
+
+                    let ts_ok = match verify_ts_segment(
                         &ts_paths[idx],
-                        TsRemuxOptions {
-                            discard_corrupt_genpts: true,
-                            keep_duration_secs: Some(keep_dur),
-                        },
-                        &state,
+                        &step,
+                        keep_dur,
+                        config.merge_min_duration_ratio,
+                        config.ffprobe_timeout_secs,
                         &cancel_rx,
                     )
-                    .await?;
-                record_forced_kill_if_needed(&state, task_id, &step).await;
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) if is_cancelled_err(&e) => {
+                            drop(temp_dir);
+                            notify_cancelled(&bot, &msg, &progress_msg).await;
+                            return Err(e);
+                        }
+                        Err(e) => return Err(e),
+                    };
 
-                if step.cancelled || *cancel_rx.borrow() {
+                    if ts_ok {
+                        total_trimmed_secs += trim_s;
+                        trims_applied.push(SegmentTrimRecord {
+                            segment_index: idx + 1,
+                            filename: seg_name.clone(),
+                            original_duration: seg_dur,
+                            trimmed_seconds: trim_s,
+                        });
+                        repaired_this_seg = true;
+                        break;
+                    }
+                }
+
+                if !repaired_this_seg {
+                    all_repaired = false;
+                    break;
+                }
+            }
+
+            if all_repaired && !trims_applied.is_empty() {
+                remove_if_exists(&ts_list_file);
+                write_concat_list(&ts_list_file, &ts_paths)?;
+                let concat_2c = ffmpeg
+                    .run_concat(&ts_list_file, &temp_merged_mp4, &state, &cancel_rx)
+                    .await?;
+                record_forced_kill_if_needed(&state, task_id, &concat_2c).await;
+
+                if concat_2c.cancelled || *cancel_rx.borrow() {
                     drop(temp_dir);
                     notify_cancelled(&bot, &msg, &progress_msg).await;
                     return Err(AppError::Cancelled.into());
                 }
 
-                let ts_ok = match verify_ts_segment(
-                    &ts_paths[idx],
-                    &step,
-                    keep_dur,
+                let (ok_2c, check_2c) = match validate_merged_output(
+                    &temp_merged_mp4,
+                    concat_2c.exit_code,
+                    input_total_duration,
+                    all_durations_known,
+                    total_input_size,
+                    input_has_audio,
+                    total_trimmed_secs,
+                    config.merge_max_loss_seconds,
                     config.merge_min_duration_ratio,
+                    config.merge_min_size_ratio,
                     config.ffprobe_timeout_secs,
                     &cancel_rx,
                 )
                 .await
                 {
-                    Ok(v) => v,
+                    Ok(res) => res,
                     Err(e) if is_cancelled_err(&e) => {
                         drop(temp_dir);
                         notify_cancelled(&bot, &msg, &progress_msg).await;
@@ -675,98 +881,49 @@ async fn do_concat(
                     Err(e) => return Err(e),
                 };
 
-                if ts_ok {
-                    total_trimmed_secs += trim_s;
-                    trims_applied.push(SegmentTrimRecord {
-                        segment_index: idx + 1,
-                        filename: seg_name.clone(),
-                        original_duration: seg_dur,
-                        trimmed_seconds: trim_s,
-                    });
-                    repaired_this_seg = true;
-                    break;
+                if ok_2c {
+                    verified_2c = Some((trims_applied, total_trimmed_secs, check_2c));
                 }
-            }
-
-            if !repaired_this_seg {
-                all_repaired = false;
-                break;
             }
         }
 
-        if all_repaired && !trims_applied.is_empty() {
-            remove_if_exists(&ts_list_file);
-            write_concat_list(&ts_list_file, &ts_paths)?;
-            let concat_2c = ffmpeg
-                .run_concat(&ts_list_file, &temp_merged_mp4, &state, &cancel_rx)
-                .await?;
-            record_forced_kill_if_needed(&state, task_id, &concat_2c).await;
-
-            if concat_2c.cancelled || *cancel_rx.borrow() {
-                drop(temp_dir);
-                notify_cancelled(&bot, &msg, &progress_msg).await;
-                return Err(AppError::Cancelled.into());
-            }
-
-            let (ok_2c, check_2c) = match validate_merged_output(
-                &temp_merged_mp4,
-                concat_2c.exit_code,
-                input_total_duration,
-                total_input_size,
-                input_has_audio,
-                total_trimmed_secs,
-                config.merge_max_loss_seconds,
-                config.merge_min_duration_ratio,
-                config.merge_min_size_ratio,
-                config.ffprobe_timeout_secs,
-                &cancel_rx,
-            )
-            .await
-            {
-                Ok(res) => res,
-                Err(e) if is_cancelled_err(&e) => {
-                    drop(temp_dir);
-                    notify_cancelled(&bot, &msg, &progress_msg).await;
-                    return Err(e);
-                }
-                Err(e) => return Err(e),
-            };
-
-            if ok_2c {
-                if config.merge_allow_auto_trim {
-                    // 用户已显式确认开启上限内自动无损片尾截除：原子发布成品并详细报告截除秒数
-                    let strategy = MergeStrategy::TsRemuxBoundedTailTrim {
-                        trims: trims_applied,
-                    };
-                    return publish_and_report_success(
-                        &bot,
-                        &msg,
-                        &progress_msg,
-                        &guard,
-                        &temp_merged_mp4,
-                        &desired_output_path,
-                        temp_dir,
-                        &strategy,
-                        &check_2c,
-                        started_at.elapsed().as_secs_f64(),
-                    )
-                    .await;
-                }
-
-                // 保守默认（MERGE_ALLOW_AUTO_TRIM=false）：不擅自丢弃任何内容，先清理临时产物再向管理员汇报候选方案
-                drop(temp_dir);
-                let prompt = format_merge_candidate_trim_prompt(
-                    &trims_applied,
+        if let Some((trims_applied, total_trimmed_secs, check_2c)) = verified_2c {
+            if config.merge_allow_auto_trim {
+                // 用户已显式确认开启上限内自动无损片尾截除：原子发布成品并详细报告截除秒数
+                let strategy = MergeStrategy::TsRemuxBoundedTailTrim {
+                    trims: trims_applied,
+                };
+                return publish_and_report_success(
+                    &bot,
+                    &msg,
+                    &progress_msg,
+                    &guard,
+                    &temp_merged_mp4,
+                    &desired_output_path,
+                    temp_dir,
+                    &strategy,
                     &check_2c,
-                    config.merge_max_loss_seconds,
-                );
-                edit_html_bounded(&bot, msg.chat.id, progress_msg.id, prompt).await;
-                info!(
-                    total_trimmed_secs = total_trimmed_secs,
-                    "Bounded tail-trim candidate verified in temp dir; awaiting user MERGE_ALLOW_AUTO_TRIM confirmation"
-                );
-                return Ok(());
+                    started_at.elapsed().as_secs_f64(),
+                )
+                .await;
             }
+
+            // 保守默认（MERGE_ALLOW_AUTO_TRIM=false）：不擅自丢弃任何内容，先清理临时产物再向管理员汇报候选方案
+            drop(temp_dir);
+            let prompt = format_merge_candidate_trim_prompt(
+                &trims_applied,
+                &check_2c,
+                config.merge_max_loss_seconds,
+            );
+            edit_html_bounded(&bot, msg.chat.id, progress_msg.id, prompt).await;
+            info!(
+                total_trimmed_secs = total_trimmed_secs,
+                "Bounded tail-trim candidate verified in temp dir; awaiting user MERGE_ALLOW_AUTO_TRIM confirmation"
+            );
+            return Err(AppError::StreamIncompatible {
+                reason: "检测到分段尾部损坏，保守模式未产出文件（需确认 MERGE_ALLOW_AUTO_TRIM=true）".to_string(),
+            }
+            .into());
         }
     }
 
@@ -898,11 +1055,11 @@ fn locate_segment_by_cumulative_time(
     let mut acc = 0.0;
     for (idx, (_, probe)) in segments.iter().enumerate() {
         acc += probe.duration_secs.max(0.0);
-        if broken_at_secs <= acc + 5.0 {
+        if (broken_at_secs - acc).abs() <= 5.0 {
             return Some(idx);
         }
     }
-    segments.len().checked_sub(1)
+    None
 }
 
 async fn notify_cancelled(bot: &Bot, msg: &Message, progress_msg: &Message) {

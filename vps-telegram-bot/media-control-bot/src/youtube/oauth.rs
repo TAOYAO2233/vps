@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnector;
 use tokio::sync::watch;
@@ -16,6 +16,18 @@ use yup_oauth2::authenticator::Authenticator;
 
 use crate::errors::AppError;
 use crate::utils::redact::{redact_secrets, register_secret};
+
+/// 等待取消通道真正变为 `true`；发送端释放时不误触发取消。
+async fn wait_for_cancel(cancel_watch: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancel_watch.borrow_and_update() {
+            return;
+        }
+        if cancel_watch.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
 /// YouTube 上传所需的 OAuth2 Scope。
 pub const YOUTUBE_SCOPES: &[&str] = &["https://www.googleapis.com/auth/youtube.upload"];
@@ -72,7 +84,7 @@ pub async fn load_authenticator_cancellable(
                 }
             }
         }
-        _ = cancel_watch.changed() => {
+        () = wait_for_cancel(&mut cancel_watch) => {
             return Err(AppError::Cancelled.into());
         }
     };
@@ -87,7 +99,9 @@ pub async fn load_authenticator_cancellable(
         .enable_http1()
         .build();
 
-    let client = hyper::Client::builder().build::<_, hyper::Body>(https);
+    let client = hyper::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(60))
+        .build::<_, hyper::Body>(https);
 
     let build_fut = yup_oauth2::AuthorizedUserAuthenticator::with_client(secret, client).build();
     let auth = tokio::select! {
@@ -95,9 +109,11 @@ pub async fn load_authenticator_cancellable(
             res.map_err(|_| AppError::YoutubeApiError {
                 message: "初始化 YouTube OAuth2 认证器超时".to_string(),
             })?
-            .context("Failed to initialize YouTube OAuth2 authenticator")?
+            .map_err(|e| AppError::YoutubeApiError {
+                message: format!("初始化 YouTube OAuth2 认证器失败: {}", redact_secrets(&e.to_string())),
+            })?
         }
-        _ = cancel_watch.changed() => {
+        () = wait_for_cancel(&mut cancel_watch) => {
             return Err(AppError::Cancelled.into());
         }
     };
@@ -129,12 +145,12 @@ pub async fn fetch_access_token_cancellable(
     let tok_res = if force_refresh {
         tokio::select! {
             res = tokio::time::timeout(OAUTH_OPERATION_TIMEOUT, auth.force_refreshed_token(YOUTUBE_SCOPES)) => res,
-            _ = cancel_watch.changed() => return Err(AppError::Cancelled.into()),
+            () = wait_for_cancel(&mut cancel_watch) => return Err(AppError::Cancelled.into()),
         }
     } else {
         tokio::select! {
             res = tokio::time::timeout(OAUTH_OPERATION_TIMEOUT, auth.token(YOUTUBE_SCOPES)) => res,
-            _ = cancel_watch.changed() => return Err(AppError::Cancelled.into()),
+            () = wait_for_cancel(&mut cancel_watch) => return Err(AppError::Cancelled.into()),
         }
     };
 

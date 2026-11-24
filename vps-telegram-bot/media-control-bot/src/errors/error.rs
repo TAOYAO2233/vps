@@ -191,8 +191,8 @@ pub enum AppError {
         filename: String,
     },
 
-    /// YouTube 服务端已接收全部字节但反复返回 308 未给出最终 video_id（状态未确认，保留会话供后续核实）。
-    #[error("YouTube upload server state unconfirmed after full bytes sent for: {filename}")]
+    /// YouTube 最终状态无法确认（响应丢失、解析失败或确认耗尽）；保留原会话供核实。
+    #[error("YouTube upload final server state unconfirmed for: {filename}")]
     YoutubeUploadStateUnconfirmed {
         /// 文件名
         filename: String,

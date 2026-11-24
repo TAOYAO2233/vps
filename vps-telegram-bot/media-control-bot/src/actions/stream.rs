@@ -79,7 +79,7 @@ pub async fn start_stream(
     Ok(())
 }
 
-/// 在独占任务内执行完整的推流生命周期。
+/// 在独占任务内执行完整的推流生命周期（确保前期预检失败也能向用户反馈）。
 async fn do_stream(
     bot: Bot,
     msg: Message,
@@ -88,6 +88,45 @@ async fn do_stream(
     raw_file_path: PathBuf,
     task_id: u64,
     cancel_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut progress_msg_id = None;
+    let res = do_stream_inner(
+        bot.clone(),
+        msg.clone(),
+        state,
+        config,
+        raw_file_path,
+        task_id,
+        cancel_rx,
+        &mut progress_msg_id,
+    )
+    .await;
+    if let Err(ref e) = res {
+        if !is_cancelled_err(e) {
+            let err_html = format!(
+                "❌ <b>RTMP 推流任务失败</b>\n{}",
+                escape_html(&sanitize_user_error(e))
+            );
+            if let Some(pid) = progress_msg_id {
+                edit_html_bounded(&bot, msg.chat.id, pid, err_html).await;
+            } else {
+                send_html_bounded(&bot, msg.chat.id, err_html).await;
+            }
+        }
+    }
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn do_stream_inner(
+    bot: Bot,
+    msg: Message,
+    state: SharedState,
+    config: Arc<Config>,
+    raw_file_path: PathBuf,
+    task_id: u64,
+    cancel_rx: watch::Receiver<bool>,
+    progress_msg_id: &mut Option<teloxide::types::MessageId>,
 ) -> Result<()> {
     if *cancel_rx.borrow() {
         return Err(AppError::Cancelled.into());
@@ -125,6 +164,7 @@ async fn do_stream(
         &cancel_rx,
     )
     .await?;
+    *progress_msg_id = Some(progress_msg.id);
 
     if *cancel_rx.borrow() {
         notify_stream_cancelled(&bot, &msg, &progress_msg, &filename).await;
@@ -209,7 +249,6 @@ async fn do_stream(
     let duration = probe.duration_secs;
     let progress_bar = ProgressBar::default();
     let started_at = Instant::now();
-    let mut last_activity_at = Instant::now();
     let stall_timeout = Duration::from_secs(config.rtmp_rw_timeout_secs.saturating_add(15));
     let mut timed_out_by_watchdog = false;
     let mut cancel_watch = cancel_rx.clone();
@@ -222,7 +261,9 @@ async fn do_stream(
             break;
         }
 
-        if last_activity_at.elapsed() >= stall_timeout {
+        // 以 FfmpegProcess 底层真实心跳时间（progress=continue）作为看门狗基准，
+        // 避免超长录播（>75 分钟）因 1% 进度增量耗时长于 stall_timeout 而被误杀。
+        if process.last_activity_at().elapsed() >= stall_timeout {
             warn!(
                 filename = %filename,
                 target = %safe_target,
@@ -240,7 +281,6 @@ async fn do_stream(
             tick_res = process.next_tick() => {
                 match tick_res {
                     Ok(Some(tick)) => {
-                        last_activity_at = Instant::now();
                         let sent_str = format_file_size_bytes(tick.total_size_bytes);
                         let status_html = if let Some(percent) = tick.percent {
                             let bar = progress_bar.render(percent);

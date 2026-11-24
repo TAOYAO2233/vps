@@ -44,7 +44,11 @@ impl ProgressBar {
     /// 格式为 `[████████░░░░░░░░░░░░]  40.0%` 的字符串。
     #[must_use]
     pub fn render(&self, percent: f64) -> String {
-        let percent = percent.clamp(0.0, 100.0);
+        let percent = if percent.is_finite() {
+            percent.clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
         let filled = ((percent / 100.0) * self.length as f64).floor() as usize;
         let empty = self.length - filled;
 
