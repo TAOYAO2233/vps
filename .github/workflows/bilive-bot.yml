@@ -1,0 +1,104 @@
+name: Build bilive-bot (Musl Static)
+
+on:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - 'vps-telegram-bot/bilive_bot/RUST/**'
+      - '.github/workflows/bilive-bot.yml'
+  pull_request:
+    branches: ["main", "master"]
+    paths:
+      - 'vps-telegram-bot/bilive_bot/RUST/**'
+      - '.github/workflows/bilive-bot.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bilive-bot-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test and build bilive-bot x86_64-musl
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: vps-telegram-bot/bilive_bot/RUST
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools binutils
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Generate missing lockfile in CI
+        run: |
+          if [ ! -f Cargo.lock ]; then
+            cargo generate-lockfile
+          fi
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            vps-telegram-bot/bilive_bot/RUST/target
+          key: ${{ runner.os }}-bilive-bot-musl-${{ hashFiles('vps-telegram-bot/bilive_bot/RUST/Cargo.toml', 'vps-telegram-bot/bilive_bot/RUST/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bilive-bot-musl-
+
+      - name: Run unit tests
+        run: cargo test --locked
+
+      - name: Build static binary
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+
+      - name: Package binary and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/bl_bot_rust dist/bl_bot_rust
+          readelf -l dist/bl_bot_rust > dist/.program-headers
+          if grep -q INTERP dist/.program-headers; then
+            echo 'Binary has a dynamic interpreter; static build failed' >&2
+            exit 1
+          fi
+          rm dist/.program-headers
+          (cd dist && sha256sum bl_bot_rust > bl_bot_rust.sha256)
+          cp Cargo.lock dist/Cargo.lock
+          if [ -f .env.example ]; then
+            cp .env.example dist/.env.example
+          fi
+          if [ -f README.md ]; then
+            cp README.md dist/README.md
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bilive-bot-linux-x86_64-musl
+          path: |
+            vps-telegram-bot/bilive_bot/RUST/dist/bl_bot_rust
+            vps-telegram-bot/bilive_bot/RUST/dist/bl_bot_rust.sha256
+            vps-telegram-bot/bilive_bot/RUST/dist/Cargo.lock
+            vps-telegram-bot/bilive_bot/RUST/dist/README.md
+          if-no-files-found: error
+          retention-days: 14
